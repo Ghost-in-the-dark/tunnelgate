@@ -1,0 +1,92 @@
+# =============================================================================
+# TunnelGate - per-router vhost TEMPLATE (reference copy)
+#
+# THIS FILE IS NOT LOADED BY NGINX AND MUST NOT BE INSTALLED.
+#
+# It documents, in readable form, exactly what app/services/proxy.py renders into
+# /etc/nginx/tunnelgate/routes.conf for every router that has a remote_port and is
+# not pending/revoked. The live file is generated wholesale on each change: do not
+# hand-edit routes.conf, it will be overwritten. If you need to change the shape of
+# a router vhost, change render_nginx() in app/services/proxy.py - this file and the
+# renderer are meant to stay in step, and tests/test_proxy.py asserts it.
+#
+# Placeholders and where each value comes from:
+#   <slug>        Router.slug              - validated by SLUG_RE (lowercase, [a-z0-9-])
+#   <suffix>      Settings.host_suffix     - subdomain_suffix, else panel_host
+#   <router_id>   Router.id                - re-validated by the renderer before it
+#                                            is interpolated (config-injection guard)
+#   <tunnel_port> Router.remote_port       - the port sshd listens on for this router
+#   <bind>        Router.bind_address      - 127.0.0.1 on a normal single-host setup
+#
+# The include below is the shared auth snippet the renderer writes next to
+# routes.conf (data/tunnelgate.routes.auth.conf in dev, /etc/nginx/tunnelgate/...
+# in production). It defines location = /__tg/auth and location @tg_login once, for
+# every router, instead of repeating them in each server block.
+# =============================================================================
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+
+    server_name <slug>.<suffix>;
+
+    # One wildcard certificate (*.<suffix>) serves every router vhost; there is no
+    # per-device certificate to issue or renew.
+    ssl_certificate     /etc/letsencrypt/live/panel.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/panel.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    # LuCI firmware uploads go through this vhost; the panel never sees the body.
+    client_max_body_size 64m;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Robots-Tag "noindex, nofollow" always;
+    # Deliberately NO X-Frame-Options / CSP here: LuCI is not ours to restyle and
+    # some themes load their own resources. The gate is the access control.
+
+    # Values the auth subrequest needs. Both are re-validated by the renderer before
+    # they land in this file, so neither can break out of the quotes.
+    set $tg_router '<router_id>';
+    set $tg_slug   '<slug>';
+
+    include /etc/nginx/tunnelgate/routes.auth.conf;
+
+    location / {
+        # Every request - HTML, XHR, WebSocket - is authorised before it is proxied.
+        auth_request /__tg/auth;
+        error_page 401 = @tg_login;
+
+        proxy_pass http://<bind>:<tunnel_port>;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-Port  $server_port;
+        proxy_set_header X-Tg-Router       $tg_router;
+
+        # LuCI's terminal, sysupgrade progress and ubus event streams are websockets.
+        # Connection must come from a map (an empty Upgrade header with a literal
+        # "upgrade" breaks ordinary requests), hence $tg_connection_upgrade.
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $tg_connection_upgrade;
+
+        # Long-lived but bounded: an idle LuCI page must survive, a dead tunnel must
+        # not hold a worker forever.
+        proxy_read_timeout    300s;
+        proxy_send_timeout    300s;
+        proxy_connect_timeout 10s;
+
+        # No buffering: LuCI streams sysupgrade output and ubus events.
+        proxy_buffering         off;
+        proxy_request_buffering off;
+    }
+}

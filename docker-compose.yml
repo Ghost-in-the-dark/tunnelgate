@@ -1,0 +1,117 @@
+# =============================================================================
+# TunnelGate - container deployment
+#
+#   docker compose up -d --build
+#
+# READ THIS FIRST: both services use network_mode: host, deliberately.
+#
+# The panel's job is to reach the SSH reverse-tunnel listeners that the HOST sshd
+# created on 127.0.0.1:<tunnel_port> (GatewayPorts no - see deploy/sshd/), and to
+# write the authorized_keys file the host sshd reads. In a bridge network those
+# listeners are simply invisible, and a proxied request to 127.0.0.1:20001 would
+# hit the container's own loopback. nginx has the same constraint one hop later:
+# it must reach the panel on 127.0.0.1:8080.
+#
+# The alternative (bridge networking plus host.docker.internal plus publishing the
+# whole 20000-25000 range) would expose every tunnel port on 0.0.0.0 and defeat
+# the loopback-only design. Host networking keeps the invariant: nothing but
+# nginx listens on a public interface.
+#
+# Consequence: ports 80/443 on the host must be free, and the host sshd must be
+# configured with deploy/sshd/tunnelgate.conf. Containerising the sshd is NOT
+# supported: the device keys and the tunnel listeners are the host's.
+#
+# Prerequisites:
+#   sudo install -d -o 10001 -g 10001 -m 0750 /var/lib/tunnelgate
+#   sudo install -d -o 10001 -g 10001 -m 0750 /etc/nginx/tunnelgate
+#   sudo cp deploy/env/tunnelgate.env.example /etc/tunnelgate.env   # then edit
+#   # wildcard cert for *.<panel_host>:
+#   #   /etc/letsencrypt/live/panel.example.com/{fullchain,privkey}.pem
+# =============================================================================
+
+services:
+  panel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tunnelgate:latest
+    container_name: tunnelgate-panel
+    # See the header: host networking is required, not a shortcut.
+    network_mode: host
+    restart: unless-stopped
+    env_file:
+      - /etc/tunnelgate.env
+    environment:
+      # The panel must not try to signal nginx it cannot reach; the nginx service
+      # below watches the routes file and reloads itself.
+      TUNNELGATE_PROXY_RELOAD_COMMAND: ""
+      TUNNELGATE_DATA_DIR: /var/lib/tunnelgate
+      TUNNELGATE_DB_URL: sqlite:////var/lib/tunnelgate/tunnelgate.db
+      TUNNELGATE_PROXY_ROUTES_PATH: /etc/nginx/tunnelgate/routes.conf
+      TUNNELGATE_BIND_ADDRESS: 127.0.0.1
+      TUNNELGATE_PORT: "8080"
+    volumes:
+      # State: DB, generated router keys, authorized_keys (read by the HOST sshd,
+      # which is why this is a bind mount at the documented path and not a named
+      # volume - the path has to be the same on both sides).
+      - /var/lib/tunnelgate:/var/lib/tunnelgate
+      # The route files nginx includes. Shared with the nginx service below and
+      # with the host nginx if you run one.
+      - /etc/nginx/tunnelgate:/etc/nginx/tunnelgate
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/api/v1/health', timeout=4).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: tunnelgate-nginx
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      panel:
+        condition: service_healthy
+    volumes:
+      # Our vhost file lands in conf.d, which the stock nginx.conf already includes
+      # inside http{} - that is exactly the level the file is written for (the map
+      # and the routes include are http-level directives).
+      - ./deploy/nginx/tunnelgate.conf:/etc/nginx/conf.d/tunnelgate.conf:ro
+      # Generated per-router vhosts + the shared auth snippet.
+      - /etc/nginx/tunnelgate:/etc/nginx/tunnelgate
+      # Wildcard certificate for *.<panel_host>.
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      # The stock image has no ACME webroot; the vhost points at /var/www/html.
+      - /var/www/html:/var/www/html:ro
+      # Replaces the entrypoint: start nginx, then watch routes.conf and reload on
+      # change, validating with nginx -t first.
+      - ./deploy/docker/nginx-entrypoint.sh:/usr/local/bin/nginx-entrypoint:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/nginx-entrypoint"]
+    healthcheck:
+      test: ["CMD-SHELL", "nginx -t -q && pgrep -f 'nginx: master' >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

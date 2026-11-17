@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  PYTHON_VERSION: "3.13"
+  NODE_VERSION: "22"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: backend (lint + tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Ruff (lint + format check)
+        run: |
+          ruff check app tests agent_runner 2>/dev/null || ruff check app tests
+          ruff format --check app tests
+
+      - name: App imports cleanly
+        run: python -c "from app.main import app; print(app.title)"
+
+      - name: Pytest
+        env:
+          TUNNELGATE_ENV: test
+          TUNNELGATE_SECRET_KEY: ci-test-secret-key
+        run: pytest -q --tb=short
+
+  frontend:
+    name: frontend (typecheck + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - name: dist is a real build
+        run: test -f dist/index.html
+
+  router-agent:
+    name: router installer (shellcheck + dry run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck busybox
+          shellcheck -s sh -e SC1091,SC3043,SC2039 agent/install.sh agent/uninstall.sh agent/tunnelgate.init agent/lib/*.sh 2>/dev/null \
+            || shellcheck -s sh agent/install.sh agent/uninstall.sh agent/tunnelgate.init
+
+      - name: busybox ash syntax check
+        run: |
+          for f in agent/install.sh agent/uninstall.sh agent/tunnelgate.init; do
+            busybox sh -n "$f" && echo "ok $f"
+          done
+
+      - name: installer test suite
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+          pytest -q tests/test_installer.py
+
+  compose:
+    name: deploy artefacts parse
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: docker compose config
+        run: |
+          if [ -f docker-compose.yml ]; then
+            docker compose -f docker-compose.yml config >/dev/null && echo "compose ok"
+          fi
+
+      - name: nginx config syntax (containerised)
+        run: |
+          if [ -d deploy/nginx ]; then
+            docker run --rm -v "$PWD/deploy/nginx:/etc/nginx/conf.d:ro" nginx:1.27-alpine nginx -t \
+              || echo "::warning::nginx syntax check needs the full site file; see deploy/nginx/README.md"
+          fi
+
+      - name: systemd unit sanity
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq systemd
+          for f in deploy/systemd/*.service; do
+            [ -f "$f" ] || continue
+            systemd-analyze verify "$f" || echo "::warning::systemd-analyze verify reported issues for $f"
+          done

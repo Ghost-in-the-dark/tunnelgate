@@ -1,0 +1,12 @@
+[Unit]
+Description=TunnelGate: validate and reload nginx for the generated router routes
+Documentation=file:///opt/tunnelgate/docs/INSTALL_SERVER.md
+
+[Service]
+Type=oneshot
+# Validate BEFORE reloading: a bad render must not be able to take nginx down.
+# nginx -t leaves the running instance untouched on failure, so a broken config
+# file only blocks the reload, and the panel keeps serving the old routes.
+ExecStart=/bin/sh -c '/usr/sbin/nginx -t && /usr/sbin/nginx -s reload || { echo "routes.conf rejected by nginx -t, keeping the running config" >&2; exit 1; }'
+# Do not hammer: a burst of route changes coalesces into one reload.
+Restart=no

@@ -1,0 +1,69 @@
+[Unit]
+Description=TunnelGate panel (LuCI over SSH reverse tunnels)
+Documentation=file:///opt/tunnelgate/docs/ARCHITECTURE.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tunnelgate
+Group=tunnelgate
+WorkingDirectory=/opt/tunnelgate
+EnvironmentFile=/etc/tunnelgate.env
+ExecStart=/opt/tunnelgate/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8080 --proxy-headers --forwarded-allow-ips 127.0.0.1
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=2s
+TimeoutStopSec=20s
+KillSignal=SIGINT
+
+# ---- hardening -------------------------------------------------------------
+# The panel never needs root: it listens on loopback, writes its data directory
+# and the nginx include directory, and talks to the local sshd over the
+# filesystem. Everything below is belt and braces on top of that.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+UMask=0027
+
+# ProtectSystem=strict makes the whole filesystem read-only, so every path the
+# panel legitimately writes has to be listed. /etc/nginx/tunnelgate is writable
+# because PROXY_ROUTES_PATH lives there (docs/INSTALL_SERVER.md section 6); the
+# directory is owned by tunnelgate with mode 0750 and contains nothing but the
+# generated routes.conf and its auth snippet.
+ReadWritePaths=/var/lib/tunnelgate /etc/nginx/tunnelgate
+
+# NOTE ON NGINX RELOAD
+# NoNewPrivileges=yes means this unit cannot use sudo to signal the root-owned
+# nginx master, so TUNNELGATE_PROXY_RELOAD_COMMAND must be EMPTY here and the
+# reload is performed by tunnelgate-nginx-reload.path/.service, which runs as
+# root and fires when the panel rewrites routes.conf. That keeps the route-sync
+# chain working without handing the panel any privilege. If you would rather
+# give the panel a sudoers rule, you must also set NoNewPrivileges=no - sudo
+# cannot elevate under it, and the reload would fail silently forever.
+#
+# With the reload command empty the panel still writes the files atomically and
+# still reports reload_pending in /api/v1/stats, so a stale route is visible in
+# the UI rather than silent.
+
+[Install]
+WantedBy=multi-user.target

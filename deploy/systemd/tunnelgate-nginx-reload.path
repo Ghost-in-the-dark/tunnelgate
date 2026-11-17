@@ -1,0 +1,14 @@
+[Unit]
+Description=TunnelGate: reload nginx when the panel rewrites router routes
+Documentation=file:///opt/tunnelgate/docs/INSTALL_SERVER.md
+
+[Path]
+# The panel rewrites both files atomically (write temp + rename), so the trigger
+# is PathModified; PathChanged would also work but fires on open-for-write, which
+# the atomic rename never does.
+PathModified=/etc/nginx/tunnelgate/routes.conf
+PathModified=/etc/nginx/tunnelgate/routes.auth.conf
+Unit=tunnelgate-nginx-reload.service
+
+[Install]
+WantedBy=multi-user.target

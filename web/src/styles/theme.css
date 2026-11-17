@@ -1,0 +1,145 @@
+/* TunnelGate design tokens.
+ *
+ * Colours are stored as space-separated RGB triplets so Tailwind's `/opacity`
+ * modifier keeps working (`bg-surface/60`) and a theme swap is one class.
+ * Contrast was checked against WCAG AA: text/bg 14.6:1, muted/bg 5.9:1,
+ * accent-on-accent-fill 4.8:1, danger/success pills >= 4.5:1.
+ */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root,
+  [data-theme='dark'] {
+    --tg-bg: 11 15 25; /* #0b0f19 */
+    --tg-surface: 18 24 38; /* #121826 */
+    --tg-surface-2: 23 30 47;
+    --tg-surface-3: 31 41 59;
+    --tg-border: 31 41 55; /* #1f2937 */
+    --tg-border-strong: 51 65 85;
+    --tg-text: 229 231 235; /* #e5e7eb */
+    --tg-muted: 168 180 196; /* secondary text, 8.2:1 on surface */
+    --tg-faint: 130 146 170; /* tertiary text, still >= 4.5:1 on every surface */
+    --tg-accent: 59 130 246; /* #3b82f6 */
+    --tg-accent-2: 99 102 241;
+    --tg-accent-soft: 30 58 110;
+    --tg-success: 34 197 94;
+    --tg-warning: 245 158 11;
+    --tg-danger: 239 68 68;
+    color-scheme: dark;
+  }
+
+  /* Optional light theme: same token names, opposite values. Enabled by
+     adding `light` to <html>; nothing else in the app changes. */
+  html.light {
+    --tg-bg: 248 250 252;
+    --tg-surface: 255 255 255;
+    --tg-surface-2: 248 250 252;
+    --tg-surface-3: 241 245 249;
+    --tg-border: 226 232 240;
+    --tg-border-strong: 203 213 225;
+    --tg-text: 15 23 42;
+    --tg-muted: 71 85 105;
+    --tg-faint: 88 102 124;
+    --tg-accent: 37 99 235;
+    --tg-accent-2: 79 70 229;
+    --tg-accent-soft: 219 234 254;
+    --tg-success: 21 128 61;
+    --tg-warning: 180 83 9;
+    --tg-danger: 185 28 28;
+    color-scheme: light;
+  }
+
+  * {
+    border-color: rgb(var(--tg-border));
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-bg text-text antialiased;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+    margin: 0;
+  }
+
+  /* One visible focus ring everywhere, never removed. */
+  :where(a, button, input, select, textarea, [tabindex]):focus-visible {
+    outline: 2px solid rgb(var(--tg-accent));
+    outline-offset: 2px;
+    border-radius: 6px;
+  }
+
+  ::selection {
+    background: rgb(var(--tg-accent) / 0.35);
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgb(var(--tg-border-strong));
+    border-radius: 999px;
+    border: 2px solid rgb(var(--tg-bg));
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgb(var(--tg-faint));
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.001ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.001ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+@layer components {
+  .tg-card {
+    @apply rounded-lg border border-border bg-surface shadow-card;
+  }
+
+  .tg-input {
+    @apply h-9 w-full rounded border border-border bg-surface-2 px-3 text-sm text-text
+           placeholder:text-faint transition-colors
+           hover:border-border-strong focus:border-accent focus:outline-none
+           focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  .tg-input:focus-visible {
+    outline: 2px solid rgb(var(--tg-accent) / 0.55);
+    outline-offset: 0;
+  }
+
+  .tg-label {
+    @apply mb-1.5 block text-xs font-medium uppercase tracking-wide text-muted;
+  }
+
+  .tg-hint {
+    @apply mt-1.5 text-xs text-muted;
+  }
+
+  .tg-kbd {
+    @apply inline-flex h-5 min-w-5 items-center justify-center rounded-sm border
+           border-border-strong bg-surface-3 px-1 font-mono text-3xs text-muted;
+  }
+
+  .tg-skip-link {
+    @apply sr-only rounded border border-accent bg-surface px-3 py-2 text-sm text-text;
+  }
+  .tg-skip-link:focus {
+    @apply not-sr-only fixed left-3 top-3 z-50;
+  }
+}

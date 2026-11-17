@@ -1,0 +1,125 @@
+# =============================================================================
+# TunnelGate - Caddy alternative to deploy/nginx/tunnelgate.conf
+#
+# This file covers the PANEL and the CONSOLE only. Per-router vhosts are NOT
+# written here: the panel pushes them into Caddy's admin API (PROXY_DRIVER=caddy)
+# and this file must not compete with that. See deploy/caddy/README.md.
+#
+#   caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+#
+# TLS: certificates come from certbot with DNS-01 (a wildcard is required because
+# every router gets its own subdomain and HTTP-01 cannot issue *.host). Caddy is
+# told to use the files directly, which also switches off its own ACME - do not
+# let two clients manage the same names.
+# =============================================================================
+{
+	# The panel talks to this on 127.0.0.1:2019 - the admin API is unauthenticated by
+	# design, so it must never listen on a public interface.
+	admin 127.0.0.1:2019
+	email admin@example.com
+}
+
+(security_headers) {
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "geolocation=(), microphone=(), camera=()"
+		-Server
+	}
+}
+
+(tls_wildcard) {
+	tls /etc/letsencrypt/live/panel.example.com/fullchain.pem /etc/letsencrypt/live/panel.example.com/privkey.pem
+}
+
+# --------------------------------------------------------------------- panel ---
+panel.example.com {
+	import tls_wildcard
+	import security_headers
+
+	header {
+		# xterm.js and the SPA both set inline styles, hence 'unsafe-inline' on
+		# style-src only. script-src stays strict: the bundle has no inline scripts.
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' wss://console.panel.example.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'"
+		X-Frame-Options "DENY"
+	}
+
+	encode zstd gzip
+
+	# Immutable hashed assets. Vite fingerprints the filenames, so a year is safe.
+	@assets path /assets/*
+	header @assets Cache-Control "public, max-age=31536000, immutable"
+
+	# The panel application itself, including the SPA fallback and /api/*.
+	reverse_proxy 127.0.0.1:8080 {
+		header_up X-Real-IP {remote_host}
+	}
+
+	# The auth subrequest is nginx-internal; do not let a browser probe it.
+	respond /__tg/* 404
+}
+
+# ------------------------------------------------------------------- console ---
+# One hostname for every router console, because the router id travels in the
+# single-use ticket, not in the Host header. Caddy upgrades websockets without
+# extra configuration, but the read timeout has to be long: a quiet shell emits
+# nothing for minutes. The app enforces the real idle limit (900 s) and the hard
+# session cap, so this only stops the proxy from cutting a live session first.
+console.panel.example.com {
+	import tls_wildcard
+	import security_headers
+
+	encode zstd gzip
+
+	reverse_proxy 127.0.0.1:8080 {
+		header_up X-Real-IP {remote_host}
+		transport http {
+			dial_timeout 5s
+			read_timeout 3600s
+		}
+		flush_interval -1
+	}
+
+	respond /__tg/* 404
+}
+
+# =============================================================================
+# REFERENCE ONLY - what the panel generates for one router.
+#
+# The panel does not read this file; it PUTs the equivalent JSON route into the
+# admin API, because the router list changes at runtime and rewriting a Caddyfile
+# would need a reload for every router. Shown here so the two forms can be compared
+# and so a hand-built deployment can mirror what the driver does.
+#
+#   demo-office.panel.example.com {
+#       import tls_wildcard
+#       import security_headers
+#
+#       forward_auth 127.0.0.1:8080 {
+#           uri /__tg/auth?router_id=<router-id>&uri={uri}
+#           copy_headers X-Tg-User
+#       }
+#
+#       reverse_proxy 127.0.0.1:20001 {
+#           header_up Host {host}
+#           header_up X-Real-IP {remote_host}
+#           header_up X-Forwarded-Proto {scheme}
+#           header_up X-Tg-Router <router-id>
+#           transport http {
+#               read_timeout 300s
+#           }
+#       }
+#   }
+#
+# Differences from the nginx renderer that matter operationally:
+#
+# * nginx runs auth_request for every request; Caddy's forward_auth does the same
+#   but copies the identity header explicitly via copy_headers.
+# * nginx needs the 'map $http_upgrade $connection_upgrade' dance and an explicit
+#   Connection header; Caddy handles the upgrade on its own. This is why the
+#   generated nginx config carries a second map and this file does not.
+# * A 401 from the gate becomes a 302 to the panel login in both drivers, but
+#   Caddy expresses it as handle_response inside the generated JSON route, not in
+#   this file.
+# =============================================================================

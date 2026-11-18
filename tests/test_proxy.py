@@ -23,6 +23,7 @@ from app.models import (
     Router,
 )
 from app.services import proxy as proxy_module
+from app.services.launch import cookie_header_name
 from app.services.proxy import (
     CADDY_ROUTE_PREFIX,
     ProxyError,
@@ -33,6 +34,7 @@ from app.services.proxy import (
     auth_snippet_path,
     load_routes,
     panel_endpoint,
+    public_origin,
     render_caddy_route,
     render_nginx,
     render_nginx_auth_snippet,
@@ -162,11 +164,29 @@ def test_render_caddy_route_deletes_the_cookie_before_the_router(db, settings, e
     handle[0] is the auth subrequest (which must keep the cookie: it is how the panel
     identifies the operator), handle[1] is the router upstream (which must not see it).
     """
-    route = render_caddy_route(load_routes(db)[0], settings)
-    auth_headers = route["handle"][0]["headers"]["request"]
-    router_headers = route["handle"][1]["headers"]["request"]
+    _launch, auth, upstream = _caddy_steps(render_caddy_route(load_routes(db)[0], settings))
+    auth_headers = auth["headers"]["request"]
+    router_headers = upstream["headers"]["request"]
     assert "delete" not in auth_headers
     assert router_headers["delete"] == ["Cookie"]
+
+
+def test_render_nginx_serves_the_launch_handoff_outside_the_gate(db, settings, edge):
+    """Redeeming a launch ticket cannot itself require a credential for this host.
+
+    "/__tg/enter" must be its own location without auth_request, and it must be proxied to
+    the panel - not to the router - because only the panel can mint the Set-Cookie that this
+    reply carries back to the router host.
+    """
+    block = _block(render_nginx(load_routes(db), settings), "edge-one.panel.test")
+    assert "location = /__tg/enter {" in block
+    enter = block[block.index("location = /__tg/enter {") : block.index("location / {")]
+    assert "auth_request /__tg/auth;" not in enter
+    assert (
+        "proxy_pass http://testserver/__tg/enter?router=$tg_slug&t=$arg_t&next=$arg_next;" in enter
+    )
+    # It must be declared before the catch-all, and the catch-all keeps its gate.
+    assert block.index("/__tg/enter") < block.index("auth_request /__tg/auth;")
 
 
 def test_render_nginx_keeps_the_body_limit_for_luci_uploads(db, settings, edge):
@@ -250,6 +270,41 @@ def test_panel_endpoint_rejects_a_non_http_url(settings):
         panel_endpoint(settings)
 
 
+def test_public_origin_follows_panel_url_on_a_flat_install(settings):
+    settings.panel_url = "https://panel.example.com"
+    settings.panel_host = "panel.example.com"
+    settings.public_url = None
+    assert public_origin(settings) == "https://panel.example.com"
+
+
+def test_public_origin_can_be_stated_explicitly(settings):
+    # The documented shape behind a TLS terminator: panel_url stays loopback for proxy_pass,
+    # and the browser-facing origin is named separately.
+    settings.panel_url = "http://127.0.0.1:8080"
+    settings.public_url = "https://panel.example.com"
+    assert public_origin(settings) == "https://panel.example.com"
+
+
+def test_public_origin_keeps_a_non_default_port(settings):
+    settings.public_url = "https://panel.example.com:8443"
+    assert public_origin(settings) == "https://panel.example.com:8443"
+
+
+def test_public_origin_never_mixes_a_loopback_port_into_a_public_host(settings):
+    # panel_host names a different host from panel_url, so panel_url's port is meaningless
+    # for the browser: 8080 on the public name would be wrong.
+    settings.panel_url = "http://127.0.0.1:8080"
+    settings.panel_host = "panel.example.com"
+    settings.public_url = None
+    assert public_origin(settings) == "http://panel.example.com"
+
+
+def test_public_origin_rejects_a_non_http_url(settings):
+    settings.public_url = "ftp://panel.example.com"
+    with pytest.raises(ProxyError):
+        public_origin(settings)
+
+
 # --------------------------------------------------------------------- template drift
 def test_router_vhost_template_still_matches_the_renderer(settings):
     """The reference template in deploy/ must describe the block the code actually emits."""
@@ -267,6 +322,7 @@ def test_router_vhost_template_still_matches_the_renderer(settings):
         "ssl_protocols TLSv1.2 TLSv1.3;",
         "ssl_prefer_server_ciphers off;",
         "client_max_body_size 64m;",
+        "location = /__tg/enter {",
         "auth_request /__tg/auth;",
         "error_page 401 = @tg_login;",
         "proxy_http_version 1.1;",
@@ -284,7 +340,14 @@ def test_router_vhost_template_still_matches_the_renderer(settings):
 
 def test_router_vhost_template_has_no_unexpanded_leftovers(settings):
     template = TEMPLATE.read_text()
-    for placeholder in ("<slug>", "<suffix>", "<router_id>", "<tunnel_port>", "<bind>"):
+    for placeholder in (
+        "<slug>",
+        "<suffix>",
+        "<router_id>",
+        "<tunnel_port>",
+        "<bind>",
+        "<panel_host>",
+    ):
         assert placeholder in template
     # The template must never carry a real hostname or a real certificate path.
     assert "panel.example.com" not in template.replace(
@@ -449,32 +512,65 @@ def _caddy_transport(handler) -> httpx.MockTransport:
     return httpx.MockTransport(handler)
 
 
+def _caddy_steps(route) -> tuple[dict, dict, dict]:
+    """(launch hand-off, auth subrequest, router upstream) out of a rendered route.
+
+    The route wraps its work in one subroute because the launch hand-off has to run before
+    the gate; each step is then a plain reverse_proxy the tests can inspect by name.
+    """
+    subroute = route["handle"][0]
+    assert subroute["handler"] == "subroute"
+    launch = subroute["routes"][0]
+    steps = subroute["routes"][1]["handle"]
+    assert [step["handler"] for step in steps] == ["reverse_proxy", "reverse_proxy"]
+    return launch, steps[0], steps[1]
+
+
 def test_render_caddy_route_matches_the_host_and_hides_the_tunnel(settings):
     spec = RouteSpec(router_id="rid-1", slug="edge-one", port=20001, bind_address="127.0.0.1")
     route = render_caddy_route(spec, settings)
 
     assert route["@id"] == CADDY_ROUTE_PREFIX + "rid-1"
     assert route["match"] == [{"host": ["edge-one.panel.test"]}]
-    handlers = [item["handler"] for item in route["handle"]]
-    assert handlers == ["reverse_proxy", "reverse_proxy"]
-    auth, upstream = route["handle"]
+    _launch, auth, upstream = _caddy_steps(route)
     auth_uri = auth["rewrite"]["uri"]
     assert auth_uri == "/__tg/auth?router_id=rid-1&uri={http.request.uri}"
     assert upstream["upstreams"] == [{"dial": "127.0.0.1:20001"}]
 
 
+def test_render_caddy_route_serves_the_launch_handoff_before_the_gate(settings):
+    """The hand-off cannot sit behind auth_request: redeeming it is what creates the cookie."""
+    spec = RouteSpec(router_id="rid-1", slug="edge-one", port=20001, bind_address="127.0.0.1")
+    launch, auth, _upstream = _caddy_steps(render_caddy_route(spec, settings))
+
+    assert launch["match"] == [{"path": ["/__tg/enter"]}]
+    assert "/__tg/auth" not in json.dumps(launch)
+    handler = launch["handle"][0]
+    assert handler["handler"] == "reverse_proxy"
+    assert handler["rewrite"]["method"] == "GET"
+    uri = handler["rewrite"]["uri"]
+    assert uri.startswith("/__tg/enter?router=edge-one")
+    assert "t={query.t}" in uri
+    # The auth subrequest must stay a separate step, or the gate would never run.
+    assert auth["rewrite"]["uri"].startswith("/__tg/auth?")
+
+
 def test_render_caddy_route_redirects_an_unauthenticated_browser(settings):
     spec = RouteSpec(router_id="rid-1", slug="edge-one", port=20001, bind_address="127.0.0.1")
-    auth = render_caddy_route(spec, settings)["handle"][0]
+    _launch, auth, _upstream = _caddy_steps(render_caddy_route(spec, settings))
     handlers = [item for entry in auth["handle_response"] for item in entry["routes"]]
-    assert any(
-        handler["handle"][0].get("status_code") == 302 for handler in handlers if handler["handle"]
-    )
+    redirects = [handler["handle"][0] for handler in handlers if handler["handle"]]
+    location = [entry for entry in redirects if entry.get("status_code") == 302]
+    assert location, "a 401 from the gate must send the browser to the login page"
+    # ... and the login page must send them back HERE, not to the panel dashboard.
+    target = location[0]["headers"]["Location"][0]
+    assert "router=edge-one" in target
+    assert "next={http.request.uri}" in target
 
 
 def test_render_caddy_route_only_forwards_the_identity_header_on_success(settings):
     spec = RouteSpec(router_id="rid-1", slug="edge-one", port=20001, bind_address="127.0.0.1")
-    auth = render_caddy_route(spec, settings)["handle"][0]
+    _launch, auth, _upstream = _caddy_steps(render_caddy_route(spec, settings))
     success = [entry for entry in auth["handle_response"] if entry["match"] == {"status_code": [2]}]
     assert success, "the 2xx branch that carries X-Tg-User is missing"
     body = json.dumps(success[0])
@@ -630,6 +726,20 @@ def test_shipped_nginx_conf_has_the_console_vhost() -> None:
     assert "location /__tg/ {" in block and "return 404;" in block
 
 
+def test_shipped_nginx_conf_exposes_the_panel_launch_handoff() -> None:
+    """The hand-off starts on the panel host, so this vhost must proxy it."""
+    text = PANEL_CONF.read_text()
+    block = _artifact_block(text, "panel.example.com")
+
+    assert "location = /__tg/launch {" in block
+    launch = block[block.index("location = /__tg/launch {") : block.index("location /__tg/ {")]
+    assert "proxy_pass http://127.0.0.1:8080;" in launch
+    # It must come BEFORE the blanket /__tg/ 404, or nginx never reaches it.
+    assert block.index("location = /__tg/launch {") < block.index("location /__tg/ {")
+    # The gate and the router-side redemption stay unreachable from the panel host.
+    assert "location /__tg/ {" in block and "return 404;" in block
+
+
 def test_shipped_nginx_conf_declares_the_upgrade_map_once() -> None:
     """nginx allows one map per target variable; the generated include declares its own."""
     text = PANEL_CONF.read_text()
@@ -703,3 +813,246 @@ def test_setup_script_installs_the_shipped_units_and_dropins() -> None:
     # An invalid sshd config must abort before the reload, or the operator is locked out.
     assert "sshd -t" in text
     assert "nginx -t" in text
+
+
+# --------------------------------------------------------------- path mode (one gateway host)
+def _path_settings(settings, **kw):
+    """Settings in path mode, gateway on its OWN name, with the fixture's routes path."""
+    params = {
+        "route_mode": "path",
+        "gateway_host": "gate.panel.test",
+        "proxy_driver": "nginx",
+    }
+    params.update(kw)
+    for key, value in params.items():
+        setattr(settings, key, value)
+    return settings
+
+
+def _merged_path_settings(settings, **kw):
+    """Path mode with the gateway collapsed onto the panel's own host (merged layout)."""
+    _path_settings(settings, **kw)
+    settings.gateway_host = settings.panel_host
+    return settings
+
+
+def test_render_nginx_path_emits_one_server_block_for_the_gateway(db, settings, edge):
+    _path_settings(settings)
+    rendered = render_nginx(load_routes(db), settings)
+    assert rendered.count("server {") == 1
+    assert "server_name gate.panel.test;" in rendered
+    # No per-router vhost may survive: that is the whole point of the mode.
+    assert "edge-one.panel.test" not in rendered
+    assert "map $http_upgrade $tg_connection_upgrade {" in rendered
+
+
+def test_render_nginx_path_scopes_each_router_to_its_own_prefix(db, settings, edge):
+    _path_settings(settings)
+    rendered = render_nginx(load_routes(db), settings)
+    assert "location /edge-one/ {" in rendered
+    assert f"proxy_pass http://127.0.0.1:{edge.remote_port}/;" in rendered
+    assert "auth_request /__tg/auth;" in rendered
+    assert "error_page 401 = @tg_login;" in rendered
+    assert f"set $tg_router '{edge.id}';" in rendered
+    assert "set $tg_slug 'edge-one';" in rendered
+
+
+def test_render_nginx_path_rewrites_root_absolute_urls(db, settings, edge):
+    """LuCI emits /luci-static/... and /cgi-bin/luci/... - under a prefix those 404."""
+    _path_settings(settings)
+    block = render_nginx(load_routes(db), settings)
+    assert 'proxy_set_header Accept-Encoding "";' in block
+    assert "sub_filter_once off;" in block
+    assert """sub_filter 'href="/' 'href="/edge-one/';""" in block
+    assert """sub_filter 'src="/'  'src="/edge-one/';""" in block
+    assert """sub_filter 'action="/' 'action="/edge-one/';""" in block
+    # A redirect out of LuCI must come back inside the prefix too: the captured group
+    # already starts with "/", so the replacement is /edge-one + /cgi-bin/luci.
+    assert "proxy_redirect ~^(/[^/].*)$ /edge-one$1;" in block
+
+
+def test_render_nginx_path_rewrites_luci_own_url_builder(db, settings, edge):
+    """The rules that decide whether path mode works are the ones LuCI's env needs.
+
+    Real LuCI builds its page environment as JSON with every slash escaped, so the page
+    carries a backslash before each slash inside the value. luci.js then derives EVERY url
+    it emits - menu links, the view and class loader, rpc and ubus endpoints - from those
+    values. Rewriting only href/src/action therefore leaves the application generating
+    root-absolute urls that resolve to the gateway root, so the menus 404 and the loader asks
+    for /luci-static/resources/<name>.js. These assertions pin the four rules that fix it.
+    """
+    _path_settings(settings)
+    block = render_nginx(load_routes(db), settings)
+
+    # nginx unescapes quoted strings, so the doubled backslash in the file is what the page
+    # itself has once. Built through chr() to keep this file free of literal backslashes.
+    esc = chr(92) * 2 + "/"
+    dq = chr(34)
+    prefix = "edge-one"
+    for key in ("scriptname", "resource", "media", "ubuspath"):
+        assert "        sub_filter '" + dq + key + dq + ":" + dq + esc + "'" in block
+        assert "'" + dq + key + dq + ":" + dq + esc + prefix + esc + "'" in block
+
+    # The rule must not pin the router-specific tail either: the same template has to work
+    # for whatever path the router answers under.
+    assert "cgi-bin" not in block.split("_luci_env_rules")[0].split("router LuCI")[0]
+
+    # A byte-level check on the rendered text: the doubled backslash really is there, so the
+    # config nginx reads and the page LuCI serves agree on what to search for.
+    assert chr(92) * 2 + "/" + prefix in block
+
+
+def test_render_nginx_path_scopes_the_router_cookie_to_the_prefix(db, settings, edge):
+    """Every router shares the host, so an unscoped cookie would reach its neighbours."""
+    _path_settings(settings)
+    block = render_nginx(load_routes(db), settings)
+    assert "proxy_cookie_path / /edge-one/;" in block
+
+
+def test_render_nginx_path_keeps_the_enter_location_outside_the_gate(db, settings, edge):
+    _path_settings(settings)
+    block = render_nginx(load_routes(db), settings)
+    assert "location = /edge-one/__tg/enter {" in block
+    enter = block[block.index("location = /edge-one/__tg/enter {") :]
+    enter = enter[: enter.index("location /edge-one/ {")]
+    # The comment above says "No auth_request here"; the directive must not be there either.
+    directives = [line for line in enter.splitlines() if not line.strip().startswith("#")]
+    assert all("auth_request" not in line for line in directives)
+    assert "/__tg/enter?router=$tg_slug&t=$arg_t&next=$arg_next;" in enter
+
+
+def test_render_nginx_path_answers_a_bare_prefix_with_a_redirect(db, settings, edge):
+    _path_settings(settings)
+    block = render_nginx(load_routes(db), settings)
+    assert "location = /edge-one {" in block
+    assert "return 308 /edge-one/;" in block
+
+
+def test_render_nginx_path_keeps_the_root_closed(db, settings, edge):
+    """The gateway root belongs to no router; the panel is on another host."""
+    _path_settings(settings)
+    block = render_nginx(load_routes(db), settings)
+    assert "location / {" in block
+    assert "return 404;" in block
+
+
+# ---------------------------------------------- path mode, merged onto the panel host
+def _directives(block: str) -> list[str]:
+    """The lines that are config, not commentary.
+
+    Merged mode's header explains the layout in prose - including an example server{} -
+    so counting "server {" over the raw text measures the comment, not the config.
+    """
+    return [line for line in block.splitlines() if not line.strip().startswith("#")]
+
+
+def test_merged_layout_renders_locations_only(db, settings, edge):
+    """A second server block for the panel's name would be served first and 404 the panel.
+
+    nginx takes the FIRST server block matching a name, and an included one is first, so a
+    full gateway block would claim the host: every panel page becomes 404 while nginx -t
+    keeps passing. The merged renderer therefore emits no server{} and no map at all.
+    """
+    _merged_path_settings(settings)
+    block = render_nginx(load_routes(db), settings)
+    config = "\n".join(_directives(block))
+
+    assert "server {" not in config
+    assert "server_name" not in config
+    # map is illegal inside a server block, so it cannot live in an included file either.
+    assert "map $http_upgrade" not in config
+    # ... but the routers are all there, as locations.
+    assert "location /edge-one/ {" in block
+    assert "location = /__tg/auth {" in block
+
+
+def test_merged_layout_tells_the_operator_where_to_include_it(db, settings, edge):
+    """The include context is the one part of this layout that fails silently."""
+    _merged_path_settings(settings)
+    block = render_nginx(load_routes(db), settings)
+    assert "LOCATIONS ONLY" in block
+    assert "INSIDE the panel server block" in block
+    assert "include " + str(settings.proxy_routes_path) + ";" in block
+
+
+def test_merged_layout_reuses_the_connection_upgrade_map_of_the_panel_vhost(db, settings, edge):
+    """nginx allows one map per target variable, and the panel vhost already owns it."""
+    _merged_path_settings(settings)
+    block = render_nginx(load_routes(db), settings)
+    assert "proxy_set_header Connection $connection_upgrade;" in block
+    assert "$tg_connection_upgrade" not in block
+
+
+def test_merged_layout_keeps_the_router_cookie_scoping(db, settings, edge):
+    """Same host, so scoping matters MORE here: the panel cookie lives on this origin too."""
+    _merged_path_settings(settings)
+    block = render_nginx(load_routes(db), settings)
+    assert "proxy_cookie_path / /edge-one/;" in block
+    assert 'proxy_set_header Cookie "";' in block
+
+
+def test_merged_layout_renders_an_empty_file_without_routes(db, settings):
+    _merged_path_settings(settings)
+    rendered = render_nginx([], settings)
+    config = "\n".join(_directives(rendered))
+    assert "No routers currently have an allocated tunnel port." in rendered
+    assert "location / {" not in config
+    assert "server {" not in config
+
+
+def test_merged_layout_indents_locations_for_a_server_block(db, settings, edge):
+    """These lines land inside someone else's server block; 4 spaces keeps it readable."""
+    _merged_path_settings(settings)
+    block = render_nginx(load_routes(db), settings)
+    lines = _directives(block)
+    auth = next(line for line in lines if line.strip().startswith("location = /__tg/auth"))
+    assert auth == "    location = /__tg/auth {"
+    router = next(line for line in lines if line.strip().startswith("location /edge-one/ {"))
+    assert router == "    location /edge-one/ {"
+
+
+def test_a_gateway_that_only_differs_by_case_is_still_merged(settings):
+    """Host names are case-insensitive; TCPGATEWAY_HOST == panel.example.COM must merge."""
+    _path_settings(settings, gateway_host=settings.panel_host.upper())
+    assert settings.gateway_merged is True
+
+
+def test_merged_is_false_outside_path_mode(settings):
+    settings.route_mode = "subdomain"
+    settings.gateway_host = settings.panel_host
+    assert settings.gateway_merged is False
+
+
+def test_render_nginx_path_forwards_exactly_one_cookie_to_the_gate(db, settings, edge):
+    _path_settings(settings)
+    header = cookie_header_name(settings.router_cookie_name)
+    block = render_nginx(load_routes(db), settings)
+    assert f"proxy_set_header {header} $cookie_{settings.router_cookie_name};" in block
+    # The router upstream must never see a browser cookie: the gate already authorised it.
+    assert 'proxy_set_header Cookie "";' in block
+
+
+def test_render_nginx_path_renders_an_empty_file_without_routes(db, settings):
+    """No routers is a normal state on a fresh install; the gateway still has to be valid."""
+    _path_settings(settings)
+    rendered = render_nginx([], settings)
+    assert "No routers currently have an allocated tunnel port." in rendered
+    assert "location / {" in rendered
+    assert "/__tg/enter" not in rendered
+
+
+def test_render_nginx_auth_snippet_explains_itself_in_path_mode(settings):
+    _path_settings(settings)
+    snippet = render_nginx_auth_snippet(settings)
+    assert proxy_module.GENERATED_MARKER in snippet
+    assert "/__tg/auth" in snippet
+    assert "routes.conf" in snippet
+
+
+def test_caddy_refuses_path_mode_instead_of_half_implementing_it(db, settings, edge):
+    _path_settings(settings, proxy_driver="caddy")
+    with pytest.raises(ProxyError) as excinfo:
+        render_caddy_route(load_routes(db)[0], settings)
+    message = str(excinfo.value)
+    assert "nginx" in message
+    assert "path" in message

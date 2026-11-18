@@ -148,7 +148,15 @@ TUNNELGATE_LOG_LEVEL=info
 # --- panel ---
 TUNNELGATE_PANEL_URL=https://$HOST
 TUNNELGATE_PANEL_HOST=$HOST
+# The origin browsers use; every redirect the panel writes names it. Equal to PANEL_URL on
+# a flat install like this one - it only has to differ when PANEL_URL goes loopback behind
+# a TLS terminator (docs/INSTALL_SERVER.md section 7).
+TUNNELGATE_PUBLIC_URL=https://$HOST
 TUNNELGATE_SUBDOMAIN_SUFFIX=$HOST
+# subdomain = <slug>.$HOST (needs a wildcard certificate). path = one gateway host and
+# https://<gateway>/<slug>/ per router (ordinary certificate, nginx only). Left at
+# subdomain here: switching is a deliberate change, see docs/INSTALL_SERVER.md section 0.
+TUNNELGATE_ROUTE_MODE=subdomain
 TUNNELGATE_COOKIE_SECURE=true
 # Deliberately NO TUNNELGATE_COOKIE_DOMAIN: unset, tg_session is host-only, so it is never
 # sent to <slug>.$HOST (a router's LuCI) and a compromised router cannot replay the

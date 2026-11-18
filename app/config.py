@@ -13,6 +13,40 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SLUG_RE = r"^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$"
 
+# Slugs that must never be handed to a router. In subdomain mode a slug is a DNS label and
+# any valid label works, but path mode publishes the router at <gateway>/<slug>/ on the
+# PANEL's own host in the merged layout, so a slug is also a first-path-segment there - and
+# the panel already owns several of those. The collision is not cosmetic, and which one you
+# get depends on the name:
+#
+#   * "api", "assets"  - nginx rejects the whole config ("duplicate location"): the panel
+#     vhost already declares location /api/ and /assets/. nginx -t fails, so the panel can
+#     no longer render routes at all until the router is renamed.
+#   * "login", "hosts", "routers", "audit", "settings", "automations", "access" - the config
+#     parses and the router silently SHADOWS the panel page. A router slugged "login" is
+#     worse than silent: /login 308s to /login/, the router location 401s, and the bounce
+#     goes back to /login?router=login - an unbreakable loop that locks the operator out of
+#     the panel entirely, so it cannot even be renamed through the UI.
+#   * "__tg" - the internal gate namespace.
+#
+# Refusing these only costs an operator a different name, and the alternative is a locked-out
+# panel, so they are rejected at creation time in both modes (a deployment can switch to path
+# mode later, and slugs never change once baked into DNS).
+RESERVED_SLUGS = frozenset(
+    {
+        "__tg",
+        "access",
+        "api",
+        "assets",
+        "audit",
+        "automations",
+        "hosts",
+        "login",
+        "routers",
+        "settings",
+    }
+)
+
 
 def utcnow() -> datetime:
     """Naive UTC now. Every datetime inside TunnelGate is naive UTC; the API adds a Z."""
@@ -37,11 +71,32 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ panel / http
     panel_url: str = "http://127.0.0.1:8080"
     panel_host: str = "panel.example.com"
+    # The origin a BROWSER sees, used by every redirect this panel writes (the login bounce
+    # from a router vhost, and the launch hand-off). Unset, it is derived from panel_url's
+    # scheme and panel_host - which is right on a flat install, where those name the same
+    # thing. It must be set whenever panel_url is loopback, i.e. behind a TLS terminator:
+    # redirecting a browser to http://127.0.0.1:8080 cannot work.
+    public_url: str | None = None
     cookie_name: str = "tg_session"
     cookie_domain: str | None = None
     cookie_secure: bool = False
     session_ttl_minutes: int = 720
     csrf_header: str = "X-CSRF-Token"
+    # ------------------------------------------------------------------ router launch
+    # The "Public route" link and every "Open LuCI" action open
+    # https://<slug>.<host_suffix>, a host the browser holds no panel cookie for. A one-time
+    # launch ticket carries the operator from the panel to a single router vhost instead of
+    # widening the session cookie to the whole domain: /__tg/enter redeems it, sets a cookie
+    # scoped to THAT router host only, and redirects to the page that was asked for. The gate
+    # then accepts either credential. Name/scope of the per-router cookie (deliberately a
+    # different name from the panel session, so the two can never be confused).
+    router_cookie_name: str = "tg_luci"
+    # How long the launch ticket stays redeemable. Short on purpose: it is created by a click
+    # and consumed by the redirect that follows it, so anything longer is only exposure.
+    launch_ticket_ttl_seconds: int = 120
+    # How long the browser keeps the router-host cookie. LuCI has no session of its own here,
+    # so this is the whole authorization lifetime for that one device.
+    router_session_ttl_minutes: int = 60
     # Reverse-proxy support. The panel is usually published by nginx, Caddy, Traefik or a cloud
     # load balancer, so the socket peer is the proxy and the client address arrives in
     # X-Forwarded-For. Those headers are attacker-controlled unless the peer is one of ours,
@@ -93,6 +148,21 @@ class Settings(BaseSettings):
     caddy_admin_url: str = "http://127.0.0.1:2019"
     caddy_server: str = "srv0"
     subdomain_suffix: str | None = None
+    # How a router's LuCI is addressed.
+    #
+    #   subdomain  https://<slug>.<host_suffix>      (one vhost per router, wildcard cert)
+    #   path       https://<gateway_host>/<slug>/    (one vhost for the whole fleet)
+    #
+    # Path routing exists because a wildcard certificate and DNS for *.<suffix> are not always
+    # available: with a single name (a free dynamic-DNS host, say) subdomains cannot be issued
+    # at all, and an IP address can never be a subdomain suffix. It costs three rewrites in the
+    # proxy layer (cookies, redirects, root-absolute URLs in LuCI's own HTML), which
+    # render_nginx() emits in path mode.
+    route_mode: str = "subdomain"
+    # The one host that serves every router in path mode. Unset it defaults to
+    # gate.<host_suffix>; the panel keeps its own host, so a router credential is still
+    # scoped to this host and never travels to the panel origin.
+    gateway_host: str | None = None
 
     # ------------------------------------------------------------------ console (web terminal)
     console_enabled: bool = True
@@ -135,10 +205,72 @@ class Settings(BaseSettings):
         return self.subdomain_suffix or self.panel_host
 
     @property
+    def route_mode_normalized(self) -> str:
+        """route_mode, reduced to the two values the renderers understand.
+
+        Unknown values fall back to "subdomain" rather than raising: a typo in one env var
+        must not stop the panel from booting, and the renderers' behaviour is what defines a
+        mode. `tunnelgate doctor` fails the unknown value, so the mistake is still visible.
+        """
+        text = str(self.route_mode or "").strip().lower()
+        return text if text in ("subdomain", "path") else "subdomain"
+
+    @property
+    def path_routing(self) -> bool:
+        return self.route_mode_normalized == "path"
+
+    @property
+    def gateway(self) -> str:
+        """The host every router is published on in path mode (unused for subdomains).
+
+        Defaults to gate.<host_suffix> so a deployment only has to set a DNS name once. A
+        separate name is still the recommended shape - see gateway_merged - but an operator
+        whose only public name is the panel's own can collapse the two, and the renderer
+        handles that case instead of refusing it.
+        """
+        explicit = str(self.gateway_host or "").strip()
+        if explicit:
+            return explicit
+        return f"gate.{self.host_suffix}"
+
+    @property
+    def gateway_merged(self) -> bool:
+        """True when path mode publishes routers under the panel's own host.
+
+        The renderer has to know, because the two layouts are structurally different:
+
+          * separate - routes.conf declares its own server{} block for the gateway name and
+            is included from the nginx *http* context;
+          * merged   - routes.conf declares LOCATIONS ONLY and must be included inside the
+            panel server block, because a second server block for the same name would be
+            served first (nginx picks the first name match) and would answer 404 on every
+            panel page while nginx -t stayed green.
+
+        Comparing the names is exact and deliberately not fuzzy: "gate." + panel_host is a
+        different name and keeps the separate, origin-isolated layout.
+        """
+        if not self.path_routing:
+            return False
+        panel = str(self.panel_host or "").strip().strip(".").lower()
+        gateway = str(self.gateway or "").strip().strip(".").lower()
+        return bool(panel) and panel == gateway
+
+    @property
     def web_dist(self) -> Path:
         return self.static_dir or (REPO_ROOT / "web" / "dist")
 
+    @staticmethod
+    def router_prefix(slug: str) -> str:
+        """The path a router owns in path mode: '/<slug>'.
+
+        One function so the renderers, the launch hand-off and the API cannot drift apart
+        about where a router lives.
+        """
+        return "/" + str(slug).strip().strip("/")
+
     def router_url(self, slug: str) -> str:
+        if self.path_routing:
+            return f"https://{self.gateway}{self.router_prefix(slug)}/"
         return f"https://{slug}.{self.host_suffix}"
 
     @property

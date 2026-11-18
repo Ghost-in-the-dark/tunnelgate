@@ -161,6 +161,34 @@ def panel_endpoint(settings) -> tuple[str, str]:
     return parts.scheme, netloc
 
 
+def public_origin(settings) -> str:
+    """The browser-facing origin of the panel: what a redirect must name.
+
+    Deliberately NOT panel_url. panel_url is the address nginx proxy_passes to and is usually
+    loopback (docs/INSTALL_SERVER.md section 7), so reusing it for a browser redirect sends a
+    TLS visitor to http://127.0.0.1:8080. TUNNELGATE_PUBLIC_URL states the public origin
+    explicitly; without it the historic derivation is kept (panel_url's scheme with
+    panel_host, and panel_url's port only when that names the same host).
+    """
+    raw = str(getattr(settings, "public_url", None) or "").strip()
+    if raw:
+        parts = urlsplit(raw)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise ProxyError(f"TUNNELGATE_PUBLIC_URL is not an http(s) URL: {raw!r}")
+        host = parts.hostname
+        if ":" in host:  # IPv6 literal
+            host = f"[{host}]"
+        return f"{parts.scheme}://{host}" + (f":{parts.port}" if parts.port else "")
+    scheme, netloc = panel_endpoint(settings)
+    panel_host = str(getattr(settings, "panel_host", "") or "").strip()
+    if not panel_host:
+        return f"{scheme}://{netloc}"
+    parts = urlsplit(str(settings.panel_url))
+    same_host = (parts.hostname or "").lower() == panel_host.lower()
+    port = f":{parts.port}" if (same_host and parts.port) else ""
+    return f"{scheme}://{panel_host}{port}"
+
+
 def auth_snippet_path(routes_path: str | Path) -> Path:
     """Where the shared auth_request snippet lives (next to the routes include)."""
     path = Path(routes_path)
@@ -168,15 +196,53 @@ def auth_snippet_path(routes_path: str | Path) -> Path:
 
 
 def router_url(settings, slug: str) -> str:
+    """The plain public address of a router's LuCI (what a bookmark should hold).
+
+    Subdomain mode gives every router its own host; path mode gives the whole fleet one host
+    and a per-router prefix. The single place that decision is made - the API, the CLI and the
+    installer all call this instead of building the URL themselves.
+    """
+    if settings.path_routing:
+        return f"https://{settings.gateway}{settings.router_prefix(slug)}/"
     return f"https://{slug}.{settings.host_suffix}"
 
 
 # --------------------------------------------------------------------------- nginx render
 def render_nginx_auth_snippet(settings) -> str:
-    """The shared snippet: one copy, included by every per-router vhost."""
+    """The shared snippet: one copy, included by every per-router vhost.
+
+    Two locations, both built from the per-server $tg_router / $tg_slug variables because
+    auth_request cannot carry arguments and a shared location does not know which vhost it runs
+    for:
+
+    * `location = /__tg/auth` is the subrequest. It forwards exactly ONE cookie - the
+      router-scoped one, via $cookie_<name> - into a dedicated header. A router must never be
+      able to feed the gate an arbitrary Cookie header.
+    * `location @tg_login` sends an anonymous visitor to the panel login with the path they
+      wanted, so signing in lands on the router instead of the panel dashboard.
+
+    `location = /__tg/enter` lives in the server block (render_nginx), because it has to answer
+    on the router host itself: that is what makes its Set-Cookie scoped to this router.
+    """
+    from .launch import cookie_header_name
+
     scheme, netloc = panel_endpoint(settings)
-    # The browser-facing login page lives on the panel hostname, not on router hostnames.
-    panel_public = str(getattr(settings, "panel_host", "") or netloc)
+    # Where a BROWSER is sent: the public origin, never the loopback proxy_pass target.
+    origin = public_origin(settings)
+    cookie_name = str(getattr(settings, "router_cookie_name", "tg_luci") or "tg_luci")
+    cookie_header = cookie_header_name(cookie_name)
+    if settings.path_routing:
+        # One gateway server block means one auth location, and it is already inside
+        # routes.conf: there is no per-router vhost left to share a snippet with. The file is
+        # still written (the panel seeds it at startup and nginx may include it from an old
+        # deployment), so it says why it is empty rather than looking like a failed render.
+        return (
+            f"{GENERATED_MARKER} - DO NOT EDIT.\n"
+            f"# PATH routing mode ({settings.gateway}): the /__tg/auth location and the\n"
+            "# @tg_login redirect are rendered inside the single gateway server block in\n"
+            "# routes.conf. Nothing includes this file any more; it is kept in sync so an\n"
+            "# nginx -t on an old config that still includes it cannot fail on a missing file.\n"
+        )
     return f"""\
 {GENERATED_MARKER} - DO NOT EDIT.
 # Shared auth_request + login redirect, included by every per-router vhost.
@@ -197,15 +263,20 @@ location = /__tg/auth {{
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
+    # The router-scoped credential. Exactly one cookie goes to the gate: $cookie_tg_luci,
+    # never $http_cookie. The panel session is deliberately not forwarded - it is scoped to
+    # the panel host and has no business here.
+    proxy_set_header {cookie_header} $cookie_{cookie_name};
     proxy_connect_timeout 5s;
     proxy_read_timeout 10s;
     proxy_send_timeout 10s;
 }}
 
 # Reached through "error_page 401 = @tg_login". We redirect instead of returning the
-# panel's JSON error because the visitor is a human with a browser.
+# panel's JSON error because the visitor is a human with a browser. next= carries the page
+# they asked for on THIS host; the login screen hands them back here with a ticket.
 location @tg_login {{
-    return 302 {scheme}://{panel_public}/login?router=$tg_slug&next=$request_uri;
+    return 302 {origin}/login?router=$tg_slug&next=$request_uri;
 }}
 """
 
@@ -213,12 +284,17 @@ location @tg_login {{
 def render_nginx(routes: list[RouteSpec], settings) -> str:
     """Render the full include file: map + one server block per router.
 
-    Pure function - the unit tests compare strings, so no I/O happens here.
+    Pure function - the unit tests compare strings, so no I/O happens here. Path mode is a
+    different shape entirely (one host, many locations), so it has its own renderer.
     """
+    if settings.path_routing:
+        return render_nginx_path(routes, settings)
     suffix = settings.host_suffix
     cert = _tls_cert_path(settings)
     key = _tls_key_path(settings)
-    panel_endpoint(settings)  # validates TUNNELGATE_PANEL_URL before rendering
+    # Validates TUNNELGATE_PANEL_URL before rendering, and gives the launch location the panel
+    # address it proxies to.
+    scheme, netloc = panel_endpoint(settings)
     snippet = auth_snippet_path(settings.proxy_routes_path)
     body_limit = _client_max_body(settings)
 
@@ -280,6 +356,28 @@ def render_nginx(routes: list[RouteSpec], settings) -> str:
                 "",
                 f"    include {snippet};",
                 "",
+                '    # The launch hand-off. "Open LuCI" and "Public route" point here rather than at',
+                "    # the bare URL: the panel mints a one-time ticket, the browser follows it to this",
+                "    # location on THIS host, and the panel's Set-Cookie reply therefore lands on this",
+                "    # router's hostname - the only scope that works without widening the panel",
+                "    # session cookie to the whole domain (see docs/SECURITY.md, threat A11).",
+                "    location = /__tg/enter {",
+                "        # No auth_request here: this location IS the way in. It validates the ticket",
+                "        # (or an existing router cookie) itself and answers with a redirect.",
+                f"        proxy_pass {scheme}://{netloc}/__tg/enter?router=$tg_slug&t=$arg_t&next=$arg_next;",
+                "        proxy_method GET;",
+                "        proxy_pass_request_body off;",
+                '        proxy_set_header Content-Length "";',
+                "        proxy_set_header Host $host;",
+                "        proxy_set_header X-Original-URI $request_uri;",
+                "        proxy_set_header X-Real-IP $remote_addr;",
+                "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
+                "        proxy_set_header X-Forwarded-Proto $scheme;",
+                "        proxy_connect_timeout 5s;",
+                "        proxy_read_timeout 10s;",
+                "        proxy_send_timeout 10s;",
+                "    }",
+                "",
                 "    location / {",
                 "        auth_request /__tg/auth;",
                 "        error_page 401 = @tg_login;",
@@ -295,11 +393,13 @@ def render_nginx(routes: list[RouteSpec], settings) -> str:
                 "        proxy_set_header X-Forwarded-Port  $server_port;",
                 "        proxy_set_header X-Tg-Router       $tg_router;",
                 "",
-                "        # The panel session cookie must never reach a router. If",
-                "        # TUNNELGATE_COOKIE_DOMAIN is set, a browser sends tg_session to",
-                "        # <slug>.<suffix> too, and without this line the router's LuCI (and anyone",
-                "        # reading its logs) receives a live panel session - full panel access, not",
-                "        # just that one device. An empty value deletes the header.",
+                "        # No browser cookie reaches the router's LuCI. If",
+                "        # TUNNELGATE_COOKIE_DOMAIN is set the browser also sends tg_session here,",
+                "        # and without this line the router (and anyone reading its logs) would",
+                "        # receive a live panel session - full panel access, not just this device.",
+                "        # The browser's own tg_luci must not be forwarded either: the gate already",
+                "        # accepted it (through the dedicated header in the auth snippet) and LuCI",
+                "        # has no use for it. An empty value deletes the header.",
                 '        proxy_set_header Cookie "";',
                 "",
                 "        # LuCI uses websockets for ubus notifications; the tunnel is plain HTTP.",
@@ -324,7 +424,380 @@ def render_nginx(routes: list[RouteSpec], settings) -> str:
     return "\n".join(out)
 
 
-# --------------------------------------------------------------------------- caddy render
+# ------------------------------------------------------------------ path mode building blocks
+def _luci_env_rules(prefix: str, indent: str = "        ") -> list[str]:
+    """sub_filter rules that move the LuCI url builder under the path prefix.
+
+    LuCI emits its page environment as JSON in which every slash has already been escaped,
+    so the served page really contains
+
+        "scriptname": "<backslash>/cgi-bin<backslash>/luci"
+
+    and luci.js builds EVERY url it emits from those values: menu links, the view and class
+    loader, the rpc calls and the ubus endpoint. Rewriting only the href, src and action
+    attributes therefore leaves the application generating root-absolute urls, which under a
+    prefix resolve to the gateway root: menus 404 and the view loader asks for
+    /luci-static/resources/<name>.js. These rules are what actually relocates it.
+
+    Only the opening of each value is rewritten, so one line per key is enough whatever the
+    router answers. The inserted prefix is written with a doubled backslash because nginx
+    unescapes quoted strings and turns the pair back into the single backslash the page has.
+    The pieces are assembled through chr() so this source file itself stays free of
+    backslashes and double quotes.
+    """
+    name = prefix.strip(chr(47))
+    escaped = chr(92) * 2 + chr(47)
+    dq = chr(34)
+    out = []
+    for key in ("scriptname", "resource", "media", "ubuspath"):
+        head = f"{dq}{key}{dq}:{dq}{escaped}"
+        out.append(f"{indent}sub_filter '{head}' '{head}{name}{escaped}';")
+    return out
+
+
+def _path_auth_locations(settings, indent: str) -> list[str]:
+    """The gate subrequest and the login bounce, as pre-indented location blocks.
+
+    Path mode has two layouts and both need exactly these two locations, so they are built
+    once here and the caller only decides how deep to indent them: four spaces inside a
+    generated server block, eight inside the operator's own panel server block.
+    """
+    from .launch import cookie_header_name
+
+    scheme, netloc = panel_endpoint(settings)
+    # Where a BROWSER is sent: the public origin, never the loopback proxy_pass target.
+    origin = public_origin(settings)
+    cookie_name = str(getattr(settings, "router_cookie_name", "tg_luci") or "tg_luci")
+    cookie_header = cookie_header_name(cookie_name)
+    inner = indent + "    "
+
+    return [
+        indent + "# The gate subrequest. auth_request cannot carry arguments and one shared",
+        indent + "# location serves every router, so each router location below sets",
+        indent + "# $tg_router and this builds the URL from it. Exactly one cookie is",
+        indent + "# forwarded - the router-scoped one - never $http_cookie: a router must",
+        indent + "# not be able to feed the gate an arbitrary Cookie header.",
+        indent + "location = /__tg/auth {",
+        inner + "internal;",
+        "",
+        inner
+        + "proxy_pass "
+        + scheme
+        + "://"
+        + netloc
+        + "/__tg/auth?router_id=$tg_router&uri=$request_uri;",
+        inner + "proxy_method GET;",
+        inner + "proxy_pass_request_body off;",
+        inner + 'proxy_set_header Content-Length "";',
+        inner + "proxy_set_header Host $host;",
+        inner + "proxy_set_header X-Original-URI $request_uri;",
+        inner + "proxy_set_header X-Tg-Router $tg_router;",
+        inner + "proxy_set_header X-Real-IP $remote_addr;",
+        inner + "proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
+        inner + "proxy_set_header X-Forwarded-Proto $scheme;",
+        inner + "proxy_set_header " + cookie_header + " $cookie_" + cookie_name + ";",
+        inner + "proxy_connect_timeout 5s;",
+        inner + "proxy_read_timeout 10s;",
+        inner + "proxy_send_timeout 10s;",
+        indent + "}",
+        "",
+        indent + "# Anonymous visitors are humans with browsers, so bounce them to the login",
+        indent + "# form rather than returning the gate JSON 401. next= carries their page.",
+        indent + "location @tg_login {",
+        inner + "return 302 " + origin + "/login?router=$tg_slug&next=$request_uri;",
+        indent + "}",
+        "",
+    ]
+
+
+def _path_router_locations(
+    routes: list[RouteSpec], settings, indent: str, upgrade_var: str
+) -> list[str]:
+    """One group of locations per router: the launch hand-off, the prefixed proxy, the 308.
+
+    Kept apart from the surrounding block for the same reason as _path_auth_locations: the
+    merged layout includes these locations inside the panel vhost, where a nested server{}
+    is neither legal nor wanted.
+    """
+    scheme, netloc = panel_endpoint(settings)
+    inner = indent + "    "
+    out: list[str] = []
+
+    for spec in routes:
+        prefix = settings.router_prefix(spec.slug)
+        out.extend(
+            [
+                indent
+                + "# ------------------------------------------------------------ "
+                + spec.slug,
+                indent
+                + "# router "
+                + spec.router_id
+                + " -> http://"
+                + spec.bind_address
+                + ":"
+                + str(spec.port),
+                indent + "#",
+                indent + "# The launch hand-off for THIS router. An exact match, or the /<slug>/",
+                indent + "# location below would swallow it and the ticket would reach LuCI.",
+                indent + "location = " + prefix + "/__tg/enter {",
+                inner + "# No auth_request here: this location IS the way in. It validates",
+                inner + "# the ticket (or an existing cookie) itself and answers with a",
+                inner + "# redirect. $request_uri still carries the prefix; the panel keeps",
+                inner + "# it while looking the router up, so the browser stays inside.",
+                inner + "set $tg_router '" + spec.router_id + "';",
+                inner + "set $tg_slug '" + spec.slug + "';",
+                inner
+                + "proxy_pass "
+                + scheme
+                + "://"
+                + netloc
+                + "/__tg/enter?router=$tg_slug&t=$arg_t&next=$arg_next;",
+                inner + "proxy_method GET;",
+                inner + "proxy_pass_request_body off;",
+                inner + '    proxy_set_header Content-Length "";',
+                inner + "proxy_set_header Host $host;",
+                inner + "proxy_set_header X-Original-URI $request_uri;",
+                inner + "proxy_set_header X-Real-IP $remote_addr;",
+                inner + "proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
+                inner + "proxy_set_header X-Forwarded-Proto $scheme;",
+                inner + "proxy_connect_timeout 5s;",
+                inner + "proxy_read_timeout 10s;",
+                inner + "proxy_send_timeout 10s;",
+                indent + "}",
+                "",
+                indent + "location " + prefix + "/ {",
+                inner + "auth_request /__tg/auth;",
+                inner + "error_page 401 = @tg_login;",
+                "",
+                inner + "set $tg_router '" + spec.router_id + "';",
+                inner + "set $tg_slug '" + spec.slug + "';",
+                "",
+                inner + "# The trailing slash strips the /<slug>/ prefix before forwarding:",
+                inner + "# the router keeps answering the paths it always answered.",
+                inner + "proxy_pass http://" + spec.bind_address + ":" + str(spec.port) + "/;",
+                inner + "proxy_http_version 1.1;",
+                "",
+                inner + "# Give the router its own name back rather than the gateway one, so",
+                inner + "# a theme that rebuilds an absolute URL from the request still",
+                inner + "# matches what sub_filter produced below.",
+                inner + "proxy_set_header Host " + spec.slug + ";",
+                inner + "proxy_set_header X-Real-IP         $remote_addr;",
+                inner + "proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;",
+                inner + "proxy_set_header X-Forwarded-Proto $scheme;",
+                inner + "proxy_set_header X-Forwarded-Host  $host;",
+                inner + "proxy_set_header X-Forwarded-Port  $server_port;",
+                inner + "proxy_set_header X-Tg-Router       $tg_router;",
+                inner + "# The prefix LuCI is served under, for backends that honour it.",
+                inner + '    proxy_set_header X-Forwarded-Prefix "' + prefix + '";',
+                "",
+                inner + "# No browser cookie reaches the router LuCI. The gate has already",
+                inner + "# accepted tg_luci through the dedicated header above, and the panel",
+                inner + "# session must never be visible to a device. Empty value = drop it.",
+                inner + '    proxy_set_header Cookie "";',
+                "",
+                inner + "proxy_set_header Upgrade    $http_upgrade;",
+                inner + "proxy_set_header Connection " + upgrade_var + ";",
+                "",
+                inner + "# sub_filter cannot rewrite a compressed body, and LuCI emits",
+                inner + "# root-absolute URLs that would resolve to the gateway root instead",
+                inner + "# of this router. Ask for identity encoding and rewrite on the way.",
+                inner + '    proxy_set_header Accept-Encoding "";',
+                inner + "sub_filter_once off;",
+                inner + "sub_filter 'href=\"/' 'href=\"" + prefix + "/';",
+                inner + "sub_filter 'src=\"/'  'src=\"" + prefix + "/';",
+                inner + "sub_filter 'action=\"/' 'action=\"" + prefix + "/';",
+                "",
+                inner + "# LuCI redirects with a root-absolute Location. Put the prefix back.",
+                inner + "# proxy_redirect only rewrites URLs it recognises as the upstream, so",
+                inner + "# a redirect to another host stays absolute.",
+                inner + "proxy_redirect ~^(/[^/].*)$ " + prefix + "$1;",
+                "",
+                inner + "# Every router shares this host, so an unscoped cookie would travel",
+                inner + "# to the neighbours. Scope everything LuCI sets to this prefix.",
+                inner + "proxy_cookie_path / " + prefix + "/;",
+                "",
+                inner + "proxy_read_timeout    300s;",
+                inner + "proxy_send_timeout    300s;",
+                inner + "proxy_connect_timeout 10s;",
+                inner + "proxy_buffering         off;",
+                inner + "proxy_request_buffering off;",
+                *_luci_env_rules(prefix, inner),
+                indent + "}",
+                "",
+            ]
+        )
+
+    # A bare /<slug> (no trailing slash) would miss the location above and land on whatever
+    # owns / - the panel's SPA in the merged layout.
+    for spec in routes:
+        prefix = settings.router_prefix(spec.slug)
+        out.extend(
+            [
+                indent + "location = " + prefix + " {",
+                inner + "return 308 " + prefix + "/;",
+                indent + "}",
+                "",
+            ]
+        )
+    return out
+
+
+def render_nginx_path(routes: list[RouteSpec], settings) -> str:
+    """Path mode: one host for the fleet, one location per router - in TWO layouts.
+
+    Why a single host at all
+    ------------------------
+    Subdomain routing needs DNS for *.<suffix> and a wildcard certificate. Neither exists on
+    a free dynamic-DNS name, and an IP address can never be a subdomain suffix at all: a
+    browser refuses to parse https://host.192.168.88.107, so no certificate can rescue it.
+    Path mode publishes the whole fleet on one name:
+
+        https://<gateway>/<slug>/cgi-bin/luci  ->  http://127.0.0.1:<port>/cgi-bin/luci
+
+    Three things have to be rewritten for LuCI to survive the prefix, and all three are here:
+
+    1. proxy_pass http://host:port/ - the trailing slash makes nginx strip the matched
+       /<slug>/ prefix before forwarding, so the router keeps seeing the paths it expects.
+    2. sub_filter - LuCI emits ROOT-ABSOLUTE URLs (/luci-static/..., /cgi-bin/luci/...).
+       Under a prefix those resolve to the gateway root and 404. The filter rewrites
+       href/src/action, and _luci_env_rules() rewrites the JSON url builder LuCI actually
+       derives its links from. proxy_set_header Accept-Encoding "" is mandatory: sub_filter
+       cannot touch a compressed body.
+    3. proxy_redirect - LuCI answers with Location: /cgi-bin/luci/...; the browser needs the
+       prefix back, or the login bounce leaves the router path entirely.
+
+    Cookies get the same treatment via proxy_cookie_path: every router shares this one host,
+    so a cookie LuCI sets with Path=/ would be sent to every OTHER router too. Scoping it to
+    the router prefix keeps one device session out of its neighbours.
+
+    Two layouts, decided by comparing the gateway with the panel host
+    ----------------------------------------------------------------
+    **Separate** (gateway != panel host, still the recommended one): this file holds a full
+    server{} block for the gateway plus the map it needs, and nginx includes it from the
+    *http* context. Router content is then served from its own origin, so a compromised
+    router's JavaScript cannot touch the panel origin.
+
+    **Merged** (gateway == panel host): a second server block for the same name would be
+    dead config at best and a trap at worst - nginx serves the FIRST server block that
+    matches a name, so an included gateway block would claim the panel's host and answer 404
+    on every panel page (and nginx -t would still pass, logging only "conflicting server
+    name"). This file therefore emits LOCATIONS ONLY, and the operator includes it INSIDE
+    the panel server block. The router prefixes sit next to the panel's own locations and /
+    still reaches the SPA. What that costs is stated in docs/SECURITY.md: paths are not an
+    origin boundary, so a hostile router page runs in the panel's origin.
+
+    Known limitation, stated rather than hidden: rewriting happens on HTML only. A LuCI theme
+    that builds an absolute URL in JavaScript at runtime, instead of using the <base> the
+    theme emitted, will still point at the gateway root. Subdomain mode has no such gap,
+    which is why it stays the default.
+    """
+    gateway = settings.gateway
+    body_limit = _client_max_body(settings)
+    merged = bool(getattr(settings, "gateway_merged", False))
+    routes_path = str(settings.proxy_routes_path)
+
+    out: list[str] = [
+        f"{GENERATED_MARKER} - DO NOT EDIT.",
+        "# Rewritten by app/services/proxy.py whenever the router/port set changes.",
+        "#",
+        "# PATH routing mode: every router is a location on ONE host.",
+        "#     https://" + gateway + "/<slug>/...  ->  http://127.0.0.1:<tunnel_port>/...",
+        "#",
+        "# Routers in status pending/revoked are absent: no port, nothing to proxy.",
+        "# Offline routers keep their location so a rebooted device reappears by itself.",
+        "#",
+    ]
+
+    if merged:
+        out.extend(
+            [
+                "# MERGED LAYOUT: " + gateway + " is the panel's own host, so this file holds",
+                "# LOCATIONS ONLY - it declares no server{} block (a second block for the same",
+                "# name would be served first and would answer 404 on every panel page).",
+                "#",
+                "# Include it INSIDE the panel server block, after that block's TLS settings",
+                "# and before (or instead of relying on) its own location /:",
+                "#",
+                "#     server {",
+                "#         listen 443 ssl;",
+                "#         server_name " + gateway + ";",
+                "#         ...",
+                "#         include " + routes_path + ";",
+                "#         location / { proxy_pass http://127.0.0.1:8080; ... }",
+                "#     }",
+                "#",
+                "# The router locations reuse the $connection_upgrade map the panel vhost",
+                "# already declares for its own /api/ websocket block. A map is illegal inside",
+                "# a server block, so it cannot live in this file - and nginx allows only one",
+                "# map per target variable, so reusing that name is the only option anyway.",
+                "",
+            ]
+        )
+        out.extend(_path_auth_locations(settings, "    "))
+        if not routes:
+            out.append("    # No routers currently have an allocated tunnel port.")
+            out.append("")
+        out.extend(_path_router_locations(routes, settings, "    ", "$connection_upgrade"))
+        return "\n".join(out)
+
+    cert = _tls_cert_path(settings)
+    key = _tls_key_path(settings)
+
+    out.extend(
+        [
+            "# Include from the nginx *http* context (the panel vhost does this).",
+            "",
+            "map $http_upgrade $tg_connection_upgrade {",
+            "    default upgrade;",
+            "    ''      close;",
+            "}",
+            "",
+            "# ---------------------------------------------------------------- gateway",
+            "# One host for the whole fleet: no wildcard certificate, no per-router DNS.",
+            "server {",
+            "    listen 443 ssl;",
+            "    listen [::]:443 ssl;",
+            "    http2 on;",
+            "    server_name " + gateway + ";",
+            "",
+            "    ssl_certificate     " + cert + ";",
+            "    ssl_certificate_key " + key + ";",
+            "    ssl_protocols TLSv1.2 TLSv1.3;",
+            "    ssl_prefer_server_ciphers off;",
+            "    ssl_session_cache shared:SSL:10m;",
+            "    ssl_session_timeout 1d;",
+            "    ssl_session_tickets off;",
+            "",
+            "    # LuCI firmware uploads are large; the 1m default would answer 413.",
+            "    client_max_body_size " + body_limit + ";",
+            "",
+            '    add_header Strict-Transport-Security "max-age=31536000" always;',
+            '    add_header X-Content-Type-Options "nosniff" always;',
+            '    add_header X-Robots-Tag "noindex, nofollow" always;',
+            "",
+        ]
+    )
+    out.extend(_path_auth_locations(settings, "    "))
+    if not routes:
+        out.append("    # No routers currently have an allocated tunnel port.")
+        out.append("")
+    out.extend(_path_router_locations(routes, settings, "    ", "$tg_connection_upgrade"))
+
+    out.extend(
+        [
+            "    # This host belongs to no single router, and the panel lives elsewhere.",
+            "    location / {",
+            "        return 404;",
+            "    }",
+            "",
+            "}",
+            "",
+        ]
+    )
+    return "\n".join(out)
+
+
 def render_caddy_route(spec: RouteSpec, settings) -> dict[str, Any]:
     """The JSON equivalent of an nginx auth_request vhost, as Caddy route objects.
 
@@ -332,103 +805,160 @@ def render_caddy_route(spec: RouteSpec, settings) -> dict[str, Any]:
     block inspects the subrequest status: 2xx copies the identity header and lets the next
     handler run, anything else returns the subrequest response (401 -> browser). The admin
     API speaks the expanded form, so this builds exactly that.
+
+    The three steps run in this order inside a subroute:
+
+    1. `/__tg/enter` - the launch hand-off. It must come FIRST and must NOT be behind the
+       gate, because redeeming the ticket is how a browser ends up holding a credential for
+       this host at all. Caddy forwards the browser's cookies here, so an operator who
+       already holds the router cookie is simply sent on to the page they asked for.
+    2. the auth subrequest (`/__tg/auth`) - same contract as the nginx snippet. Caddy keeps
+       the browser's Cookie header on this request, so the gate can read the router cookie.
+    3. the router upstream - where the panel session must never appear.
     """
+    if getattr(settings, "path_routing", False):
+        # Refused rather than half-implemented: a Caddy route that matched one host but did not
+        # rewrite root-absolute href/src/action or scope cookies to the prefix would publish a
+        # router that loads LuCI's HTML and then 404s every asset. Say so instead.
+        raise ProxyError(
+            "path routing (TUNNELGATE_ROUTE_MODE=path) is only implemented for the nginx driver; "
+            "use TUNNELGATE_PROXY_DRIVER=nginx, or keep subdomain routing with caddy"
+        )
     host = f"{spec.slug}.{settings.host_suffix}"
-    scheme, netloc = panel_endpoint(settings)
-    panel_public = str(getattr(settings, "panel_host", "") or netloc)
+    netloc = panel_endpoint(settings)[1]
     auth_uri = f"/__tg/auth?router_id={spec.router_id}&uri={{http.request.uri}}"
-    login = f"{scheme}://{panel_public}/login?router={{http.request.host}}"
+    enter_uri = f"/__tg/enter?router={spec.slug}&t={{query.t}}&next={{query.next}}"
+    login = f"{public_origin(settings)}/login?router={spec.slug}&next={{http.request.uri}}"
     return {
         "@id": f"{CADDY_ROUTE_PREFIX}{spec.router_id}",
         "match": [{"host": [host]}],
         "handle": [
             {
-                "handler": "reverse_proxy",
-                "upstreams": [{"dial": netloc}],
-                "rewrite": {"method": "GET", "uri": auth_uri},
-                "headers": {
-                    "request": {
-                        "set": {
-                            "X-Forwarded-Method": ["{http.request.method}"],
-                            "X-Forwarded-Uri": ["{http.request.uri}"],
-                            "X-Tg-Router": [spec.router_id],
-                        }
-                    }
-                },
-                "handle_response": [
+                "handler": "subroute",
+                "routes": [
                     {
-                        "match": {"status_code": [401, 403]},
-                        "routes": [
+                        # Step 1: the launch hand-off. No auth in front of it - it is the way
+                        # in - and the panel's Set-Cookie reply travels back through this host,
+                        # which is what scopes the cookie to this router.
+                        "match": [{"path": ["/__tg/enter"]}],
+                        "handle": [
                             {
-                                "handle": [
-                                    {
-                                        "handler": "static_response",
-                                        "status_code": 302,
-                                        "headers": {"Location": [login]},
+                                "handler": "reverse_proxy",
+                                "upstreams": [{"dial": netloc}],
+                                "rewrite": {"method": "GET", "uri": enter_uri},
+                                "headers": {
+                                    "request": {
+                                        "set": {
+                                            "Host": ["{http.request.host}"],
+                                            "X-Original-URI": ["{http.request.uri}"],
+                                            "X-Forwarded-Proto": ["{http.request.scheme}"],
+                                            "X-Tg-Router": [spec.router_id],
+                                        }
                                     }
-                                ]
+                                },
                             }
                         ],
                     },
                     {
-                        "match": {"status_code": [2]},
-                        "routes": [
-                            {"handle": [{"handler": "vars"}]},
+                        "handle": [
                             {
-                                "handle": [
-                                    {"handler": "headers", "request": {"delete": ["X-Tg-User"]}}
-                                ]
-                            },
-                            {
-                                "match": [
-                                    {
-                                        "not": [
-                                            {
-                                                "vars": {
-                                                    "{http.reverse_proxy.header.X-Tg-User}": [""]
-                                                }
-                                            }
-                                        ]
+                                "handler": "reverse_proxy",
+                                "upstreams": [{"dial": netloc}],
+                                "rewrite": {"method": "GET", "uri": auth_uri},
+                                "headers": {
+                                    "request": {
+                                        "set": {
+                                            "X-Forwarded-Method": ["{http.request.method}"],
+                                            "X-Forwarded-Uri": ["{http.request.uri}"],
+                                            "X-Tg-Router": [spec.router_id],
+                                        }
                                     }
-                                ],
-                                "handle": [
+                                },
+                                "handle_response": [
                                     {
-                                        "handler": "headers",
-                                        "request": {
-                                            "set": {
-                                                "X-Tg-User": [
-                                                    "{http.reverse_proxy.header.X-Tg-User}"
+                                        "match": {"status_code": [401, 403]},
+                                        "routes": [
+                                            {
+                                                "handle": [
+                                                    {
+                                                        "handler": "static_response",
+                                                        "status_code": 302,
+                                                        "headers": {"Location": [login]},
+                                                    }
                                                 ]
                                             }
-                                        },
-                                    }
+                                        ],
+                                    },
+                                    {
+                                        "match": {"status_code": [2]},
+                                        "routes": [
+                                            {"handle": [{"handler": "vars"}]},
+                                            {
+                                                "handle": [
+                                                    {
+                                                        "handler": "headers",
+                                                        "request": {"delete": ["X-Tg-User"]},
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                "match": [
+                                                    {
+                                                        "not": [
+                                                            {
+                                                                "vars": {
+                                                                    "{http.reverse_proxy.header.X-Tg-User}": [
+                                                                        ""
+                                                                    ]
+                                                                }
+                                                            }
+                                                        ]
+                                                    }
+                                                ],
+                                                "handle": [
+                                                    {
+                                                        "handler": "headers",
+                                                        "request": {
+                                                            "set": {
+                                                                "X-Tg-User": [
+                                                                    "{http.reverse_proxy.header.X-Tg-User}"
+                                                                ]
+                                                            }
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                        ],
+                                    },
                                 ],
                             },
+                            {
+                                "handler": "reverse_proxy",
+                                "flush_interval": -1,
+                                "upstreams": [{"dial": f"{spec.bind_address}:{spec.port}"}],
+                                "headers": {
+                                    "request": {
+                                        "set": {
+                                            "Host": ["{http.request.host}"],
+                                            "X-Real-IP": ["{http.request.remote.host}"],
+                                            "X-Forwarded-Host": ["{http.request.host}"],
+                                            "X-Forwarded-Proto": ["{http.request.scheme}"],
+                                            "X-Tg-Router": [spec.router_id],
+                                        },
+                                        # The panel's session cookie must never reach a router:
+                                        # with TUNNELGATE_COOKIE_DOMAIN set the browser sends
+                                        # tg_session to <slug>.<suffix> as well, and a router
+                                        # that keeps it holds a live panel session. Delete it on
+                                        # the way through.
+                                        "delete": ["Cookie"],
+                                    }
+                                },
+                            },
                         ],
+                        "terminal": True,
                     },
                 ],
-            },
-            {
-                "handler": "reverse_proxy",
-                "flush_interval": -1,
-                "upstreams": [{"dial": f"{spec.bind_address}:{spec.port}"}],
-                "headers": {
-                    "request": {
-                        "set": {
-                            "Host": ["{http.request.host}"],
-                            "X-Real-IP": ["{http.request.remote.host}"],
-                            "X-Forwarded-Host": ["{http.request.host}"],
-                            "X-Forwarded-Proto": ["{http.request.scheme}"],
-                            "X-Tg-Router": [spec.router_id],
-                        },
-                        # The panel's session cookie must never reach a router: with
-                        # TUNNELGATE_COOKIE_DOMAIN set the browser sends tg_session to
-                        # <slug>.<suffix> as well, and a router that keeps it holds a live
-                        # panel session. Delete it on the way through.
-                        "delete": ["Cookie"],
-                    }
-                },
-            },
+            }
         ],
         "terminal": True,
     }

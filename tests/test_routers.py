@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
-from app.config import utcnow
+from app.config import RESERVED_SLUGS, SLUG_RE, utcnow
 from app.models import AuditLog, BootstrapToken, Router, RouterRuntime
 
 
@@ -45,6 +47,32 @@ def test_create_router_rejects_a_bad_slug(api):
     r = api.c.post("/api/v1/routers", json={"name": "X", "slug": "Not A Slug"})
     assert r.status_code == 422
     assert r.json()["error"]["code"] == "validation_error"
+
+
+@pytest.mark.parametrize("slug", sorted(RESERVED_SLUGS))
+def test_create_router_rejects_a_reserved_slug(api, slug):
+    """The panel owns these first path segments.
+
+    In path mode a router is published at <gateway>/<slug>/, so "api" or "assets" makes nginx
+    reject the whole config ("duplicate location"), and "login" shadows the login page with a
+    redirect loop that locks the operator out. Nothing in the UI could undo either.
+    """
+    r = api.c.post("/api/v1/routers", json={"name": "X", "slug": slug})
+    assert r.status_code == 422, r.text
+    assert r.json()["error"]["code"] == "validation_error"
+    if re.match(SLUG_RE, slug):
+        # "__tg" is already outside the character class; the rest are rejected BY the
+        # reserved list, which is the guard worth naming in the message.
+        assert "reserved" in r.text
+
+
+def test_a_name_that_slugifies_into_a_reserved_word_gets_a_free_one(api):
+    """A router called "Login" must not become "login": the derived slug is bumped, so the
+    operator does not have to understand why the obvious name was refused."""
+    first = api.create_router("Login")
+    assert first["slug"] == "login-2"
+    second = api.create_router("Login")
+    assert second["slug"] == "login-3"
 
 
 def test_create_router_requires_csrf(api, settings):

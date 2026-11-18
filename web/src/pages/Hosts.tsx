@@ -10,6 +10,7 @@ import { FleetCounters, TopBar } from '../components/AppShell'
 import { Button } from '../components/Button'
 import { Icon } from '../components/Icon'
 import { Kpi } from '../components/Kpi'
+import { openExternal } from '../lib/external'
 import { HostsTable, COLUMNS } from '../components/HostsTable'
 import type { ColumnId, Sort, SortKey } from '../components/HostsTable'
 import { EmptyState, ErrorState, InlineAlert, TableSkeleton } from '../components/States'
@@ -187,7 +188,12 @@ export function HostsPage() {
   })
 
   const openLuCI = (r: Router) => {
-    if (r.url) window.open(r.url, '_blank', 'noopener,noreferrer')
+    // Through the launch endpoint: it exchanges this panel session for a cookie on the
+    // router's own host, which is what stops "Open LuCI" from bouncing round the login page.
+    // A refusal is surfaced rather than swallowed - an unusable host (an IP as the subdomain
+    // suffix is the usual one) otherwise looks exactly like a dead button.
+    const result = openExternal(r.launch_url || r.url)
+    if (!result.ok) toast.error(result.reason)
   }
 
   const selectedCount = selected.size

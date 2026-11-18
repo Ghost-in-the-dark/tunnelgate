@@ -167,6 +167,17 @@ substring), `limit`, `offset`.
 
 ### `GET /api/v1/routers/{id}` → `RouterOut`
 
+Two URL fields, and they are not interchangeable:
+
+| field | value | use |
+|---|---|---|
+| `url` | `https://<slug>.<suffix>` | the router's real public address - display it, copy it, poll it |
+| `launch_url` | `https://<slug>.<suffix>/__tg/enter` | what a click must follow: it installs a cookie scoped to that router host |
+
+`null` for both while the router has no proxy route yet. Opening `url` in a browser that has
+never been through the hand-off bounces through `/login`; see
+[the launch hand-off](#internal-the-router-launch-hand-off).
+
 ### `PATCH /api/v1/routers/{id}` *(operator)*
 
 `name`, `group_name`, `notes`, `http_port`. The slug never changes after creation (it is baked
@@ -569,6 +580,7 @@ audited (`settings.agent_endpoint.test`, `detail: {checked_url, error}`).
 
 ```json
 {"panel_url": "http://127.0.0.1:8080", "subdomain_suffix": "panel.example.com",
+ "route_mode": "subdomain", "gateway_host": "gate.panel.example.com",
  "bootstrap_ttl_minutes": 15, "poll_interval_seconds": 2, "proxy_driver": "nginx",
  "version": "1.0.0",
  "agent_url": "https://panel.example.com",
@@ -599,16 +611,80 @@ the override is `PUT /api/v1/settings/agent-endpoint` (see [Settings](#settings-
 
 ---
 
-## Internal: the nginx auth subrequest
+## Internal: the router launch hand-off
 
-Not part of the public API but worth documenting because it *is* the authorisation boundary.
+Not part of the public API, but this is how a browser gets from the panel to a router's LuCI
+without a domain-wide session cookie. `docs/SECURITY.md` §6 has the reasoning.
+
+### `GET /__tg/launch?router=<slug|id>&next=<path>` *(session required)*
+
+Runs on the panel host, where `tg_session` actually is.
+
+```
+GET /__tg/launch?router=office-ap&next=/cgi-bin/luci
+-> 303 Location: https://office-ap.panel.example.com/__tg/enter?t=<ticket>
+   Cache-Control: no-store
+```
+
+* The caller must hold a panel session (`401 not_authenticated` otherwise).
+* `next` is sanitised to a same-host absolute path (`/` on anything else - `//host`,
+  `/\host`, `https://...` and a bare segment all become `/`).
+* The ticket is 32 random bytes, valid for `TUNNELGATE_LAUNCH_TICKET_TTL_SECONDS` (120 s),
+  **single use**, and bound to *(router, user, target path)*. Only its SHA-256 is stored, in
+  memory, so a restart drops hand-offs in flight.
+* `404 router_not_found` for an unknown or revoked router.
+* Audits `luci.launch` with `detail: {"next": "<sanitised path>"}`.
+
+This is the URL the SPA's "Open LuCI" and "Public route" controls follow, and the one the login
+page redirects to when it is given `?router=`.
+
+### `GET /__tg/enter?t=<ticket>&next=<path>` *(reached through a router vhost)*
+
+Arrives at the panel **through the router vhost** (`location = /__tg/enter` is proxied here with
+`router=$tg_slug`), which is what makes the `Set-Cookie` land on `<slug>.<suffix>` rather than
+on the panel.
+
+With `TUNNELGATE_ROUTE_MODE=path` the same endpoint is reached on the gateway host instead, and
+the router is identified by the first path segment rather than by the `Host` header: nginx passes
+the original URI in `X-Original-URI` and the panel reads `/<slug>/` from it. The cookie then
+carries `Path=/<slug>/` and the target defaults to `/<slug>/` rather than `/`.
+
+* Valid ticket, or an already-valid `tg_luci` for this router → `303` to the target path and
+  `Set-Cookie: tg_luci=<router_id>.<user_id>.<expiry>.<hmac>; Path=/; HttpOnly; Secure;
+  SameSite=Lax`, lifetime `TUNNELGATE_ROUTER_SESSION_TTL_MINUTES` (60).
+* Expired ticket, replay, ticket minted for a different router, or a `Host` that does not belong
+  to the router → `302` to `<panel>/login?router=<slug>&next=<path>`. Never an error page: a
+  stale link has to end up somewhere the operator can sign in and continue.
+* No `auth_request` guards this location - it is the way in, and it fails closed on its own.
+
+### `GET /__tg/enter/status` 
+
+Diagnostic JSON: `{"authorized": bool, "router": "<slug>", "user": "<name>|null",
+"cookie": "<cookie name>"}`. Read-only; useful when a deployment thinks it is authenticated and
+the gate disagrees.
 
 ### `GET /__tg/auth?router_id=<id>&uri=<original-uri>`
 
-Called by nginx `auth_request` for every request to `https://<slug>.<domain>`.
+Called by nginx `auth_request` for every request to `https://<slug>.<domain>`, and in path
+mode for every request to `https://<gateway>/<slug>/...` (the router id reaches nginx from the
+matched `location`, so the browser still cannot choose it).
 
-* `200` + `X-Tg-User`, `X-Tg-Role`, `X-Tg-Router` headers → nginx proxies the request.
-* `401` → nginx redirects to the panel login.
-* Anything else, including a panel crash → nginx denies (fail closed).
+Accepts **either** credential:
 
-It audits `luci.open` (throttled) so the audit log can answer "who looked at which router".
+1. the panel session (`tg_session`, sent by a browser on the panel host), or
+2. `tg_luci` for exactly this `router_id`, read from the `X-Tg-Luci-Cookie` header that the
+   rendered auth snippet sets from `$cookie_tg_luci` - never from the whole `$http_cookie`,
+   so no other cookie can influence the decision. The cookie jar is consulted as well, for a
+   direct request to the panel.
+
+```
+200  + X-Tg-User, X-Tg-Role, X-Tg-Router   -> nginx proxies the request
+401  {"error": {"code": "not_authenticated"}} -> nginx redirects to the panel login
+```
+
+It fails closed: an unknown router, a disabled account, a forged signature or a cookie for a
+different router all produce the same `401`. Both responses carry `Cache-Control: no-store`.
+
+It audits `luci.open` (throttled) with `detail: {"uri": "...", "credential":
+"panel-session"|"router-cookie"}`, so the audit log answers "who looked at which router, and
+with which credential".

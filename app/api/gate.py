@@ -1,8 +1,15 @@
 """The nginx `auth_request` subrequest: the authorization boundary for every router vhost.
 
 nginx calls `GET /__tg/auth?router_id=...&uri=...` for each request to
-`https://<slug>.<domain>` and proxies the request only on `200`. The panel session cookie is the
-credential; the router id comes from the vhost, not from the client.
+`https://<slug>.<domain>` and proxies the request only on `200`. Two credentials are accepted:
+
+* the panel session cookie - the normal path when the panel cookie happens to cover this host
+  (`TUNNELGATE_COOKIE_DOMAIN`), which is why the old flow still works where it used to;
+* the router cookie issued by `/__tg/enter` - scoped to this router host, signed with the panel
+  secret and bound to exactly one router id. This is the credential a correct deployment uses,
+  and it is why the gate no longer requires a domain-wide session cookie to exist at all.
+
+The router id comes from the vhost, never from the client.
 
 Fail closed is the whole design: anything other than a clean 200 makes nginx deny. A panel crash
 therefore denies access rather than opening it, and an unknown router id is a plain 401 - the
@@ -17,9 +24,10 @@ import time
 from fastapi import APIRouter, Query, Request, Response
 from fastapi.responses import JSONResponse
 
-from ..deps import DbSession, OptionalSession, client_ip
+from ..deps import DbSession, OptionalSession, SettingsDep, client_ip
 from ..models import Router, User
 from ..services.audit import record as audit_record
+from ..services.launch import router_cookie_names, verify_router_cookie
 
 log = logging.getLogger(__name__)
 
@@ -61,20 +69,49 @@ def _deny(message: str = "Authentication required") -> Response:
     )
 
 
+def _router_cookie_value(request: Request, settings) -> str | None:
+    """The router-host credential as the proxy presents it.
+
+    The proxy copies exactly one cookie into a dedicated header (`$cookie_tg_luci`), because
+    nginx cannot hand a cookie to an auth subrequest any other way. Reading the header FIRST
+    and the cookie jar second keeps both routes working: the header on a real deployment, the
+    cookie when the panel is reached directly (tests, a single-host trial without a vhost).
+    """
+    name, header = router_cookie_names(settings)
+    return request.headers.get(header) or request.cookies.get(name)
+
+
 @router.get("/auth")
 async def auth_request(
     request: Request,
     db: DbSession,
+    settings: SettingsDep,
     session: OptionalSession,
     router_id: str | None = Query(default=None),
     uri: str | None = Query(default=None),
 ) -> Response:
-    """200 + X-Tg-* headers when this session may read this router; 401 otherwise."""
-    if session is None:
-        return _deny()
-    user = db.get(User, session.user_id)
-    if user is None or not user.is_active:
-        return _deny("Account is disabled")
+    """200 + X-Tg-* headers when this caller may read this router; 401 otherwise."""
+    user: User | None = None
+    via_router_cookie = False
+
+    if session is not None:
+        user = db.get(User, session.user_id)
+        if user is not None and not user.is_active:
+            return _deny("Account is disabled")
+
+    if user is None:
+        # The panel session is absent (the usual case: it is scoped to the panel host). Fall
+        # back to the router-scoped cookie the launch endpoint installed on THIS host.
+        if not router_id:
+            return _deny("No router in this request")
+        user_id = verify_router_cookie(settings, router_id, _router_cookie_value(request, settings))
+        if user_id is None:
+            return _deny()
+        user = db.get(User, user_id)
+        if user is None or not user.is_active:
+            return _deny("Account is disabled")
+        via_router_cookie = True
+
     if not router_id:
         return _deny("No router in this request")
     item = db.get(Router, router_id)
@@ -92,7 +129,12 @@ async def auth_request(
             router=item,
             ip=client_ip(request),
             user_agent=request.headers.get("user-agent"),
-            detail={"uri": (uri or "/")[:255]},
+            detail={
+                "uri": (uri or "/")[:255],
+                # How this request authenticated matters when reading the log later: a
+                # router-cookie open means the router host held a credential of its own.
+                "credential": "router-cookie" if via_router_cookie else "panel-session",
+            },
         )
         db.commit()
 

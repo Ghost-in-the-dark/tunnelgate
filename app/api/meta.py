@@ -45,6 +45,8 @@ async def panel_config(db: DbSession, user: CurrentUser, settings: SettingsDep) 
     return ConfigOut(
         panel_url=settings.panel_url,
         subdomain_suffix=settings.host_suffix,
+        route_mode=settings.route_mode_normalized,
+        gateway_host=settings.gateway,
         bootstrap_ttl_minutes=int(settings.bootstrap_ttl_minutes),
         poll_interval_seconds=WIZARD_POLL_SECONDS,
         proxy_driver=settings.proxy_driver,

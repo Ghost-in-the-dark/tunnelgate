@@ -8,7 +8,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from .config import SLUG_RE
+from .config import RESERVED_SLUGS, SLUG_RE
 
 Role = Literal["admin", "operator", "viewer"]
 OsType = Literal["linux", "freebsd", "windows"]
@@ -93,6 +93,11 @@ class RouterCreate(BaseModel):
             return None
         if not re.match(SLUG_RE, v):
             raise ValueError("slug must be 1-40 chars of a-z, 0-9 and single hyphens")
+        if v in RESERVED_SLUGS:
+            # These are the panel's own first path segments (see config.RESERVED_SLUGS): in
+            # path mode a router published at <gateway>/<slug>/ would either break nginx
+            # outright or shadow - or infinitely redirect around - the panel page.
+            raise ValueError("slug is reserved for the panel's own paths; choose another name")
         return v
 
 
@@ -120,6 +125,10 @@ class RouterOut(BaseModel):
     console_ready: bool = False
     bind_address: str | None = None
     url: str | None = None
+    # The URL a click must follow: same host, but through /__tg/enter, which turns the panel
+    # session into a router-scoped cookie. `url` stays as the plain public address (bookmarks,
+    # clipboard, "is it up?" checks); `launch_url` is what "Open LuCI" links to.
+    launch_url: str | None = None
     hostname: str | None = None
     model: str | None = None
     openwrt_version: str | None = None
@@ -369,6 +378,11 @@ class AgentEndpointTestOut(BaseModel):
 class ConfigOut(BaseModel):
     panel_url: str
     subdomain_suffix: str
+    # How routers are published: "subdomain" (https://<slug>.<suffix>) or "path"
+    # (https://<gateway>/<slug>/). The SPA needs this to explain the shape of a router URL
+    # and to know which host the gateway lives on.
+    route_mode: str = "subdomain"
+    gateway_host: str = ""
     bootstrap_ttl_minutes: int
     poll_interval_seconds: int
     proxy_driver: str

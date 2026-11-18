@@ -52,12 +52,39 @@ export function LoginPage() {
 
   const state = location.state as LocationState | null
   const fromState = state?.from ? `${state.from.pathname}${state.from.search ?? ''}` : null
+
   // The nginx auth gate redirects to /login?router=<slug>&next=<original URI> when a
   // router vhost rejects an anonymous request. RequireAuth records the destination in
   // history state instead, so fall back to ?next= to keep the operator's original page.
-  const from = fromState ?? safeNext(new URLSearchParams(location.search).get('next')) ?? '/hosts'
+  //
+  // With ?router= present, `next` is a path on the ROUTER, not on this panel: applying it
+  // here would 404 the panel and, worse, the resulting session cookie would still not be
+  // valid over there. /__tg/launch is the handoff that mints a single-use ticket and sends
+  // the browser to that router's own host, where the path actually means something.
+  const params = new URLSearchParams(location.search)
+  const routerSlug = params.get('router')
+  const nextPath = safeNext(params.get('next'))
+  const handoff =
+    !fromState && routerSlug
+      ? `/__tg/launch?router=${encodeURIComponent(routerSlug)}&next=${encodeURIComponent(nextPath ?? '/')}`
+      : null
+  const from = fromState ?? handoff ?? nextPath ?? '/hosts'
+
+  // A /__tg/ path is a server endpoint, not an SPA route, so it needs a real navigation:
+  // react-router would swap in the not-found page instead of ever reaching FastAPI.
+  const leave = (dest: string) => {
+    if (dest.startsWith('/__tg/')) window.location.assign(dest)
+    else navigate(dest, { replace: true })
+  }
+
+  // Already signed in and bounced here by a router vhost: skip the form and complete the
+  // handoff immediately, otherwise the operator has to sign in a second time for nothing.
+  useEffect(() => {
+    if (bootState === 'authenticated' && handoff) window.location.replace(handoff)
+  }, [bootState, handoff])
 
   if (bootState === 'authenticated' && user) {
+    if (handoff) return <p className="p-10 text-center text-xs text-muted">Opening your router…</p>
     return <Navigate to={from} replace />
   }
 
@@ -80,8 +107,9 @@ export function LoginPage() {
       const session = await api.login(username.trim(), password)
       setSession(session)
       // `from` is history state recorded by RequireAuth or a same-origin path vetted by
-      // safeNext(), so this navigation cannot leave the panel.
-      navigate(from, { replace: true })
+      // safeNext(), so this navigation cannot leave the panel; a router handoff is a
+      // same-origin /__tg/launch URL, which the server answers with a 303 to the router.
+      leave(from)
     } catch (err) {
       if (err instanceof ApiError && err.status === 429) {
         setRetryAfter(err.retryAfter ?? DEFAULT_RETRY_AFTER)
@@ -120,6 +148,13 @@ export function LoginPage() {
             {error ? (
               <InlineAlert tone="danger" className="mb-4">
                 {error}
+              </InlineAlert>
+            ) : null}
+
+            {handoff ? (
+              <InlineAlert tone="info" className="mb-4">
+                Sign in to open <strong>{routerSlug}</strong>. You are signing in here; the
+                router gets its own short-lived session and never sees this cookie.
               </InlineAlert>
             ) : null}
 

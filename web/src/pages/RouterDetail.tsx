@@ -6,6 +6,7 @@ import type { Router, RouterStatus } from '../lib/types'
 import { useAuth, useCountdown } from '../lib/hooks'
 import { cn } from '../lib/cn'
 import { copyText } from '../lib/clipboard'
+import { openExternal, unopenableReason } from '../lib/external'
 import {
   absoluteTime,
   clockDuration,
@@ -64,6 +65,17 @@ export function RouterDetailPage() {
 
   const router = routerQuery.data
   const status = statusQuery.data
+
+  // Every "open" action navigates through /__tg/enter, not to the bare public URL: the launch
+  // endpoint is what converts this panel session into a cookie scoped to that router's host.
+  // Falling back to router.url keeps older rows (and a proxy that has not been re-rendered yet)
+  // usable - they simply take the longer way round through the login page.
+  const launchUrl = router?.launch_url || router?.url
+
+  // A public route the browser cannot parse renders perfectly but opens nothing (an IP as the
+  // subdomain suffix produces exactly that), so the header action is disabled and says why
+  // rather than opening a tab that cannot exist.
+  const launchProblem = router?.url ? unopenableReason(launchUrl) : ''
 
   const [deleteOpen, setDeleteOpen] = useState(false)
 
@@ -184,10 +196,20 @@ export function RouterDetailPage() {
                   size="sm"
                   variant="secondary"
                   icon="external"
-                  disabled={!router.url || !router.online}
-                  title={!router.url ? 'No public route yet' : undefined}
+                  disabled={!launchUrl || !router.online || launchProblem !== ''}
+                  title={
+                    !launchUrl
+                      ? 'No public route yet'
+                      : launchProblem || undefined
+                  }
                   onClick={() => {
-                    if (router.url) window.open(router.url, '_blank', 'noopener')
+                    // The launch URL, never the bare public URL: it is the one that turns
+                    // this panel session into a credential for THIS router host. Opening
+                    // the bare URL is what used to bounce the operator round the login loop.
+                    // The failure is reported: a host the browser cannot parse (an IP as the
+                    // subdomain suffix) used to make this button appear simply dead.
+                    const result = openExternal(launchUrl)
+                    if (!result.ok) toast.error(result.reason)
                   }}
                 >
                   Open LuCI
@@ -386,6 +408,12 @@ function OverviewTab({
   const toast = useToast()
   const phase = status?.phase ?? 'waiting'
   const neverConnected = !router.last_seen_at && !router.has_key
+  // Same fallback as the header action: go through the launch endpoint when the panel
+  // advertises one, and keep the bare URL working for older rows.
+  const launchUrl = router.launch_url || router.url
+  // A public route the browser cannot parse renders perfectly but opens nothing (an IP as the
+  // subdomain suffix produces exactly that), so say so here instead of leaving a dead link.
+  const launchProblem = router.url ? unopenableReason(launchUrl) : ''
 
   const cards = [
     {
@@ -498,14 +526,20 @@ function OverviewTab({
             <h2 className="text-xs font-medium text-text">Public route</h2>
             {router.url ? (
               <div className="mt-2 space-y-1.5">
-                <a
-                  href={router.url}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="block break-all text-2xs text-accent hover:underline"
-                >
-                  {router.url}
-                </a>
+                {launchProblem ? (
+                  // Not a link: the href would be a host the browser refuses, so offering it as
+                  // one is a dead end that looks live. The address stays copyable above.
+                  <span className="block break-all font-mono text-2xs text-muted">{router.url}</span>
+                ) : (
+                  <a
+                    href={launchUrl ?? router.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="block break-all text-2xs text-accent hover:underline"
+                  >
+                    {router.url}
+                  </a>
+                )}
                 <Button
                   size="sm"
                   variant="secondary"
@@ -518,11 +552,19 @@ function OverviewTab({
                 >
                   Copy URL
                 </Button>
-                <p className="text-3xs leading-relaxed text-faint">
-                  Served by the reverse proxy and gated by{' '}
-                  <span className="font-mono">auth_request</span> against this panel session. Anyone without
-                  a session is bounced to the login screen.
-                </p>
+                {launchProblem ? (
+                  <InlineAlert tone="danger" title="This public route cannot be opened">
+                    {launchProblem}
+                  </InlineAlert>
+                ) : (
+                  <p className="text-3xs leading-relaxed text-faint">
+                    The link signs you in to this router and lands straight in its LuCI. The address
+                    itself is <span className="font-mono">{router.url}</span>: opening it in a fresh
+                    browser sends you through the panel login first, which now hands you back here
+                    instead of looping. The panel session never reaches the router - the route
+                    gets its own short-lived cookie, scoped to this router alone.
+                  </p>
+                )}
               </div>
             ) : (
               <p className="mt-2 text-2xs leading-relaxed text-muted">

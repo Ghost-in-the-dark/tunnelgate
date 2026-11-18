@@ -178,3 +178,119 @@ def test_gate_route_is_not_in_the_public_api_namespace(client):
     # cannot reach it at all.
     r = client.get("/__tg/auth")
     assert r.status_code in (401, 200)
+
+
+# --------------------------------------------------------------------------- router cookie
+def _router_cookie(settings, router_id: str, user_id: int) -> str:
+    from app.services.launch import issue_router_cookie
+
+    value, _max_age = issue_router_cookie(settings, router_id, user_id)
+    return value
+
+
+def _cookie_header(settings) -> str:
+    from app.services.launch import router_cookie_names
+
+    return router_cookie_names(settings)[1]
+
+
+def test_gate_accepts_the_router_cookie_without_a_panel_session(client, api, settings):
+    """The whole point of the launch flow: a credential scoped to THIS router host is enough.
+
+    A browser on https://<slug>.<suffix> has no panel session (that cookie is host-only by
+    design), so the gate has to accept the router-scoped cookie the launch endpoint installed.
+    """
+    created = api.create_router("Launched")
+    owner = _user("gate-launch-owner")
+    client.cookies.clear()
+
+    r = client.get(
+        "/__tg/auth",
+        params={"router_id": created["id"], "uri": "/cgi-bin/luci"},
+        headers={_cookie_header(settings): _router_cookie(settings, created["id"], owner)},
+    )
+    assert r.status_code == 200, r.text
+    assert r.headers["x-tg-user"] == "gate-launch-owner"
+    assert r.headers["x-tg-router"] == created["slug"]
+    assert r.headers["cache-control"] == "no-store"
+
+
+def test_gate_audits_a_router_cookie_open_as_such(client, api, settings):
+    """The log has to say which credential was used: they have different blast radii."""
+    created = api.create_router("Launched Audit")
+    owner = _user("gate-launch-auditor")
+    client.cookies.clear()
+
+    client.get(
+        "/__tg/auth",
+        params={"router_id": created["id"], "uri": "/cgi-bin/luci"},
+        headers={_cookie_header(settings): _router_cookie(settings, created["id"], owner)},
+    )
+
+    with session_scope() as s:
+        rows = s.query(AuditLog).filter(AuditLog.action == "luci.open").all()
+    assert len(rows) == 1
+    assert rows[0].actor_username == "gate-launch-auditor"
+    assert json.loads(rows[0].detail)["credential"] == "router-cookie"
+
+
+def test_gate_rejects_a_router_cookie_minted_for_another_router(client, api, settings):
+    """A cookie is bound to one router id; holding one must never open a neighbour."""
+    first = api.create_router("First")
+    second = api.create_router("Second")
+    owner = _user("gate-cross-router")
+    client.cookies.clear()
+
+    r = client.get(
+        "/__tg/auth",
+        params={"router_id": second["id"], "uri": "/"},
+        headers={_cookie_header(settings): _router_cookie(settings, first["id"], owner)},
+    )
+    assert r.status_code == 401
+    assert r.json()["error"]["code"] == "not_authenticated"
+
+
+def test_gate_rejects_a_tampered_router_cookie(client, api, settings):
+    created = api.create_router("Tampered")
+    owner = _user("gate-tamper")
+    value = _router_cookie(settings, created["id"], owner)
+    forged = value.rsplit(".", 1)[0] + "." + "0" * 64
+    client.cookies.clear()
+
+    r = client.get(
+        "/__tg/auth",
+        params={"router_id": created["id"], "uri": "/"},
+        headers={_cookie_header(settings): forged},
+    )
+    assert r.status_code == 401
+
+
+def test_gate_rejects_a_router_cookie_for_a_disabled_account(client, api, settings):
+    created = api.create_router("Disabled")
+    owner = _user("gate-disabled", active=False)
+    client.cookies.clear()
+
+    r = client.get(
+        "/__tg/auth",
+        params={"router_id": created["id"], "uri": "/"},
+        headers={_cookie_header(settings): _router_cookie(settings, created["id"], owner)},
+    )
+    assert r.status_code == 401
+    assert r.json()["error"]["code"] == "not_authenticated"
+
+
+def test_gate_prefers_the_panel_session_when_both_are_present(client, api, settings):
+    """Both cookies at once is not an error: the session wins and is audited as such."""
+    created = api.create_router("Both")
+    owner = _user("gate-both")
+    _login(client, "gate-both", "user-t3st-pass")
+
+    r = client.get(
+        "/__tg/auth",
+        params={"router_id": created["id"], "uri": "/"},
+        headers={_cookie_header(settings): _router_cookie(settings, created["id"], owner)},
+    )
+    assert r.status_code == 200
+    with session_scope() as s:
+        row = s.query(AuditLog).filter(AuditLog.action == "luci.open").one()
+    assert json.loads(row.detail)["credential"] == "panel-session"

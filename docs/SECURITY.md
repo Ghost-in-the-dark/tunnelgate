@@ -31,7 +31,7 @@ bootstrap flow, or anything in `app/security.py`.
 | A8 | MITM during onboarding | Learn the private key | TLS to the panel; `ssh-keyscan` fingerprint is compared with the value returned by the API over TLS before `known_hosts` is written; `StrictHostKeyChecking=yes` afterwards |
 | A9 | Dump of the panel database | Replay credentials | Passwords are scrypt-hashed; session and bootstrap tokens are stored as SHA-256; only public keys are stored in plaintext |
 | A10 | Operator error (deleting the wrong router) | Outage | Delete is key revocation + port release, reversible by re-creating the router (the router keeps retrying/needs a reinstall) |
-| A11 | Compromised **router** (or anything that can read the traffic reaching its LuCI) | Take over the panel: every router, every console, every mutation - not just the one device | The panel cookie is **host-only by default** (`TUNNELGATE_COOKIE_DOMAIN` unset), so the browser never sends `tg_session` to `<slug>.<suffix>`; every panel-generated router vhost additionally drops the header, in both drivers (`proxy_set_header Cookie "";` / `"delete": ["Cookie"]`); the console WS re-validates the session cookie on `console.<suffix>`, a host the browser reaches only over TLS. Enabling `COOKIE_DOMAIN` collapses this control - see §6 |
+| A11 | Compromised **router** (or anything that can read the traffic reaching its LuCI) | Take over the panel: every router, every console, every mutation - not just the one device | The panel cookie is **host-only by default** (`TUNNELGATE_COOKIE_DOMAIN` unset), so the browser never sends `tg_session` to `<slug>.<suffix>`; every panel-generated router vhost additionally drops the header, in both drivers (`proxy_set_header Cookie "";` / `"delete": ["Cookie"]`); the console WS re-validates the session cookie on `console.<suffix>`, a host the browser reaches only over TLS. What a router *does* get is `tg_luci`: a signed, Host-scoped cookie for that one device, obtainable only from a single-use ticket minted by an authenticated panel request (`/__tg/launch` -> `/__tg/enter`), so it grants that router's LuCI and nothing else, and nginx forwards it to the gate in a dedicated header instead of `$http_cookie`. Replaying it against the panel is worthless: `/api/*` reads only `tg_session` from the panel host, which the browser never sends there. Enabling `COOKIE_DOMAIN` collapses this control - see §6. **In path mode's merged layout this row is weakened**: the router's page is same-origin with the panel, so it does not need to *receive* `tg_session` to use it - the browser sends it on same-origin requests the router's script issues, and `/api/auth/me` hands out the CSRF token. The cookie strip and the host-only default still hold against exfiltration; nothing holds against same-origin abuse. See §6.1 |
 
 ### Explicitly out of scope
 
@@ -205,6 +205,110 @@ while the UI still reported "ready".
   the static template, `render_nginx()` and `render_caddy_route()` all emit it - but the strip is
   defence in depth: it is one line in a generated file, whereas the host-only default is the
   structural control. Set the option only if the SPA and API really are on different hostnames.
+  **`TUNNELGATE_COOKIE_DOMAIN` is not how a router gets its session.** Setting it does make the
+  login page appear to work again, by delivering the operator's *panel* session to every router -
+  which is the blast radius described above, paid for a convenience. The supported way is the
+  hand-off below, and it is what the UI links to:
+* **How a browser actually reaches a router's LuCI.** The operator is authenticated on
+  `panel.example.com`; `lab.router.example.com` is a different host, so the browser has nothing
+  to offer it and `auth_request` answers 401. The hand-off is a two-hop redirect - the first on
+  the panel host, the second through the router vhost but answered by the panel:
+  1. **`GET /__tg/launch?router=<slug>&next=<path>`** on the panel host. Requires a panel
+     session (that is the `CurrentUser` dependency, so CSRF does not apply to a GET that only
+     redirects). It mints a 32-byte ticket, stores only its SHA-256 bound to
+     `(router_id, user_id, target path)`, TTL `TUNNELGATE_LAUNCH_TICKET_TTL_SECONDS` (120 s), and
+     answers `303 https://<slug>.<suffix>/__tg/enter?t=<ticket>`.
+  2. **`GET /__tg/enter?t=<ticket>`** arriving through the router vhost, which proxies it to the
+     panel. The ticket is consumed (single use - a replay or an expired ticket falls through to
+     the login page), and the panel answers `Set-Cookie: tg_luci=...; Path=/; HttpOnly; Secure`
+     **on the router host** plus a `303` to the original path. Because the response travels back
+     through the router vhost, the cookie lands on exactly the host that needs it.
+
+  `tg_luci` is `<router_id>.<user_id>.<expiry>.<HMAC-SHA256>` under a key derived from
+  `TUNNELGATE_SECRET_KEY`, so no server-side state is needed to verify it, it cannot be extended
+  past `TUNNELGATE_ROUTER_SESSION_TTL_MINUTES` (60), and it names the only router it opens. The
+  gate (`/__tg/auth`) accepts *either* the panel session (a browser on the panel host) *or* a
+  valid `tg_luci` for the `router_id` nginx injected (a browser on that router's host), and
+  fails closed otherwise. Every accepted request still lands in the audit log as `luci.open`, with
+  `detail.credential` saying which of the two was used.
+
+  Consequences worth stating plainly: the token a router can steal is a **grant to itself**,
+  expiring in an hour, revocable only by rotating `TUNNELGATE_SECRET_KEY` (it is stateless -
+  signing out of the panel does not clear it, and the browser drops it when the cookie expires);
+  and because it is scoped to the host, it is not sent to the panel or to any other router.
+
+  **Path mode (`TUNNELGATE_ROUTE_MODE=path`) keeps the same two hops but scopes differently.**
+  Every router lives on one gateway host, so "a different host" is no longer what separates them:
+  the cookie is narrowed with `Path=/<slug>/` (`proxy_cookie_path / /<slug>/;`) and nginx takes
+  the router id from the matched `location`, not from the `Host` header. Two consequences
+  follow, and both are why path mode is not the default:
+  * the browser now sends `tg_luci` to the gateway host on every request under that prefix, and
+    same-site JavaScript served by *that* LuCI could read it if the cookie were not `HttpOnly` -
+    it is, and LuCI's own session cookie is the one it uses for its own authorisation;
+  * `tg_session` is still host-only on the panel, and the panel does strip `Cookie` on the
+    router hop in both modes, so LuCI never *receives* the panel session. Whether the surrounding
+    origin keeps the two apart depends on the layout - see below.
+
+### 6.1 Path mode on the panel's own host
+
+Path mode has two layouts and the panel picks one from the configuration: **separate** when
+`TUNNELGATE_GATEWAY_HOST` differs from `TUNNELGATE_PANEL_HOST`, **merged** when they are the same
+name. The separate layout is what this section has described so far, and it keeps the property
+that matters: router content is a different origin from the panel. The merged layout does not, and
+that is a security decision, not a cosmetic one.
+
+**Why the origin, and not the cookie, is the boundary here.** An origin is scheme + host + port;
+a *path* is not part of it. In the merged layout a browser loading `https://gate.example.com/alpha/`
+and `https://gate.example.com/` sees one origin. Everything a router serves - its LuCI HTML, its
+JavaScript, anything a compromised or merely hostile device chooses to return - therefore runs
+with the panel's origin privileges:
+
+* it can issue same-origin `fetch` requests to `/api/...` and the browser attaches the operator's
+  `tg_session` cookie automatically;
+* it can read the CSRF token, because `GET /api/auth/me` is same-origin and returns it in the body;
+* so it can perform **any** authenticated action the operator can, from the operator's browser:
+  add or delete routers, start consoles, mint launch tickets, change settings.
+
+That is the whole trade. A compromised router is a cheap, physically reachable, internet-facing
+device; in the merged layout it converts into a working session against the panel.
+
+What still holds in merged mode, and why it is not a free pass for the router:
+
+* `tg_session` is `HttpOnly`, so script cannot read the cookie value itself - it does not need to,
+  the browser sends it;
+* the panel vhost drops the browser `Cookie` header before proxying to a router
+  (`proxy_set_header Cookie ""`), so the router's *server* never receives `tg_session`; a
+  compromised router can act through the victim's browser but cannot lift the session out and
+  reuse it elsewhere;
+* router access is still gated by `auth_request` and the single-use launch ticket, so an
+  unauthenticated visitor cannot reach router content either way;
+* `TUNNELGATE_COOKIE_DOMAIN` must stay unset in every layout (§6).
+
+None of that restores isolation: "the router cannot read the cookie" is not "the router cannot
+use it". Treat merged mode as *the panel trusts whatever the routers serve*, and only adopt it
+when the routers are at least as trusted as the panel host itself.
+
+The panel's CSP does not close the gap either, and it is worth being precise about why: the
+shipped policy in `deploy/nginx/tunnelgate.conf` is written in terms of `'self'`
+(`default-src 'self'; script-src 'self'`), and in the merged layout the router *is* `'self'`.
+Router content does inherit those headers - the generated router locations declare no
+`add_header` of their own, and nginx passes the server-level ones down to a location that adds
+none - so a router page still cannot be framed, still gets HSTS and still cannot load a
+third-party script. None of that is a control against the router itself, which needs no
+third-party origin to call `/api/`.
+
+**Recommendation.** Keep the gateway on its own name whenever DNS and certificates allow it - a
+second certificate, or a wildcard, makes it free, and `app.cli doctor` warns rather than fails on
+merged precisely so the choice is visible. Use merged only when one public name is genuinely all
+you have: a free dynamic-DNS name with no wildcard, a single-certificate install, or a panel
+published on a bare IP. Note that the naming is the whole switch - there is no separate "merged"
+flag. Setting `TUNNELGATE_GATEWAY_HOST` equal to `TUNNELGATE_PANEL_HOST` selects the merged
+layout, and the include in nginx has to move with it (docs/ARCHITECTURE.md, "Path mode: separate
+and merged layouts"): `routes.conf` then holds only `location` blocks and belongs **inside** the
+panel `server` block. Put it in the http context instead and nginx refuses to load
+(`"location" directive is not allowed here`) rather than serving anything wrong - a loud
+misconfiguration, not a silent widening.
+
 * **CSRF**: double submit - the session row owns a random `csrf_token`, the SPA sends it in
   `X-CSRF-Token` on every mutating request, the server compares in constant time. A cross-site
   form post cannot set a custom header.
@@ -338,7 +442,13 @@ ship to a log store you cannot rewrite (`journald` + off-host forwarding); the s
 - [ ] `TUNNELGATE_SECRET_KEY` set, backed up somewhere safe, **not** in the repo
 - [ ] `TUNNELGATE_COOKIE_SECURE=true` and the panel served over HTTPS only
 - [ ] `TUNNELGATE_COOKIE_DOMAIN` is **unset** (host-only cookie); if it is set, the §6 blast-radius
-      trade-off has been accepted in writing
+      trade-off has been accepted in writing. It is not needed to open a router: that is the
+      `/__tg/launch` hand-off, and `python -m app.cli doctor` warns when the domain cookie is
+      set anyway
+- [ ] After upgrading, `python -m app.cli doctor` reports `launch config: /__tg/enter is served
+      and the gate sees the router cookie`; if it reports FAIL, the generated nginx config is
+      stale - run `python -m app.cli render-proxy` (the `tunnelgate-nginx-reload.path` unit
+      reloads nginx for you)
 - [ ] Admin password is not the one from the docs; rotate after install
 - [ ] `sshd -t` passes after installing the drop-in; a second root shell stays open while testing
 - [ ] Firewall exposes only 22/tcp (or your SSH port) and 80/443
@@ -375,3 +485,22 @@ ship to a log store you cannot rewrite (`journald` + off-host forwarding); the s
    routers, or anything that bypasses the renderer inherits no strip. The host-only default (§6)
    is the control that survives all of that; the strip is a second layer. Do not enable
    `TUNNELGATE_COOKIE_DOMAIN` and rely on the strip.
+9. **`tg_luci` is a per-router grant, not per-request authorisation.** It is a stateless signed
+   cookie (§6) with a 60-minute lifetime: it cannot be revoked individually, it is re-checked
+   against the account only (a disabled user is refused), and it keeps working for its full
+   lifetime even if the router is deleted - the gate then denies because the router row is gone,
+   which is the only revocation path. Rotating `TUNNELGATE_SECRET_KEY` invalidates every one of
+   them at once, at the cost of invalidating every console session too. Lower
+   `TUNNELGATE_ROUTER_SESSION_TTL_MINUTES` if an hour is too generous for your devices.
+10. **The launch ticket store is in-process memory.** Tickets live in a dict with a TTL, like the
+    console tickets, so a panel restart drops any hand-off in flight (the operator clicks again)
+    and two panel processes behind one address do not share them - the same constraint the
+    console already has, and the shipped unit runs one process.
+11. **The merged path layout has no origin isolation** (§6.1). When
+    `TUNNELGATE_GATEWAY_HOST` equals `TUNNELGATE_PANEL_HOST` the router pages are served from the
+    panel's origin, so a hostile or compromised router runs script that can use the operator's
+    session - the panel session cookie, the CSRF token and every API call are reachable
+    same-origin. The cookie is `HttpOnly` and the router hop strips the `Cookie` header, so the
+    router's *server* never holds `tg_session`; that limits exfiltration, not abuse. If any
+    router is less trusted than the panel host - and a cheap internet-facing device usually is -
+    use the separate layout.

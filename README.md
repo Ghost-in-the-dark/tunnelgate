@@ -18,8 +18,24 @@ router side; the panel dials **in** through the console listener for its shell.
 
 ## What you get
 
-* `https://<slug>.<domain>` for every router, TLS, gated by a panel session (subdomain, not a
-  path prefix, so LuCI's absolute URLs and WebSockets work unmodified).
+* `https://<slug>.<domain>` for every router, TLS, gated by `auth_request` against the panel
+  (subdomain, not a path prefix, so LuCI's absolute URLs and WebSockets work unmodified). The
+  **Open LuCI** link hands the browser off through a single-use ticket and lands it on that
+  router's hostname with a short-lived cookie scoped to that host alone - the panel session
+  never leaves the panel origin, and `TUNNELGATE_COOKIE_DOMAIN` is never needed.
+* **One host, many paths, if you have no wildcard certificate.**
+  `TUNNELGATE_ROUTE_MODE=path` publishes every router as `https://<gateway>/<slug>/` instead:
+  one ordinary certificate for `TUNNELGATE_GATEWAY_HOST` (a free dynamic-DNS name is enough), no
+  wildcard DNS, no per-router records. nginx then rewrites LuCI's absolute links and redirects
+  into the prefix and scopes each router's cookie to `/<slug>/`. The console keeps its own
+  hostname. The gateway has two layouts: by default it is a name of its own, and router content
+  stays a separate origin from the panel; if you point `TUNNELGATE_GATEWAY_HOST` at
+  `TUNNELGATE_PANEL_HOST` the panel and the routers share one origin under one name (the
+  "merged" layout - `routes.conf` then goes *inside* the panel `server` block, not the http
+  context), which is convenient but lets a compromised router script the panel origin with the
+  operator's session. `app.cli doctor` warns under `gateway host` when your configuration is
+  merged, and stays quiet otherwise; docs/SECURITY.md §6.1 explains the trade. Subdomain mode
+  stays the default: it needs no rewriting, so nothing in a LuCI app can escape its own host.
 * A one-line, single-use, 15-minute install command per router - no key, no port and no secret
   in it; the key is minted when the router exchanges the token.
 * A live status model (`pending → awaiting → online → offline`) backed by observed sockets **and**
@@ -145,8 +161,9 @@ docs/                 the documents above
   `ALTER TABLE` statements to apply.
 * **The console grants root on the router by default** - it is an operator tool, gated by role and
   audited, not a sandbox. A dedicated router user is supported and documented.
-* **TLS, DNS and a wildcard certificate are prerequisites**, not built in; the panel assumes it is
-  reached over HTTPS and sets `Secure` cookies accordingly.
+* **TLS, DNS and a wildcard certificate are prerequisites** for subdomain mode (`path` mode
+  needs one ordinary certificate, not a wildcard), and TLS is not built in; the panel assumes it
+  is reached over HTTPS and sets `Secure` cookies accordingly.
 * LuCI keeps its own users; TunnelGate does not manage them.
 * **The trust boundary is a setting, not a guess.** Behind a proxy, forwarded headers are believed
   only from `TUNNELGATE_TRUSTED_PROXIES` (default `127.0.0.1,::1`); `TUNNELGATE_FORWARDED_ALLOW_HOPS`
@@ -164,6 +181,13 @@ docs/                 the documents above
 7. **No graceful handing-off of live SSH sessions on panel restart** - consoles drop and the user
    reconnects; tunnels are unaffected (sshd owns them).
 8. **`luci.open` audit is throttled** to one row per user/router/minute.
+9. **A router grant is per-router, not per-request.** `tg_luci` is a signed, Host-scoped
+   cookie (default 1 h, `TUNNELGATE_ROUTER_SESSION_TTL_MINUTES`) and is stateless, so it cannot
+   be revoked individually: delete the router or rotate `TUNNELGATE_SECRET_KEY` to invalidate
+   every one of them. Panel sign-out does not clear it.
+10. **In-flight launch tickets live in process memory** (like console tickets). A panel restart
+    mid-hand-off drops them - the operator clicks the link again - and one process per
+    deployment is assumed, as everywhere else.
 9. **No built-in metrics endpoint** (Prometheus); `/api/v1/stats` is what exists.
 10. **The wizard's connection check is polling, not WebSocket** - simpler, and 2 s latency is
     invisible next to a firmware install.

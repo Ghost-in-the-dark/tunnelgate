@@ -167,6 +167,7 @@ def create_app(settings: Settings | None = None, *, use_monitor: bool = True) ->
         console_ws,
         gate,
         heartbeat,
+        launch,
         meta,
         users,
     )
@@ -185,6 +186,7 @@ def create_app(settings: Settings | None = None, *, use_monitor: bool = True) ->
         settings_api,
         meta,
         gate,
+        launch,
     ):
         app.include_router(mod.router)
 

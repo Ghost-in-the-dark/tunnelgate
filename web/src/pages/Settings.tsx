@@ -793,7 +793,8 @@ function PanelTab() {
       </section>
 
       <InlineAlert tone="info" title="The rows below come from the server environment">
-        Subdomain suffix, TTL, poll interval, proxy driver and the internal panel URL are set with{' '}
+        Route mode, gateway host / subdomain suffix, TTL, poll interval, proxy driver and the
+        internal panel URL are set with{' '}
         <span className="font-mono">TUNNELGATE_*</span> variables and stay read-only by design - a panel
         compromise must not change how the proxy reaches the panel. The agent endpoint above is the one
         exception: it is what routers dial, and an administrator can override it here.
@@ -1259,10 +1260,26 @@ function AgentEndpointTestResult({
 }
 
 function ConfigList({ config }: { config: PanelConfig }) {
+  const pathMode = config.route_mode === 'path'
   const rows: Array<[string, string, string | null]> = [
     ['Agent URL', config.agent_url, 'What routers dial (editable above).'],
     ['Internal panel URL', config.panel_url, 'How the proxy reaches the panel on this host.'],
-    ['Subdomain suffix', config.subdomain_suffix, 'Per-router hostnames are <slug>.<suffix>.'],
+    ['Route mode', config.route_mode, pathMode ? 'One gateway host, and a path per router.' : 'One host per router.'],
+    ...(pathMode
+      ? ([
+          [
+            'Gateway host',
+            config.gateway_host,
+            'Every router is published as <gateway>/<slug>/.',
+          ],
+        ] as Array<[string, string, string | null]>)
+      : ([
+          [
+            'Subdomain suffix',
+            config.subdomain_suffix,
+            'Per-router hostnames are <slug>.<suffix>.',
+          ],
+        ] as Array<[string, string, string | null]>)),
     [
       'Bootstrap TTL',
       config.bootstrap_ttl_minutes + ' min',

@@ -17,6 +17,7 @@
 #                                            is interpolated (config-injection guard)
 #   <tunnel_port> Router.remote_port       - the port sshd listens on for this router
 #   <bind>        Router.bind_address      - 127.0.0.1 on a normal single-host setup
+#   <panel_host>  Settings.panel_host      - host the panel (and the login page) answers on
 #
 # The include below is the shared auth snippet the renderer writes next to
 # routes.conf (data/tunnelgate.routes.auth.conf in dev, /etc/nginx/tunnelgate/...
@@ -33,8 +34,8 @@ server {
 
     # One wildcard certificate (*.<suffix>) serves every router vhost; there is no
     # per-device certificate to issue or renew.
-    ssl_certificate     /etc/letsencrypt/live/panel.example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/panel.example.com/privkey.pem;
+    ssl_certificate     /etc/letsencrypt/live/<suffix>/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/<suffix>/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_prefer_server_ciphers off;
     ssl_session_cache shared:SSL:10m;
@@ -57,19 +58,43 @@ server {
 
     include /etc/nginx/tunnelgate/routes.auth.conf;
 
+    # The launch hand-off. "Open LuCI" and "Public route" point here rather than at the
+    # bare URL: the panel mints a one-time ticket, the browser follows it to this
+    # location on THIS host, and the panel's Set-Cookie reply therefore lands on this
+    # router's hostname - the only scope that works without widening the panel session
+    # cookie to the whole domain (see docs/SECURITY.md, threat A11).
+    location = /__tg/enter {
+        # No auth_request here: this location IS the way in. It validates the ticket
+        # (or an existing router cookie) itself and answers with a redirect.
+        proxy_pass https://<panel_host>/__tg/enter?router=$tg_slug&t=$arg_t&next=$arg_next;
+        proxy_method GET;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Original-URI $request_uri;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 10s;
+        proxy_send_timeout 10s;
+    }
+
     location / {
         # Every request - HTML, XHR, WebSocket - is authorised before it is proxied.
         auth_request /__tg/auth;
         error_page 401 = @tg_login;
 
-        # The panel session cookie must NEVER leave the panel origin. Without this line
-        # the browser's Cookie header is forwarded verbatim to 127.0.0.1:<tunnel_port>,
-        # i.e. into the router's LuCI. Anyone who owns a single router - or reads one
-        # router's request log - would then hold a live tg_session for the operator who
-        # opened that router, which is full panel access, not just that router. An empty
+        # No browser cookie reaches the router's LuCI. Without this line the browser's
+        # Cookie header is forwarded verbatim to 127.0.0.1:<tunnel_port> - and although
+        # the browser does not send tg_session to this host, it DOES send tg_luci, the
+        # router's own launch cookie. LuCI never needs it (the gate has already accepted
+        # it), so forwarding it would hand a device a live credential for itself. An empty
         # value tells nginx to drop the header instead of passing it through.
-        # If a future LuCI needs a cookie of its own, re-add it EXPLICITLY here from a
-        # dedicated variable - never by removing this line.
+        # The gate gets tg_luci through the dedicated header set in routes.auth.conf, so
+        # dropping the whole Cookie header here costs nothing. If a future LuCI needs a
+        # cookie of its own, re-add it EXPLICITLY here from a dedicated variable - never by
+        # removing this line.
         proxy_set_header Cookie "";
 
         proxy_pass http://<bind>:<tunnel_port>;

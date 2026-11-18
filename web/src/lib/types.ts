@@ -38,6 +38,9 @@ export interface Router {
   console_ready: boolean
   bind_address: string | null
   url: string | null
+  /** The clickable form of `url`: it goes through /__tg/enter, which installs a cookie scoped
+   *  to that router's host. `url` alone cannot authenticate from a fresh browser. */
+  launch_url: string | null
   hostname: string | null
   model: string | null
   openwrt_version: string | null
@@ -159,6 +162,10 @@ export interface PanelConfig {
   /** False when the panel has no hostname to probe, so "Test connection" cannot work. */
   agent_endpoint_testable: boolean
   subdomain_suffix: string
+  /** "subdomain" (one host per router) or "path" (one gateway host, /<slug>/ per router). */
+  route_mode: string
+  /** The single host routers are published under in path mode; empty otherwise. */
+  gateway_host: string
   bootstrap_ttl_minutes: number
   poll_interval_seconds: number
   proxy_driver: string

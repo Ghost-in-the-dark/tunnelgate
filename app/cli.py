@@ -24,6 +24,7 @@ import json
 import os
 import shutil
 import socket
+import subprocess
 import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -367,6 +368,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     _check_ssh(settings, report)
     _check_ports(settings, report)
     _check_proxy(settings, report)
+    _check_launch(settings, report)
+    _check_slug_namespace(settings, report)
     _check_console(settings, report)
     _check_frontend(settings, report)
 
@@ -530,6 +533,68 @@ def _check_ssh(settings: Settings, report: Report) -> None:
         )
 
 
+def _check_slug_namespace(settings: Settings, report: Report) -> None:
+    """Do any existing router slugs collide with the panel's own paths?
+
+    Creation refuses a reserved slug (config.RESERVED_SLUGS), but a panel upgraded from an
+    older build can already own one, and in path mode the collision is not cosmetic:
+
+      * "api" / "assets" - nginx declares location /api/ and /assets/ in the panel vhost, so
+        the rendered routes.conf produces a duplicate location and nginx -t rejects the WHOLE
+        config: the panel can no longer push routes at all;
+      * "login" and friends - the router location shadows the panel page; for /login the
+        result is an unbreakable 308 -> 401 -> 302 /login?router=login loop, i.e. the operator
+        is locked out of the panel and cannot rename it through the UI.
+
+    Only path mode renders those locations, so subdomain deployments are unaffected even
+    though the slug itself is just as undesirable there (a mode switch would hit it later).
+    """
+    if not settings.path_routing:
+        return
+    from .config import RESERVED_SLUGS
+    from .models import Router
+
+    try:
+        _ensure_runtime_dirs(settings)
+        init_db()
+        with session_scope() as db:
+            clashes = sorted(
+                slug
+                for (slug,) in db.execute(select(Router.slug)).all()
+                if str(slug) in RESERVED_SLUGS
+            )
+    except Exception as exc:
+        report.warn(
+            "slug namespace",
+            f"cannot check router slugs: {type(exc).__name__}: {exc}",
+            "fix the database first (init-db / check-schema)",
+        )
+        return
+
+    if not clashes:
+        report.ok("slug namespace", "no router slug shadows a panel path")
+        return
+    breaking = sorted(s for s in clashes if s in {"api", "assets"})
+    detail = ", ".join(clashes)
+    if breaking:
+        report.fail(
+            "slug namespace",
+            f"router slug(s) {detail} collide with the panel's own locations",
+            f"rename {', '.join(breaking)} before the next route render, or nginx -t will "
+            "reject the whole config and no route update can be published. Set the router's "
+            "name in the panel; the slug follows the name at creation and is immutable, so "
+            "the affected router has to be re-created",
+        )
+    else:
+        report.fail(
+            "slug namespace",
+            f"router slug(s) {detail} shadow a panel page",
+            "re-create the affected router under another name: /" + clashes[0] + "/ would be "
+            "served by the router instead of the panel, and for /login that is a redirect "
+            "loop that locks you out of the panel",
+        )
+
+
 def _check_ports(settings: Settings, report: Report) -> None:
     from .services import ports as ports_service
 
@@ -587,6 +652,59 @@ def _check_ports(settings: Settings, report: Report) -> None:
         report.ok("tunnel bind address", "127.0.0.1")
 
 
+def _nginx_modules(nginx: str) -> str | None:
+    """Return the configure arguments of an nginx binary, or None.
+
+    nginx -V writes to stderr and exits 0; a wrapper that prints nothing is
+    treated as unknown rather than as "no modules", so a doctor run can never
+    turn a probe failure into a false failure of the deployment.
+    """
+    try:
+        proc = subprocess.run(  # fixed argv, no shell
+            [nginx, "-V"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    text = (proc.stderr or "") + (proc.stdout or "")
+    if "configure arguments" not in text:
+        return None
+    return text
+
+
+def _check_sub_filter(nginx: str, report: Report) -> None:
+    """Fail when path routing is on but this nginx cannot rewrite HTML.
+
+    Path mode is the only mode that needs sub_filter: LuCI emits root-absolute
+    URLs and they must be moved under /<slug>/. A stock "nginx" build carries
+    the module, a slim one may not, and the breakage is invisible until a
+    router page loads with broken CSS and dead links - so it is checked here
+    rather than discovered there.
+    """
+    modules = _nginx_modules(nginx)
+    if modules is None:
+        report.warn(
+            "sub_filter module",
+            f"could not read the module list from {nginx} -V",
+            "path routing rewrites LuCI's HTML with sub_filter; check it by hand with "
+            "nginx -V 2>&1 | grep -o with-http_sub_module",
+        )
+        return
+    if "with-http_sub_module" in modules:
+        report.ok("sub_filter module", "with-http_sub_module")
+    else:
+        report.fail(
+            "sub_filter module",
+            f"{nginx} was built without --with-http_sub_module",
+            "path routing rewrites LuCI's absolute links with sub_filter; install the distro "
+            "'nginx' package (nginx-common + nginx), not a minimal build, or switch to "
+            "TUNNELGATE_ROUTE_MODE=subdomain",
+        )
+
+
 def _check_proxy(settings: Settings, report: Report) -> None:
     driver = (settings.proxy_driver or "none").strip().lower()
     if driver == "none":
@@ -603,7 +721,17 @@ def _check_proxy(settings: Settings, report: Report) -> None:
             "use nginx, caddy or none",
         )
         return
-    report.ok("proxy driver", driver)
+    if driver == "caddy" and settings.path_routing:
+        # Caught here rather than at the first sync: the proxy manager would raise on every
+        # reconcile, so every router route would silently stay unpublished.
+        report.fail(
+            "proxy driver",
+            "TUNNELGATE_ROUTE_MODE=path with TUNNELGATE_PROXY_DRIVER=caddy",
+            "path routing rewrites LuCI's HTML and scopes cookies per prefix, which only the "
+            "nginx renderer does; use nginx, or switch back to subdomain routing",
+        )
+    else:
+        report.ok("proxy driver", driver)
 
     routes_path = Path(settings.proxy_routes_path)
     parent_ok, parent_error = _writable_dir(routes_path.parent)
@@ -622,6 +750,9 @@ def _check_proxy(settings: Settings, report: Report) -> None:
         )
         if nginx:
             report.ok("nginx", nginx)
+            if settings.path_routing:
+                _check_sub_filter(nginx, report)
+                _check_routes_include(settings, report, nginx)
         else:
             report.fail(
                 "nginx",
@@ -661,6 +792,284 @@ def _check_proxy(settings: Settings, report: Report) -> None:
                 f"{settings.caddy_admin_url} is not on loopback",
                 "the admin API is unauthenticated by design - keep it on 127.0.0.1",
             )
+
+
+def _check_routes_include(settings: Settings, report: Report, nginx: str) -> None:
+    """Is routes.conf included where the layout requires, and does nginx accept the result?
+
+    Path mode has two layouts and they differ in nothing more consequential than this
+    include. Separate: routes.conf declares its own server{} block, so it belongs in the
+    *http* context. Merged: it declares locations only, so it belongs INSIDE the panel server
+    block - in the http context nginx rejects the bare "location" directives with
+    "location directive is not allowed here" and the router paths never appear.
+
+    Rather than guess from the file alone, this asks nginx itself: the rendered config either
+    parses (and the operator is fine) or it does not, and nginx names the file and line that
+    broke. That covers the reverse mistake too - a separate-layout file included inside a
+    server block is equally illegal - and it needs no knowledge of where the operator keeps
+    their vhosts.
+    """
+    routes_path = Path(settings.proxy_routes_path)
+    if not routes_path.exists():
+        return  # _check_launch already reports a missing render
+    code, output = _run_quiet([nginx, "-t"])
+    if code == 0:
+        report.ok("routes include", "nginx accepts the rendered config")
+        return
+    if _nginx_test_did_not_reach_the_config(output):
+        # "nginx -t" is a full start-up: it parses the config, then tries to open the pid file
+        # and temp paths. Run as the unprivileged service account, it dies on those with
+        # "open() /run/nginx.pid failed (13: Permission denied)" and exits non-zero - which
+        # says nothing about the include. Blaming the include there sends an operator to move
+        # a correct include and leaves the real reason (who ran doctor) unmentioned.
+        report.warn(
+            "routes include",
+            "the config parses, but nginx -t could not finish: " + _nginx_blocking_error(output),
+            "re-run doctor as root (sudo -u root ... or just sudo), or grant this user write "
+            "access to nginx's pid file and temp paths; the include placement itself is fine",
+        )
+        return
+    detail = " | ".join(line.strip() for line in output.splitlines() if line.strip())[:400]
+    if settings.gateway_merged:
+        fix = (
+            "in the merged layout routes.conf holds locations only: include it INSIDE the "
+            "panel server block (server_name " + settings.gateway + "), not in the http context"
+        )
+    else:
+        fix = (
+            "in the separate layout routes.conf declares its own server{} block: include it "
+            "from the *http* context (deploy/nginx/tunnelgate.conf does), not inside a server"
+        )
+    report.fail("routes include", "nginx rejects the rendered config: " + detail, fix)
+
+
+def _nginx_test_did_not_reach_the_config(output: str) -> bool:
+    """Did "nginx -t" reject the CONFIG, or fail before judging it?
+
+    nginx prints "the configuration file ... syntax is ok" only once parsing has succeeded, so
+    that line plus a non-zero exit means the config is fine and nginx fell over on a runtime
+    prerequisite (unwritable pid file, missing temp dir, privileged port). This distinction
+    matters because the fix is completely different - and because doctor is normally run as
+    the same unprivileged account that runs the panel.
+    """
+    lowered = output.lower()
+    return "syntax is ok" in lowered or "test is successful" in lowered
+
+
+def _nginx_blocking_error(output: str) -> str:
+    """The last [emerg] line of a failed nginx -t, which is the reason it stopped."""
+    for line in reversed([ln.strip() for ln in output.splitlines() if ln.strip()]):
+        if "[emerg]" in line or "[alert]" in line:
+            return line[:300]
+    return " | ".join(ln.strip() for ln in output.splitlines() if ln.strip())[:300]
+
+
+def _run_quiet(argv: list[str]) -> tuple[int, str]:
+    """Run a command, returning (exit code, combined output). Never raises."""
+    import subprocess
+
+    try:
+        completed = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError) as exc:  # pragma: no cover - broken install
+        return 1, f"{type(exc).__name__}: {exc}"
+    return completed.returncode, (completed.stdout or "") + (completed.stderr or "")
+
+
+def _check_launch(settings: Settings, report: Report) -> None:
+    """Can a browser actually get from this panel into a router's LuCI?
+
+    "Public route" is https://<slug>.<suffix> - a host the browser holds no panel cookie for -
+    so the way in is a one-time ticket redeemed at /__tg/enter, which installs a cookie scoped
+    to that router host. Two things break that quietly, and both look identical from the UI
+    (an endless bounce through /login):
+
+      * router hostnames that cannot exist, e.g. an IP or a bare name as the suffix;
+      * proxy config rendered before the hand-off existed, so the vhost has no /__tg/enter and
+        its auth subrequest does not carry the router cookie.
+
+    The second one is the common upgrade mistake, and it is only visible in the generated
+    files, which is exactly why it belongs here rather than in the UI.
+    """
+    from .services.launch import cookie_header_name
+
+    raw_mode = str(getattr(settings, "route_mode", "") or "").strip().lower()
+    if raw_mode and raw_mode not in {"subdomain", "path"}:
+        report.warn(
+            "route mode",
+            f"TUNNELGATE_ROUTE_MODE={raw_mode!r} is not 'subdomain' or 'path'",
+            "the panel falls back to subdomain routing; fix or unset the variable",
+        )
+
+    suffix = str(settings.host_suffix or "").strip()
+    if settings.path_routing:
+        # Path mode publishes everything on ONE name, so what has to be usable is that name -
+        # not "<slug>.<suffix>". An IP still fails here, but for the opposite reason: it would
+        # be the gateway host itself, and a certificate for a bare IP is not obtainable.
+        gateway = str(settings.gateway or "").strip()
+        problem = _gateway_problem(gateway)
+        if problem:
+            report.fail(
+                "router hostnames",
+                f"gateway host {gateway!r} is not a usable host: {problem}",
+                "set TUNNELGATE_GATEWAY_HOST to the public name routers are published under "
+                "(for example gate.example.com); in path mode every router is "
+                "https://<gateway>/<slug>/ and no wildcard DNS or certificate is needed",
+            )
+        else:
+            report.ok("router hostnames", f"{gateway}/<slug>/")
+
+        panel = str(settings.panel_host or "").strip(".").lower()
+        if settings.gateway_merged:
+            # Supported, but not free: same scheme+host+port means a path is not an origin
+            # boundary, so a hostile router page runs in the panel's origin. The layout also
+            # changes where routes.conf has to be included - locations are illegal in the
+            # http context and a server{} block is illegal inside a server block, so nginx
+            # rejects the config outright rather than failing quietly (verified on 1.26.3).
+            # Cheap to get wrong, cheap to detect: _check_routes_include runs nginx -t.
+            report.warn(
+                "gateway host",
+                f"{gateway} is the panel's own host: routers share the panel origin",
+                "keep the gateway on a separate name if you have one - see docs/SECURITY.md "
+                "'Path mode on the panel's own host' for what the shared origin costs. In this "
+                "layout routes.conf holds locations only and must be included INSIDE the panel "
+                "server block (doctor checks that under 'routes include')",
+            )
+        else:
+            report.ok("gateway host", f"{gateway} (panel on {panel or 'unset'})")
+    else:
+        problem = _hostname_problem(suffix)
+        if problem:
+            report.fail(
+                "router hostnames",
+                f"<slug>.{suffix} is not a usable host: {problem}",
+                "set TUNNELGATE_SUBDOMAIN_SUFFIX to a real domain (router.example.com gives "
+                "lab.router.example.com), or unset it and point TUNNELGATE_PANEL_HOST at the "
+                "panel; with no usable domain at all, set TUNNELGATE_ROUTE_MODE=path and "
+                "publish routers under one gateway host instead",
+            )
+        else:
+            report.ok("router hostnames", f"<slug>.{suffix}")
+
+    if settings.cookie_domain:
+        report.warn(
+            "cookie scope",
+            f"TUNNELGATE_COOKIE_DOMAIN={settings.cookie_domain} widens the panel session to "
+            "every router host",
+            "unset it: /__tg/enter gives each router its own short-lived cookie, so the "
+            "domain-wide session cookie is no longer needed (docs/SECURITY.md section 6)",
+        )
+
+    # A loopback panel_url is the documented shape behind a TLS terminator, and it is fine
+    # for proxy_pass - but every redirect this panel writes names the browser's origin, so
+    # without an explicit public origin a router visitor is sent to http://127.0.0.1:8080.
+    if not str(getattr(settings, "public_url", None) or "").strip():
+        from urllib.parse import urlsplit as _urlsplit
+
+        host = (_urlsplit(str(settings.panel_url)).hostname or "").lower()
+        if host in {"127.0.0.1", "::1", "localhost"}:
+            report.warn(
+                "public origin",
+                f"TUNNELGATE_PANEL_URL={settings.panel_url} is loopback, and "
+                "TUNNELGATE_PUBLIC_URL is unset, so login redirects name 127.0.0.1",
+                "set TUNNELGATE_PUBLIC_URL to the https origin operators use "
+                f"(https://{settings.panel_host}); a browser cannot reach 127.0.0.1 on the "
+                "panel host",
+            )
+
+    driver = (settings.proxy_driver or "none").strip().lower()
+    if driver == "caddy":
+        report.warn(
+            "launch config",
+            "caddy keeps routes in memory, so they cannot be checked from here",
+            "after upgrading, run: python -m app.cli render-proxy   # re-pushes every route "
+            "with /__tg/enter",
+        )
+        return
+    if driver != "nginx":
+        return
+
+    from .services.proxy import auth_snippet_path
+
+    routes_path = Path(settings.proxy_routes_path)
+    snippet_path = auth_snippet_path(routes_path)
+    absent = [path for path in (routes_path, snippet_path) if not path.exists()]
+    if absent:
+        report.warn(
+            "launch config",
+            ", ".join(_relpath(path) for path in absent) + " not written yet",
+            "start the panel once, or run: python -m app.cli render-proxy",
+        )
+        return
+
+    header = cookie_header_name(settings.router_cookie_name)
+    routes_text = _read_text(routes_path)
+    stale = []
+    if "/__tg/enter" not in routes_text:
+        stale.append("the router vhosts have no /__tg/enter, so Public route loops via /login")
+    if settings.path_routing:
+        # Path mode has no per-router vhost and no shared snippet: the auth location is part
+        # of the same file, so both facts are checked in routes.conf.
+        if header not in routes_text or "/__tg/auth" not in routes_text:
+            stale.append(
+                f"the gateway auth location never forwards {header}, so the gate cannot see a "
+                "router cookie"
+            )
+    elif header not in _read_text(snippet_path):
+        stale.append(
+            f"the auth subrequest never forwards {header}, so the gate cannot see a router cookie"
+        )
+    if stale:
+        report.fail(
+            "launch config",
+            "; ".join(stale),
+            "python -m app.cli render-proxy   # then reload nginx (the .path unit does it)",
+        )
+    else:
+        report.ok("launch config", "/__tg/enter is served and the gate sees the router cookie")
+
+
+def _gateway_problem(host: str) -> str:
+    """Why `host` is wrong as the single gateway name in path mode, or "" when usable.
+
+    Stricter than `_hostname_problem` in one respect: a bare IP is rejected outright, because
+    this host has to hold a real certificate. Public CAs issue for names, not for 192.168.x.x.
+    """
+    if not host:
+        return "it is empty"
+    if any(ch.isspace() for ch in host):
+        return "it contains whitespace"
+    if ":" in host or host.replace(".", "").isdigit():
+        return "it is an IP address"
+    if "." not in host:
+        return "it has no dot, so no certificate authority would issue for it"
+    for label in host.split("."):
+        if not label or len(label) > 63 or label.startswith("-") or label.endswith("-"):
+            return f"{label!r} is not a valid DNS label"
+    return ""
+
+
+def _hostname_problem(host: str) -> str:
+    """Why <slug>.<host> would not resolve, or "" when the name looks usable."""
+    if not host:
+        return "it is empty"
+    if any(ch.isspace() for ch in host):
+        return "it contains whitespace"
+    candidate = host[2:] if host.startswith("*.") else host
+    if ":" in candidate or candidate.replace(".", "").isdigit():
+        return "it is an IP address"
+    if "." not in candidate:
+        return "it has no dot, so <slug>.<host> would not resolve"
+    for label in candidate.split("."):
+        if not label or len(label) > 63 or label.startswith("-") or label.endswith("-"):
+            return f"{label!r} is not a valid DNS label"
+    return ""
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 def _is_loopback_url(url: str) -> bool:
@@ -884,6 +1293,7 @@ def cmd_render_proxy(args: argparse.Namespace) -> int:
 def cmd_console_url(args: argparse.Namespace) -> int:
     """Print the URL and the loopback helpers for a router console."""
     from .models import Router
+    from .services.launch import launch_url
 
     settings = _settings()
     init_db()
@@ -917,6 +1327,7 @@ def cmd_console_url(args: argparse.Namespace) -> int:
                         "console_host": "console." + settings.host_suffix,
                         "console_port": r.console_port,
                         "luci_url": settings.router_url(r.slug),
+                        "launch_url": launch_url(settings, r.slug),
                         "console_url": f"https://console.{settings.host_suffix}/#/routers/{r.id}",
                     }
                     for r in targets
@@ -932,6 +1343,9 @@ def cmd_console_url(args: argparse.Namespace) -> int:
         _say("  id:          " + router.id)
         _say("  status:      " + router.status)
         _say("  LuCI:        " + settings.router_url(router.slug))
+        # The address that works from a browser. The plain LuCI URL above only authenticates
+        # a browser that already holds that router's cookie; this one installs it.
+        _say("  open:        " + launch_url(settings, router.slug))
         _say(f"  console:     https://{console_host}/#/routers/{router.id}")
         if router.console_port:
             _say(

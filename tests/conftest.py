@@ -102,6 +102,7 @@ def _reset_runtime_state() -> None:
         ("app.api.auth", ("LOGIN_LIMITER", "_LIMITER")),
         ("app.api.bootstrap", ("EXCHANGE_LIMITER",)),
         ("app.services.console", ("TICKETS", "SESSIONS")),
+        ("app.services.launch", ("TICKETS",)),
     ):
         try:
             mod = importlib.import_module(mod_name)

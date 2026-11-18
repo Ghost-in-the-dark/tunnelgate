@@ -126,8 +126,11 @@ export function HostsTable({
     {
       label: 'Open LuCI',
       icon: 'external',
-      disabled: !r.url || !r.online,
-      disabledReason: !r.url
+      // Left enabled when the URL is merely unusable: the click handler then explains what is
+      // wrong with it (a host the browser cannot parse looks identical to a dead button), and a
+      // disabled item would hide that. Offline still disables, because that reason is obvious.
+      disabled: !(r.launch_url || r.url) || !r.online,
+      disabledReason: !(r.launch_url || r.url)
         ? 'No public URL yet - the proxy route is created once the tunnel is up.'
         : 'The router is offline, so its LuCI page is unreachable.',
       onSelect: () => onOpenLuCI(r),

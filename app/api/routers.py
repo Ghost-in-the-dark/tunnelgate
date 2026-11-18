@@ -18,7 +18,7 @@ from typing import Annotated
 from fastapi import APIRouter, Query, Request, Response
 from sqlalchemy import ColumnElement, func, or_, select
 
-from ..config import utcnow
+from ..config import RESERVED_SLUGS, utcnow
 from ..deps import (
     CsrfGuard,
     CurrentUser,
@@ -51,6 +51,7 @@ from ..services import bootstrap as bootstrap_service
 from ..services import keys as keys_service
 from ..services import ports as ports_service
 from ..services.audit import record as audit_record
+from ..services.launch import launch_url
 from . import bootstrap as bootstrap_api
 
 log = logging.getLogger(__name__)
@@ -79,10 +80,18 @@ def slugify(name: str) -> str:
 
 
 def _unique_slug(db, base: str) -> str:
-    """First free slug: base, base-2, base-3... The slug is baked into DNS, so it never moves."""
+    """First free slug: base, base-2, base-3... The slug is baked into DNS, so it never moves.
+
+    A name can slugify into a path the panel already owns (a router called "Login" becomes
+    "login"), so a reserved slug is skipped exactly like a taken one: the operator gets
+    "login-2" without having to know why the obvious name was refused.
+    """
     candidate = base
     counter = 1
-    while db.execute(select(Router.id).where(Router.slug == candidate)).first() is not None:
+    while (
+        candidate in RESERVED_SLUGS
+        or db.execute(select(Router.id).where(Router.slug == candidate)).first() is not None
+    ):
         counter += 1
         suffix = f"-{counter}"
         candidate = base[: SLUG_MAX_LENGTH - len(suffix)].rstrip("-") + suffix
@@ -137,6 +146,10 @@ def router_out(item: Router, *, token: BootstrapToken | None = None, settings=No
         console_ready=console_ready(item),
         bind_address=item.bind_address,
         url=settings.router_url(item.slug) if settings is not None else None,
+        # The clickable form: same host, but through /__tg/enter so the panel can install a
+        # router-scoped cookie. `url` alone cannot authenticate from a fresh browser, which is
+        # exactly the login loop this field exists to end.
+        launch_url=launch_url(settings, item.slug) if settings is not None else None,
         hostname=item.hostname,
         model=item.model,
         openwrt_version=item.openwrt_version,

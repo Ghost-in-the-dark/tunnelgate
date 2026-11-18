@@ -19,9 +19,9 @@ The router vhosts are `<slug>.<host_suffix>`, so with the values above a router 
 
 ## 0. Decide the DNS layout first
 
-Two options; pick one before requesting certificates.
+Three options; pick one before requesting certificates.
 
-### Option A - wildcard (recommended)
+### Option A - wildcard (recommended for subdomain mode)
 
 ```
 panel.example.com          A     203.0.113.10
@@ -39,10 +39,126 @@ One `A` record per router, added when the router is created, and a certificate p
 moving parts (creating a router has a DNS step and a certbot step), no wildcard, no DNS plugin.
 Only sensible for a handful of routers.
 
+### Option C - no wildcard at all: path routing
+
+Keep one name in DNS for the whole router fleet - the gateway - and publish every router under a
+path on it:
+
+```
+gate.example.com           A     203.0.113.10          # every router lives here
+panel.example.com          A     203.0.113.10          # the panel itself (separate layout)
+# merged layout instead: no second record - point TUNNELGATE_PANEL_HOST at gate.example.com
+```
+
+```bash
+TUNNELGATE_ROUTE_MODE=path
+TUNNELGATE_GATEWAY_HOST=gate.example.com
+TUNNELGATE_PROXY_DRIVER=nginx
+```
+
+A router is then `https://gate.example.com/lab-router/`. No wildcard DNS record, no wildcard
+certificate, no DNS step when a router is added - the gateway's certificate covers all of them.
+This is the option to pick when the domain is a free dynamic-DNS name (a wildcard record is
+usually not available there) or when you have no DNS control at all.
+
+Path mode has **two layouts**, and the panel picks one by comparing `TUNNELGATE_GATEWAY_HOST`
+with `TUNNELGATE_PANEL_HOST`. There is no separate flag.
+
+| | separate (recommended) | merged |
+|---|---|---|
+| `TUNNELGATE_GATEWAY_HOST` | `gate.example.com`, different from the panel | the **same** value as `TUNNELGATE_PANEL_HOST` |
+| `routes.conf` holds | one full `server` block for the gateway, plus `map $http_upgrade $tg_connection_upgrade` | only `location`s |
+| Included in | nginx **http** context (as always) | the **panel `server` block** |
+| Origin shared with the panel | no | **yes** - see docs/SECURITY.md §6.1 |
+
+**Separate** is the default when the two names differ and the one to prefer: a router page is a
+different origin, so a compromised router cannot act inside the panel. **Merged** is for the case
+where one public name is all you have - a free dynamic-DNS name with no wildcard, a single
+certificate, or a panel on a bare IP. It costs origin isolation: whatever a router serves runs in
+the panel's origin and can use the operator's session, including reading the CSRF token. Read
+docs/SECURITY.md §6.1 before choosing it.
+
+In the merged layout the include moves into the panel vhost:
+
+```nginx
+server {
+    server_name gate.example.com;
+    ...
+    include /etc/nginx/tunnelgate/routes.conf;
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        ...
+    }
+}
+```
+
+The panel vhost must also declare the upgrade map itself - the shipped `tunnelgate.conf`
+already does for its own WebSocket blocks - because the merged file's router locations reference
+`$connection_upgrade` and a `map` is illegal inside a `server` block:
+
+```nginx
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+```
+
+This is the one placement error nginx will not let slide. Include the merged file in the http
+context and `nginx -t` stops with `"location" directive is not allowed here in
+.../routes.conf:1`; include the separate-layout file inside a server block and it stops with
+`"server" directive is not allowed here`. Both are caught before nginx reloads, which is the good
+half of the story - the bad half is that the error names `routes.conf`, not the vhost that
+included it. `app.cli doctor` runs `nginx -t` under `routes include` and, on failure, tells you
+which context the layout in effect wants; it warns under `gateway host` for the merged layout
+itself.
+
+In practice merged mode means editing the shipped `deploy/nginx/tunnelgate.conf`: it places the
+routes include in the http context (just after the upgrade map) for subdomain and separate mode,
+so move that one line into the panel `server` block and keep the http-context copy out. Nothing
+else in the file changes - the console vhost, the port-80 redirect and the CSP stay as they are.
+
+Merged mode also puts the router prefixes into the panel's own path namespace, and that is a
+real constraint, not a typo warning. A router slug becomes `location = /<slug>` plus
+`location /<slug>/`, both more specific than the panel's `location /`, so the slug wins on that
+host. Two consequences:
+
+* **nginx refuses the file outright** when the slug duplicates a location the panel vhost already
+  declares. `api` and `assets` do: the panel vhost has `location /api/` and `location /assets/`,
+  and merging a router called `api` fails with `duplicate location "/api/"`, which takes the whole
+  config down (doctor's `routes include` check reports it);
+* **the panel page is shadowed** when the slug matches an SPA route instead - nothing in nginx
+  declares `/login`, `/hosts`, `/settings`, `/audit` or `/routers`, so the config parses and the
+  page simply becomes the router's prefix: `/hosts` answers `308 /hosts/`, the gate refuses, and
+  the operator lands on `/login?router=hosts&next=/hosts/`, which signs them in and hands off to
+  the *router* - so that panel page is unreachable, not merely broken. A router called `login`
+  is the pathological case: the bounce target is the shadowed path itself, so `/login` ->
+  `308 /login/` -> `401` -> `302 /login?router=login&...` -> `308` ... never resolves, and there
+  is no way into the panel at all. Renaming the router is the only fix.
+
+Neither the panel nor `app.cli doctor` reserves these names today, so rename before switching an
+existing fleet over: `api`, `assets`, `login`, `hosts`, `settings`, `audit` and `routers` are
+the ones that bite. The separate layout has none of this - the gateway host carries no panel
+locations to collide with.
+
+Requirements and trade-offs:
+
+- the gateway host must be a real DNS name; a bare IP cannot get a certificate, so
+  `app.cli doctor` fails an IP here, and fails an empty or dotless host too;
+- if the gateway is the panel's own host, that is the merged layout described above: doctor
+  warns (same-origin, docs/SECURITY.md §6.1) but the setup is supported. If the names differ you
+  get the separate layout and the nginx include stays in the http context;
+- only the **nginx** driver implements it - caddy refuses to start in this mode;
+- the nginx build needs `--with-http_sub_module` (the distro `nginx` package has it; a minimal
+  build may not). Doctor reports it as `sub_filter module`; without it LuCI pages load with
+  unprefixed CSS and dead links;
+- LuCI is rewritten (absolute links, redirects, cookie `Path`) because it assumes it owns a
+  host; see docs/ARCHITECTURE.md §5.1. Subdomain mode has no such rewriting and stays the
+  default.
+
 The rest of this document assumes **Option A**.
 
-> If you cannot use DNS-01, use Option B, or put Cloudflare in front and use its origin
-> certificate; either way the panel's nginx config does not change.
+> If you cannot use DNS-01, use Option B or C, or put Cloudflare in front and use its origin
+> certificate; either way the panel's nginx config does not change much.
 
 ---
 
@@ -228,6 +344,13 @@ TUNNELGATE_LOG_LEVEL=info
 TUNNELGATE_PANEL_URL=https://panel.example.com
 TUNNELGATE_PANEL_HOST=panel.example.com
 TUNNELGATE_SUBDOMAIN_SUFFIX=panel.example.com
+# Router addressing. subdomain = <slug>.panel.example.com (needs a wildcard cert).
+# path = https://gate.panel.example.com/<slug>/ (needs one ordinary cert, nginx only).
+TUNNELGATE_ROUTE_MODE=subdomain
+# Path mode only. Different from TUNNELGATE_PANEL_HOST => separate layout (recommended,
+# include routes.conf in the http context). Equal to it => merged layout, same origin as the
+# panel: include routes.conf inside the panel server block instead. See docs/SECURITY.md §6.1.
+# TUNNELGATE_GATEWAY_HOST=gate.panel.example.com
 TUNNELGATE_COOKIE_SECURE=true
 # Leave COOKIE_DOMAIN unset - see "Do not widen the session cookie" below.
 
@@ -297,6 +420,37 @@ inherit it.
 Only set it if the SPA and the API genuinely live on different hostnames, and accept the
 trade-off in writing.
 
+### How a router is opened (and why it is not the cookie)
+
+A router's LuCI lives on `<slug>.panel.example.com`, a host the browser has no panel session
+for. The panel therefore issues a **one-time launch ticket** and the router vhost redeems it:
+
+```
+browser, signed in on panel.example.com
+  GET https://panel.example.com/__tg/launch?router=office-ap&next=/cgi-bin/luci
+    -> 303 https://office-ap.panel.example.com/__tg/enter?t=<ticket>
+  GET https://office-ap.panel.example.com/__tg/enter?t=<ticket>   (router vhost -> panel)
+    -> Set-Cookie: tg_luci=...; Path=/; HttpOnly; Secure
+    -> 303 /cgi-bin/luci
+```
+
+`tg_luci` is scoped to that one router host, valid for
+`TUNNELGATE_ROUTER_SESSION_TTL_MINUTES` (default 60), and is the only thing the router's vhost
+will accept besides a panel session. It grants that router - nothing else. This is what "Open
+LuCI" and the "Public route" card in the UI link to; the plain `https://<slug>.<suffix>` URL
+keeps working once that cookie exists, and falls back through `/login` when it does not.
+
+Two consequences for an install:
+
+* **The generated vhost must be current.** `/__tg/enter` and the `X-Tg-Luci-Cookie` header on
+  the auth subrequest are part of `routes.conf` / `routes.auth.conf`. After upgrading, run
+  `python -m app.cli render-proxy` (or restart the panel, which re-renders on startup) and
+  reload nginx. `python -m app.cli doctor` fails with `launch config` if the files on disk
+  predate the hand-off - that is the symptom to look for if "Open LuCI" starts bouncing through
+  `/login` again.
+* **Nothing needs `TUNNELGATE_COOKIE_DOMAIN`.** If a router login appears to work only with the
+  domain cookie set, the config is stale, not the setting wrong.
+
 ### Initialise the database
 
 ```bash
@@ -332,7 +486,9 @@ directory, the routes file and `authorized_keys`. It restarts on failure with a 
 ### Route include directory
 
 The panel regenerates `routes.conf` on every router change and reloads nginx. Prepare the
-directory and include it once:
+directory and include it once (the include below is the subdomain-mode one; in path mode see
+§0 Option C for which context the file belongs in - http for separate, the panel `server` block
+for merged):
 
 ```bash
 install -d -m 0755 /etc/nginx/tunnelgate
@@ -349,7 +505,11 @@ The shipped `tunnelgate.conf` defines:
 * `server_name console.panel.example.com` - the console WebSocket vhost (a WebSocket cannot go
   through `auth_request` per router, so it lives on its own hostname and the router id comes from
   the ticket);
-* an `include /etc/nginx/tunnelgate/routes.conf;` for the per-router vhosts.
+* an `include /etc/nginx/tunnelgate/routes.conf;` for the per-router vhosts, placed in the
+  http context. That placement is right for subdomain mode and for the *separate* path layout;
+  in the *merged* path layout the same line has to move inside the panel `server` block instead
+  ("Option C - no wildcard at all: path routing" above). It is one include either way - never
+  both.
 
 ### Certificates
 
@@ -400,12 +560,21 @@ There are two separate questions here and they are easy to conflate:
 | Question | Setting |
 |---|---|
 | Where does the panel listen for its **own** proxy? | `TUNNELGATE_PANEL_URL` (usually `http://127.0.0.1:8080`) |
+| Where do **browsers** reach the panel? | `TUNNELGATE_PUBLIC_URL` |
 | Where do **routers** dial the panel? | the **agent endpoint** - `TUNNELGATE_PANEL_URL` by default, overridable from the UI |
 
-On a flat install they are the same string and nothing needs doing. They diverge as soon as a TLS
-terminator, a load balancer or a non-default port sits in front: the panel still binds loopback,
-while routers dial the public name. Do not "fix" that by pointing `TUNNELGATE_PANEL_URL` at the
-public name - the panel's own proxy would then try to reach itself through the public edge.
+On a flat install the first two are the same string and nothing needs doing. They diverge as soon
+as a TLS terminator, a load balancer or a non-default port sits in front: the panel still binds
+loopback, while browsers arrive on the public name. Do not "fix" that by pointing
+`TUNNELGATE_PANEL_URL` at the public name - the panel's own proxy would then try to reach itself
+through the public edge.
+
+`TUNNELGATE_PUBLIC_URL` is the origin written into every redirect the panel emits: the login
+bounce from a router vhost, and the one-time router launch hand-off. Unset, it is derived from
+`TUNNELGATE_PANEL_URL`'s scheme plus `TUNNELGATE_PANEL_HOST`, which is correct on a flat
+install. **Set it explicitly whenever `TUNNELGATE_PANEL_URL` is loopback** - otherwise a browser
+that follows "Open LuCI" is redirected to `http://127.0.0.1:8080`, which cannot work.
+`python -m app.cli doctor` warns about exactly that combination.
 
 ### Moving the panel without re-installing routers
 
@@ -746,7 +915,10 @@ are most likely to touch:
 |---|---|---|
 | `TUNNELGATE_PANEL_URL` | `http://127.0.0.1:8080` | Where the panel listens for its own proxy - **not** necessarily what routers dial. Fallback for the agent endpoint; override it from the UI instead. See §7 |
 | `TUNNELGATE_PANEL_HOST` | `panel.example.com` | nginx `server_name` for the panel |
-| `TUNNELGATE_SUBDOMAIN_SUFFIX` | =`panel_host` | Suffix for router vhosts |
+| `TUNNELGATE_PUBLIC_URL` | derived from `PANEL_URL` + `PANEL_HOST` | Origin **browsers** use: every redirect the panel writes (login bounce, router launch) names it. Required when `PANEL_URL` is loopback - see §7 |
+| `TUNNELGATE_ROUTE_MODE` | `subdomain` | How routers are published: `subdomain` (`<slug>.<suffix>`, needs a wildcard certificate) or `path` (one gateway host, `<gateway>/<slug>/`, needs one ordinary certificate and **nginx**). Unknown values fall back to `subdomain` so a typo cannot stop the panel from booting; `app.cli doctor` reports it |
+| `TUNNELGATE_SUBDOMAIN_SUFFIX` | =`panel_host` | Suffix for router vhosts - `subdomain` mode only |
+| `TUNNELGATE_GATEWAY_HOST` | =`gate.<suffix>` | The single host routers are published under in `path` mode. Must be a DNS name, not an IP: a CA cannot issue for an IP. Equal to `TUNNELGATE_PANEL_HOST` selects the *merged* layout (shared origin; include `routes.conf` inside the panel `server` block), different gives *separate*, the recommended one. Checked by `app.cli doctor`, which warns on merged and fails an IP, empty or dotless value |
 | `TUNNELGATE_COOKIE_SECURE` | `false` | Usually leave it. The cookie is already marked `Secure` when a request arrives over HTTPS from a trusted proxy, so a TLS-terminating deployment needs nothing. Set `true` only when the panel is **never** reachable over plain HTTP - forcing it on a LAN deployment makes browsers drop the cookie over `http://` and logins silently do not stick |
 | `TUNNELGATE_COOKIE_DOMAIN` | unset (host-only) | **Leave unset.** Operator opt-in only; a domain cookie is sent to every router host - see §5 "Do not widen the session cookie" |
 | `TUNNELGATE_DB_URL` | `sqlite:///./data/tunnelgate.db` | SQLAlchemy URL |

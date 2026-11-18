@@ -188,8 +188,8 @@ docs/                 the documents above
 10. **In-flight launch tickets live in process memory** (like console tickets). A panel restart
     mid-hand-off drops them - the operator clicks the link again - and one process per
     deployment is assumed, as everywhere else.
-9. **No built-in metrics endpoint** (Prometheus); `/api/v1/stats` is what exists.
-10. **The wizard's connection check is polling, not WebSocket** - simpler, and 2 s latency is
+11. **No built-in metrics endpoint** (Prometheus); `/api/v1/stats` is what exists.
+12. **The wizard's connection check is polling, not WebSocket** - simpler, and 2 s latency is
     invisible next to a firmware install.
 
 ## License

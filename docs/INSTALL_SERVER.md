@@ -844,14 +844,31 @@ dig +short test.panel.example.com
 nginx -t
 ```
 
-Then, in the browser:
+Then walk the whole lifecycle once, in the browser. This is the acceptance test: if every step
+below behaves, the deployment is finished. It takes about ten minutes and is worth doing exactly
+as written the first time.
 
-1. `https://panel.example.com` → log in.
-2. Create a router ("Office AP").
-3. Copy the install command, run it on the router (`docs/INSTALL_ROUTER.md`).
-4. Watch the wizard reach **Done**.
-5. Click **Open LuCI** - you should land in LuCI at `https://office-ap.panel.example.com`.
-6. Open the console and run `uci show system`.
+| # | Do this | Expect |
+|---|---|---|
+| 1 | Open `https://panel.example.com` | login page; log in as `admin` |
+| 2 | Create a router named "Office AP" | wizard step 2; note the slug it picks |
+| 3 | Advance to the copy-command step | the command contains only `X-Bootstrap-Token` - no key, no port |
+| 4 | Run the command on the router (`docs/INSTALL_ROUTER.md`) | the wizard goes Waiting → Connected → Done within a minute |
+| 5 | `ss -ltnH \| grep <port>` on the panel | one listener on `127.0.0.1:<port>`, nothing on `0.0.0.0` |
+| 6 | Click **Open LuCI** | you land in LuCI at `https://office-ap.panel.example.com/` and every page, stylesheet and XHR works (no 404s in the browser console) |
+| 7 | Press the console button, run `uci show system` | a prompt and real output; the router's shell, not the panel's |
+| 8 | Close the console, then open Settings → Audit | rows for `auth.login`, `router.create`, `bootstrap.exchange`, `luci.open`, `console.open`, `console.close` |
+| 9 | Settings → Users → add an `operator` account, log in as it in a private window | it can add, rotate and delete routers and open consoles, but Settings → Users and Settings → Panel are refused (admin only) |
+| 10 | Router → **Rotate key**, then run the new command on the router | the live tunnel drops at once and the panel shows **pending**; the **port does not change**; after the exchange the router is **online** again; the old key line is gone from `authorized_keys` and the new one is there |
+| 11 | Router → **Delete** | the key line disappears, the port returns to the pool (`/api/v1/stats` → `ports_free` goes up) |
+| 12 | `grep -c <slug> /var/lib/tunnelgate/.ssh/authorized_keys` | `0` - nothing is left behind; the router's LuCI URL now 404s |
+
+Two failure modes that are *not* bugs, so as not to chase them:
+
+* after step 10 the router sits in **pending** until the new install command has run - rotation does
+  not push a key to the router (the private half is never stored, so it cannot);
+* the console needs the console key, which the heartbeat delivers. Straight after installing, step 7
+  can answer `console_not_installed` for a minute; wait for one heartbeat and try again.
 
 If LuCI opens but the console times out, the router has not picked up the console key yet: the
 heartbeat delivers it, so wait one heartbeat interval (60 s) or restart the tunnel service.

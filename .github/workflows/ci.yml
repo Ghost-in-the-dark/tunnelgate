@@ -18,9 +18,9 @@ jobs:
     name: backend (lint + tests)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
@@ -51,8 +51,8 @@ jobs:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -70,7 +70,7 @@ jobs:
     name: router installer (shellcheck + dry run)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: shellcheck
         run: |
@@ -95,7 +95,7 @@ jobs:
     name: deploy artefacts parse
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # docker-compose.yml reads /etc/tunnelgate.env (env_file:), which does not exist on a
       # fresh runner. Materialise it from the shipped example first: without this the very
@@ -143,7 +143,25 @@ jobs:
       - name: systemd unit sanity
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq systemd
+          # systemd-analyze verify resolves ExecStart on THIS machine, so the unit's real
+          # prefix (/opt/tunnelgate) does not exist on a bare runner and every unit would
+          # warn about a missing binary. Stub the executable it expects, so the check is
+          # about the unit file and not about the runner.
+          sudo mkdir -p /opt/tunnelgate/.venv/bin
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /opt/tunnelgate/.venv/bin/uvicorn >/dev/null
+          sudo chmod 0755 /opt/tunnelgate/.venv/bin/uvicorn
+          # systemd-analyze verify also reports unrelated diagnostics for the runner's own
+          # units (walinuxagent, xfs_scrub). Only fail on lines that name our files, so a
+          # real problem with a unit is an error instead of a warning nobody reads.
+          failed=0
           for f in deploy/systemd/*.service; do
             [ -f "$f" ] || continue
-            systemd-analyze verify "$f" || echo "::warning::systemd-analyze verify reported issues for $f"
+            unit=$(basename "$f")
+            out=$(systemd-analyze verify "$f" 2>&1 | grep -F "$unit:" || true)
+            if [ -n "$out" ]; then
+              echo "$out"
+              failed=1
+            fi
           done
+          [ "$failed" -eq 0 ] || { echo "::error::systemd-analyze verify reported issues in deploy/systemd"; exit 1; }
+          echo "all systemd units verify clean"

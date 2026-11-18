@@ -14,7 +14,7 @@ test('a hostname routed through a real domain opens', () => {
 })
 
 test('a hostname routed through a duckdns-style domain opens', () => {
-  const url = 'https://lab-router.perm-host.duckdns.org/__tg/enter?t=abc'
+  const url = 'https://lab-router.example.duckdns.org/__tg/enter?t=abc'
   assert.equal(isOpenableUrl(url), true)
   assert.equal(unopenableReason(url), '')
 })
@@ -35,12 +35,12 @@ test('an IP address as the subdomain suffix is refused, and named as the cause',
 // Path mode is the answer for a free dynamic-DNS name: one host, one prefix per router.
 // Nothing about that form is unusual for a browser, so these must all pass untouched.
 test('a path-routed URL under one gateway host opens', () => {
-  const launch = 'https://gate.perm-host.duckdns.org/lab-router/__tg/enter'
+  const launch = 'https://gate.example.duckdns.org/lab-router/__tg/enter'
   assert.equal(isOpenableUrl(launch), true)
   assert.equal(unopenableReason(launch), '')
-  assert.equal(unopenableReason('https://gate.perm-host.duckdns.org/lab-router/'), '')
+  assert.equal(unopenableReason('https://gate.example.duckdns.org/lab-router/'), '')
   // A port in the gateway does not change any of that.
-  assert.equal(unopenableReason('https://gate.perm-host.duckdns.org:8443/lab-router/'), '')
+  assert.equal(unopenableReason('https://gate.example.duckdns.org:8443/lab-router/'), '')
 })
 
 test('a path-routed URL whose prefix looks like an IP is still openable', () => {

@@ -14,7 +14,7 @@
 #   2. creates the unprivileged tunnel user and its .ssh directory
 #   3. installs deploy/sshd/tunnelgate.conf and validates it with sshd -t BEFORE reloading
 #   4. creates the data dirs, writes /etc/tunnelgate.env (secrets generated, never overwritten)
-#   5. installs the systemd units and starts the panel
+#   5. builds the SPA, installs the systemd units and starts the panel
 #   6. initialises the database and seeds the admin user
 #   7. installs the nginx vhost and the route include directory
 #   8. requests the wildcard certificate (DNS-01, optional) and reloads nginx
@@ -80,9 +80,11 @@ ROUTES_DIR=/etc/nginx/tunnelgate
 say "installing packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
+# iproute2 is a runtime dependency, not a convenience: the monitor reads 'ss -Hltnp' to
+# learn which tunnels are listening, and treats an empty answer as "cannot see anything".
 apt-get install -y -qq --no-install-recommends \
     ca-certificates curl nginx python3 python3-venv python3-pip \
-    sqlite3 certbot openssh-server ufw jq >/dev/null
+    sqlite3 certbot openssh-server ufw jq iproute2 >/dev/null
 ok "packages present"
 
 # ------------------------------------------------------------------ 2. tunnel user
@@ -204,6 +206,42 @@ if [ ! -d "$REPO/.venv" ]; then
     ok "virtualenv ready"
 else
     ok "virtualenv already exists"
+fi
+
+# The panel serves the SPA itself, and web/dist is deliberately not committed, so a
+# fresh clone has no UI until it is built. Skipped when a build is already there and
+# no source file is newer than it (so re-running the script stays idempotent).
+say "building the SPA"
+build_spa=1
+if [ -f "$REPO/web/dist/index.html" ]; then
+    # Anything under web/ that is newer than the build and is not itself a build
+    # artefact means the bundle is stale. node_modules is pruned because npm writes
+    # it constantly and it never changes the output on its own.
+    if [ -z "$(find "$REPO/web" \
+                \( -name node_modules -o -name dist \) -prune -o \
+                -type f -newer "$REPO/web/dist/index.html" -print 2>/dev/null | head -n 1)" ]; then
+        build_spa=0
+        ok "web/dist is up to date"
+    fi
+fi
+if [ "$build_spa" -eq 1 ]; then
+    if ! command -v npm >/dev/null 2>&1; then
+        # Debian/Ubuntu ship nodejs+npm; the SPA needs Node 18 or newer.
+        apt-get install -y -qq --no-install-recommends nodejs npm >/dev/null 2>&1 || true
+    fi
+    if command -v npm >/dev/null 2>&1; then
+        ( cd "$REPO/web" && npm ci --no-audit --no-fund >/dev/null 2>&1 && npm run build >/dev/null 2>&1 ) \
+            || warn "npm run build failed - run 'cd $REPO/web && npm ci && npm run build' and check the output"
+        if [ -f "$REPO/web/dist/index.html" ]; then
+            ok "SPA built into web/dist"
+        else
+            warn "no web/dist/index.html: the panel will serve the API but no UI"
+        fi
+    else
+        warn "npm is not installed, so the UI cannot be built here."
+        warn "install nodejs+npm, then: cd $REPO/web && npm ci && npm run build"
+        warn "the panel still starts and serves the API without a UI"
+    fi
 fi
 
 # ------------------------------------------------------------------ 6. database

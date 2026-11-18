@@ -9,6 +9,24 @@
 # and writes authorized_keys that the HOST sshd reads. Giving it its own network
 # namespace would hide every tunnel it exists to serve.
 # =============================================================================
+# -----------------------------------------------------------------------------
+# Stage 1: the SPA. web/dist is a build artefact and is not committed, so the
+# image builds it from source instead of expecting a prebuilt directory on the
+# build host (a fresh clone would otherwise fail this COPY). bookworm, not
+# alpine, because esbuild/rollup ship prebuilt glibc binaries and the runtime
+# stage below is Debian anyway.
+# -----------------------------------------------------------------------------
+FROM node:22-bookworm-slim AS tg-web
+WORKDIR /web
+# Dependencies first so a src-only change does not re-resolve the world.
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY web/ ./
+RUN npm run build
+
+# -----------------------------------------------------------------------------
+# Stage 2: the panel.
+# -----------------------------------------------------------------------------
 FROM python:3.13-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -23,11 +41,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     TUNNELGATE_AUTHORIZED_KEYS_PATH=/var/lib/tunnelgate/.ssh/authorized_keys \
     TUNNELGATE_PROXY_ROUTES_PATH=/etc/nginx/tunnelgate/routes.conf
 
-# openssh-client: the console feature shells out to ssh. No curl and no compiler:
-# the runtime has no business building anything, and the healthcheck below uses
-# the interpreter that is already present.
+# openssh-client: the console feature shells out to ssh.
+# iproute2: the monitor reads 'ss -Hltnp' to see which tunnel listeners the HOST
+# sshd created. Without ss the panel cannot observe a single tunnel and every
+# router stays awaiting/offline forever - the image is useless without it, and
+# python:slim does not ship iproute2.
+# No curl and no compiler: the runtime has no business building anything, and the
+# healthcheck below uses the interpreter that is already present.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends openssh-client ca-certificates \
+    && apt-get install -y --no-install-recommends openssh-client ca-certificates iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
 # Dependencies first so a source change does not re-resolve the world.
@@ -56,9 +78,10 @@ WORKDIR /opt/tunnelgate
 # the unprivileged user (PermissionError on app/__init__.py at import time).
 COPY --chown=tunnelgate:tunnelgate app /opt/tunnelgate/app
 # The app serves the SPA itself (index.html fallback), so the build output has to
-# be in the image. The repo ships web/dist; rebuild it with
-#   cd web && npm ci && npm run build
-COPY --chown=tunnelgate:tunnelgate web/dist /opt/tunnelgate/web/dist
+# be in the image. web/dist is a build artefact that is deliberately NOT in the
+# repository (.gitignore), so it is built in the "web" stage above and copied
+# from there. The runtime image keeps no Node and no toolchain.
+COPY --from=tg-web --chown=tunnelgate:tunnelgate /web/dist /opt/tunnelgate/web/dist
 COPY --chown=root:root deploy/docker/entrypoint.sh /usr/local/bin/tunnelgate-entrypoint
 RUN chmod 0755 /usr/local/bin/tunnelgate-entrypoint
 

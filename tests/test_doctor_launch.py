@@ -20,6 +20,8 @@ from app.cli import (
     _check_launch,
     _check_proxy,
     _check_routes_include,
+    _check_ss,
+    _check_storage,
     _check_sub_filter,
     _hostname_problem,
     _nginx_modules,
@@ -269,6 +271,67 @@ def test_path_mode_catches_a_gateway_that_forgets_the_router_cookie(settings):
     assert "Tg-Luci" in check.detail or "tg_luci" in check.detail.lower()
 
 
+# --------------------------------------------------- path checks must not traceback
+def test_a_path_that_cannot_be_statted_reads_as_absent(tmp_path, monkeypatch):
+    """doctor used to die with PermissionError before printing a single check.
+
+    stat() needs +x on every parent, so a uid mismatch (container 10001 vs a host-owned
+    0750 directory, or sudo against the service user's data dir) turned the whole report
+    into a stack trace. Absence is the truthful answer there: the writability check
+    reports the real problem with a fix line.
+    """
+    import errno
+
+    real_exists = Path.exists
+
+    def boom(self):
+        if self.name == "tg.db":
+            raise PermissionError(errno.EACCES, "Permission denied", str(self))
+        return real_exists(self)
+
+    monkeypatch.setattr(Path, "exists", boom)
+    report = Report()
+    _check_storage(_settings_for_storage(tmp_path), report)
+    check = next(c for c in report.checks if c.name == "database")
+    assert check.status == WARN
+    assert "init-db" in check.fix
+
+
+def _settings_for_storage(tmp_path):
+    from app.config import Settings
+
+    return Settings(
+        env="test",
+        data_dir=str(tmp_path),
+        db_url=f"sqlite:///{tmp_path / 'tg.db'}",
+        authorized_keys_path=str(tmp_path / "keys" / "authorized_keys"),
+    )
+
+
+# ------------------------------------------------------------- socket inventory (ss)
+def test_missing_ss_is_a_failure_that_names_iproute2(monkeypatch):
+    """Without ss the panel cannot see a single tunnel, so it must not pass as a warning.
+
+    tunnels.py returns an empty map when ss is absent and the monitor reads that as
+    "unobservable", which parks every router at awaiting/offline while /api/v1/health
+    still reports ok. A minimal image (python:slim, no iproute2) hits exactly this.
+    """
+    monkeypatch.setattr("app.cli.shutil.which", lambda name: None)
+    report = Report()
+    _check_ss(report)
+    check = next(c for c in report.checks if c.name == "socket inventory")
+    assert check.status == FAIL
+    assert "iproute2" in (check.fix or "")
+
+
+def test_present_ss_passes(monkeypatch):
+    monkeypatch.setattr("app.cli.shutil.which", lambda name: "/usr/bin/ss")
+    report = Report()
+    _check_ss(report)
+    check = next(c for c in report.checks if c.name == "socket inventory")
+    assert check.status == OK
+
+
 # ------------------------------------------------------- routes.conf include context
 def _nginx_that_validates_ok(tmp_path):
     path = tmp_path / "nginx"
@@ -387,6 +450,23 @@ def test_routes_include_is_skipped_before_the_first_render(settings, tmp_path):
     report = Report()
     _check_routes_include(settings, report, _nginx_that_validates_ok(tmp_path))
     assert "routes include" not in _statuses(report)
+
+
+def test_a_missing_nginx_is_a_warning_because_it_may_run_elsewhere(settings, monkeypatch):
+    """The panel image has no nginx by design: docker-compose runs it as its own service.
+
+    deploy/README.md documents 'docker exec ... doctor', so a hard failure here would make
+    every containerised deployment look broken. The panel only writes config either way.
+    """
+    settings.proxy_driver = "nginx"
+    settings.proxy_routes_path = str(settings.data_dir / "routes.conf")
+    monkeypatch.setattr("app.cli.shutil.which", lambda name: None)
+    monkeypatch.setattr("app.cli.os.path.exists", lambda path: False)
+    report = Report()
+    _check_proxy(settings, report)
+    check = next(c for c in report.checks if c.name == "nginx")
+    assert check.status == WARN
+    assert "container" in check.fix
 
 
 def test_caddy_in_path_mode_is_refused_by_the_doctor(settings):

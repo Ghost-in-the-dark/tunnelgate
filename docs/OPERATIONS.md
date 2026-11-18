@@ -137,6 +137,8 @@ Admins can see live sessions and force-close them:
 | `journalctl` shows the proxy address as the client, yet the audit log is right (or vice versa) | the two trust lists disagree: the app believes `TUNNELGATE_TRUSTED_PROXIES`, uvicorn believes `--forwarded-allow-ips` | the unit's `ExecStart` still says `--forwarded-allow-ips 127.0.0.1` while the proxy is elsewhere | widen `--forwarded-allow-ips` too, not just `TUNNELGATE_TRUSTED_PROXIES` - see `docs/INSTALL_SERVER.md` §7 |
 | `no_free_port` on create | pool exhausted (deleted routers leak) | `GET /api/v1/stats` `ports_free` | delete stale routers; `app.cli doctor` reports leaks |
 | Everything 500s after upgrade | schema drift (no migration engine) | `app.cli check-schema` | apply the printed `ALTER TABLE`s |
+| Every router sits at `awaiting`/`offline` while `/api/v1/health` answers `ok`, and `ss -ltnp` on the host clearly shows the listeners | the panel cannot run `ss`, so it refuses to guess and treats the tunnels as unobservable | `journalctl -u tunnelgate \| grep "ss is not installed"`; `app.cli doctor` fails under `socket inventory` | install `iproute2` in whatever runs the panel (the container image ships it; a hand-rolled image often does not) |
+| `app.cli doctor` dies with `PermissionError` on the database or `/var/lib/tunnelgate`, or reports "routes dir not writable" for files it should own | doctor is running as a different uid than the panel - typical with `docker exec` (uid 10001) against a host-owned data dir, or `sudo` vs the service user | `ls -ln /var/lib/tunnelgate` compared with the uid in the unit/container | run doctor as the service user, or `chown -R 10001:10001 /var/lib/tunnelgate` for the container path |
 
 ### Collecting a diagnosis bundle
 

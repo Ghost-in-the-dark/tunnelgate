@@ -123,5 +123,6 @@ ssh -p <tunnel_port> tunnelgate@127.0.0.1        # from the panel host only
 ```
 
 `doctor` checks the data directory, the database, `authorized_keys`, sshd reachability, free
-ports in both pools, the routes path, the secret key, the console prerequisites and `web/dist`.
+ports in both pools, the routes path, the secret key, the console prerequisites and `web/dist`
+(which is built, not committed - see the frontend note in docs/INSTALL_SERVER.md).
 It exits non-zero on a blocking problem and prints the fix.

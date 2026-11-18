@@ -364,6 +364,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     report = Report()
 
     _check_runtime(settings, report)
+    _check_ss(report)
     _check_storage(settings, report)
     _check_ssh(settings, report)
     _check_ports(settings, report)
@@ -417,8 +418,71 @@ def _check_runtime(settings: Settings, report: Report) -> None:
         )
 
 
+def _check_ss(report: Report) -> None:
+    """Is 'ss' installed? It is the only source of truth for "is the tunnel up".
+
+    The monitor asks the kernel for the listening sockets with a single ss call and the
+    routers' status is derived from that answer, not from the heartbeat. Without ss the
+    host is unobservable by design (tunnels.py returns an empty map) and every router
+    sits at awaiting/offline no matter how healthy it is - so this is a blocking check,
+    not a warning. python:slim and minimal images ship without iproute2.
+    """
+    if shutil.which("ss"):
+        report.ok("socket inventory", "ss")
+        return
+    report.fail(
+        "socket inventory",
+        "'ss' is not installed, so the panel cannot see any tunnel",
+        "apt-get install -y iproute2 (the monitor reads 'ss -Hltnp'; without it every router "
+        "stays awaiting/offline and api/health reports status ok while nothing is online)",
+    )
+
+
 def _check_version(report: Report, version: str) -> None:
     report.ok("python", "{}.{}.{} / tunnelgate {}".format(*sys.version_info[:3], version))
+
+
+def _dir_fix(path: Path, mode: str) -> str:
+    """The ownership one-liner, for both deployment shapes.
+
+    Bare metal owns these directories as the 'tunnelgate' user; the container image runs
+    as a fixed uid 10001, so 'install -d -o tunnelgate' silently does the wrong thing
+    there and the panel keeps failing to write. Name both forms rather than guessing
+    which deployment the operator is running.
+    """
+    return f"install -d -o tunnelgate -g tunnelgate -m {mode} {path} (container: -o 10001 -g 10001)"
+
+
+def _db_access_hint(exc: BaseException) -> str:
+    """The fix line for "cannot open the database": permission, or schema.
+
+    A PermissionError here is almost always the documented uid mismatch rather than a
+    missing schema - the panel runs as one uid and the data directory is owned by another
+    (container uid 10001 vs the host user, or doctor invoked with sudo/another account).
+    Saying "run init-db" at that point sends the operator down the wrong path.
+    """
+    if isinstance(exc, PermissionError):
+        return (
+            "the user running doctor cannot read the data directory; run it as the "
+            "tunnelgate service user, or chown the data dir to the uid the panel runs as "
+            "(container: 10001) - see docs/OPERATIONS.md"
+        )
+    return "fix the database first (init-db / check-schema)"
+
+
+def _exists(path: Path) -> bool:
+    """Path.exists() that answers False instead of raising on EACCES.
+
+    stat() needs execute permission on every parent directory, so a doctor run as the
+    wrong user (root-owned 0750 data dir, or the reverse: the tunnelgate user inside a
+    container whose mount is owned by the host uid) used to traceback here before
+    reporting anything. "Cannot see it" is reported by the data-dir check above; this
+    one must not replace the whole report with a stack trace.
+    """
+    try:
+        return path.exists()
+    except OSError:
+        return False
 
 
 def _check_storage(settings: Settings, report: Report) -> None:
@@ -430,12 +494,12 @@ def _check_storage(settings: Settings, report: Report) -> None:
         report.fail(
             "data dir",
             f"{_relpath(data_dir)} is not writable: {error}",
-            "install -d -o tunnelgate -g tunnelgate -m 0750 " + str(data_dir),
+            _dir_fix(data_dir, "0750"),
         )
 
     if settings.is_sqlite:
         db_path = Path(settings.db_url.split("sqlite:///", 1)[-1])
-        if db_path.exists():
+        if _exists(db_path):
             report.ok("database", _relpath(db_path))
         else:
             report.warn(
@@ -467,11 +531,14 @@ def _check_storage(settings: Settings, report: Report) -> None:
         report.fail(
             "authorized_keys dir",
             f"{_relpath(keys_path.parent)} not writable: {keys_dir_error}",
-            "install -d -o tunnelgate -g tunnelgate -m 0755 " + str(keys_path.parent),
+            _dir_fix(keys_path.parent, "0755"),
         )
         return
-    if keys_path.exists():
-        mode = keys_path.stat().st_mode & 0o777
+    if _exists(keys_path):
+        try:
+            mode = keys_path.stat().st_mode & 0o777
+        except OSError:
+            mode = 0
         if mode & 0o077:
             report.warn(
                 "authorized_keys mode",
@@ -495,7 +562,7 @@ def _check_ssh(settings: Settings, report: Report) -> None:
         )
 
     dropin = Path("/etc/ssh/sshd_config.d/tunnelgate.conf")
-    if dropin.exists():
+    if _exists(dropin):
         body = dropin.read_text(encoding="utf-8", errors="replace")
         if "AllowTcpForwarding remote" in body and "GatewayPorts no" in body:
             report.ok("sshd drop-in", str(dropin))
@@ -567,7 +634,7 @@ def _check_slug_namespace(settings: Settings, report: Report) -> None:
         report.warn(
             "slug namespace",
             f"cannot check router slugs: {type(exc).__name__}: {exc}",
-            "fix the database first (init-db / check-schema)",
+            _db_access_hint(exc),
         )
         return
 
@@ -608,7 +675,7 @@ def _check_ports(settings: Settings, report: Report) -> None:
         report.fail(
             "port pools",
             f"cannot read the pools: {type(exc).__name__}: {exc}",
-            "fix the database first (init-db / check-schema)",
+            _db_access_hint(exc),
         )
         return
 
@@ -741,7 +808,7 @@ def _check_proxy(settings: Settings, report: Report) -> None:
         report.fail(
             "routes dir",
             f"{_relpath(routes_path.parent)} not writable: {parent_error}",
-            "install -d -o tunnelgate -g tunnelgate -m 0750 " + str(routes_path.parent),
+            _dir_fix(routes_path.parent, "0750"),
         )
 
     if driver == "nginx":
@@ -754,10 +821,17 @@ def _check_proxy(settings: Settings, report: Report) -> None:
                 _check_sub_filter(nginx, report)
                 _check_routes_include(settings, report, nginx)
         else:
-            report.fail(
+            # A warning, not a failure: in the supported container deployment nginx is a
+            # SEPARATE service (docker-compose.yml has a tunnelgate-nginx container), so the
+            # panel image legitimately has no nginx binary - and deploy/README.md documents
+            # running doctor via docker exec. On bare metal this is also not fatal to the
+            # panel, which only writes config; it just means nothing is serving it yet.
+            report.warn(
                 "nginx",
-                "not found in PATH",
-                "apt-get install -y nginx-light; the panel only writes config, nginx serves it",
+                "no nginx binary in this process's PATH",
+                "fine when nginx runs in another container or on the host (the panel only "
+                "writes config, it never executes nginx for routing); otherwise install "
+                "nginx-light and check that TUNNELGATE_PROXY_ROUTES_PATH is included by it",
             )
         command = (settings.proxy_reload_command or "").strip()
         if command:
@@ -810,7 +884,7 @@ def _check_routes_include(settings: Settings, report: Report, nginx: str) -> Non
     their vhosts.
     """
     routes_path = Path(settings.proxy_routes_path)
-    if not routes_path.exists():
+    if not _exists(routes_path):
         return  # _check_launch already reports a missing render
     code, output = _run_quiet([nginx, "-t"])
     if code == 0:
@@ -992,7 +1066,7 @@ def _check_launch(settings: Settings, report: Report) -> None:
 
     routes_path = Path(settings.proxy_routes_path)
     snippet_path = auth_snippet_path(routes_path)
-    absent = [path for path in (routes_path, snippet_path) if not path.exists()]
+    absent = [path for path in (routes_path, snippet_path) if not _exists(path)]
     if absent:
         report.warn(
             "launch config",
@@ -1129,7 +1203,7 @@ def _module_version(name: str) -> str:
 def _check_frontend(settings: Settings, report: Report) -> None:
     dist = Path(settings.web_dist)
     index = dist / "index.html"
-    if index.exists():
+    if _exists(index):
         report.ok("web UI", _relpath(dist))
     else:
         report.warn(

@@ -169,8 +169,15 @@ apt-get update
 apt-get upgrade -y
 apt-get install -y --no-install-recommends \
     ca-certificates curl git nginx python3 python3-venv python3-pip \
-    sqlite3 certbot openssh-server rsync ufw jq
+    sqlite3 certbot openssh-server rsync ufw jq iproute2
 ```
+
+`iproute2` is not optional: the panel runs `ss -Hltnp` to find out which tunnels are
+actually listening, and it refuses to guess. Without `ss` every router stays at
+`awaiting`/`offline` no matter how healthy it is, while `/api/v1/health` still answers
+`ok` - `app.cli doctor` fails on this under `socket inventory` and the monitor logs it
+once at startup. It is in Debian's default install, but a minimal image or a stripped
+cloud image may not have it.
 
 Check the clock - TLS and token expiry depend on it:
 
@@ -322,15 +329,25 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-### Frontend build (only if `web/dist` is absent)
+### Frontend build (required after a fresh clone)
 
-The repository ships a prebuilt SPA in `web/dist`. To rebuild it:
+`web/dist` is a build artefact and is **not** in the repository (it is in
+`.gitignore`), so a fresh clone has no UI yet. `scripts/setup-server.sh` builds it for
+you; doing it by hand:
 
 ```bash
 cd /opt/tunnelgate/web
 npm ci
 npm run build          # writes web/dist
 ```
+
+This needs Node 18 or newer plus npm. Without `web/dist` the panel still starts and
+serves `/api/v1` and `/api/v1/health` - useful for checking a deployment headlessly -
+but every page returns the API's 404, and `app.cli doctor` warns under `web UI`.
+
+The container image does not have this step: `Dockerfile` builds the SPA in its own
+`tg-web` stage and copies the result in, so `docker compose up --build` needs no
+prebuilt directory either.
 
 ### Environment file
 
@@ -847,7 +864,7 @@ heartbeat delivers it, so wait one heartbeat interval (60 s) or restart the tunn
 cd /opt/tunnelgate
 git fetch --tags && git checkout v1.1.0
 .venv/bin/pip install -r requirements.txt
-(cd web && npm ci && npm run build)   # only if web/dist is not shipped
+(cd web && npm ci && npm run build)   # required: web/dist is not in the repo
 .venv/bin/python -m app.cli check-schema
 systemctl restart tunnelgate
 ```

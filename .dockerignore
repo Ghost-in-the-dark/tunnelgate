@@ -1,0 +1,17 @@
+# Build context exclusions. web/dist and web/node_modules are build artefacts and
+# are not in the repository; the "tg-web" stage builds them from web/package*.json
+# and web/src. Copying them in would let a stale local dist shadow the real build.
+.git
+.gitignore
+.venv
+.pytest_cache
+.ruff_cache
+.artifacts
+data
+**/__pycache__
+**/*.pyc
+web/node_modules
+web/dist
+*.db
+*.db-wal
+*.db-shm

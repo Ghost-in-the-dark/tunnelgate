@@ -158,7 +158,11 @@ of the UI so it follows the theme.
 - **Toolbar:** state dot, session clock, time left before the hard limit, ticket
   countdown, Disconnect / Reconnect.
 - **Session log** below the terminal: user, source address, start, duration,
-  bytes in/out, close reason.
+  bytes in/out, close reason. Admins get a **Kill** action on every row that has
+  no close reason yet; it asks first, then closes the session server-side, which
+  also stops whatever the user had running in that shell. A kill that the panel
+  cannot perform (the session already ended, or no live handler owns it) is
+  reported as such instead of leaving a "killed" row pointing at a live shell.
 
 ### 5.6 Audit
 

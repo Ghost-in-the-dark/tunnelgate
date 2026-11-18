@@ -242,6 +242,10 @@ export const api = {
   consoleSessions: (signal?: AbortSignal) =>
     request<ConsoleSessionList>('/api/v1/console/sessions', { signal }),
 
+  /** Admin-only: force-close one live console session. */
+  terminateConsoleSession: (id: string) =>
+    request<void>(`/api/v1/console/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
   // audit ------------------------------------------------------------
   listAudit: (
     params: { router_id?: string; action?: string; actor?: string; limit?: number; offset?: number } = {},

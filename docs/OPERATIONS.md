@@ -117,9 +117,17 @@ curl form and the reasoning.
 
 ### Console sessions
 
-Admins can see live sessions and force-close them:
-`GET /api/v1/console/sessions`, then `DELETE /api/v1/console/sessions/{id}` (sends
-`admin_terminated` and closes the SSH channel).
+Admins can see live sessions and force-close them: `GET /api/v1/console/sessions` lists
+them, `DELETE /api/v1/console/sessions/{id}` ends one (the session closes with
+`admin_terminated` and the kill is audited as `console.terminate`).
+
+The console screen has a **Kill** button on every open row for admins. A session that is
+already closed, or that no handler in the running panel owns, is reported instead of silently
+"killed" - a 409 means look again, not that the shell is gone.
+
+Deleting a router ends its live shells too (`router_disconnected`): a shell on a router the
+panel no longer knows would keep a root prompt on that device with no session row and no way
+back to it from the UI.
 
 ## 4. Common failures
 

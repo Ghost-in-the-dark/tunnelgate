@@ -190,8 +190,11 @@ into DNS and into already-installed routers).
 
 ### `DELETE /api/v1/routers/{id}` *(operator)*
 
-Revokes the key (rewrites `authorized_keys` + no-op if the tunnel user is absent), frees **both**
-ports, deletes the row (cascade: tokens, runtime, console sessions) and returns `204`.
+Revokes the key (rewrites `authorized_keys` + no-op if the tunnel user is absent), kills its
+live console shells (each closes with `router_disconnected`; the count lands in the audit
+detail), frees **both** ports, deletes the row (cascade: tokens, runtime, console sessions) and
+returns `204`. The shells are signalled first because the session rows vanish with the router:
+a shell left running would be a root prompt on a device with no row and no way to reach it.
 The router's ssh then dies on its next reconnect attempt ("Permission denied") and procd
 retries forever; run the uninstaller on the router to stop that.
 
@@ -398,6 +401,26 @@ CSRF-equivalent proof). Frame protocol:
 Close reasons: `idle_timeout`, `max_duration`, `client_closed`, `router_disconnected`,
 `admin_terminated`, `server_shutdown`.
 
+### `DELETE /api/v1/console/sessions/{id}` *(admin, CSRF)*
+
+Force-close one live console session. → `204`
+
+The panel does not write `closed_at` here: it signals the handler that owns the shell and that
+handler's teardown stamps the row, the byte counters and the `console.close` audit entry. One
+writer per row is why a kill cannot leave a finished-looking row in front of a shell that is
+still running.
+
+| Status | `code` | Meaning |
+|---|---|---|
+| `404` | `console_session_not_found` | no such `ConsoleSession` row |
+| `409` | `console_session_closed` | the session already ended; `details.close_reason` says how |
+| `409` | `console_session_not_live` | the row is open but no handler in this process owns it (still starting, or left over from a previous run) |
+| `403` | `forbidden` | caller is not an admin |
+| `403` | `csrf_failed` | missing or stale CSRF token |
+
+The kill is audited as `console.terminate` with the target username and address, and the session
+itself closes with reason `admin_terminated`.
+
 ### `GET /api/v1/console/sessions`
 
 Recent `ConsoleSession` rows. Operators see their own; admins see all. Filters: `router_id`,
@@ -426,7 +449,7 @@ Filters: `router_id`, `actor`, `action`, `outcome`, `limit` (default 100, max 10
 
 Actions: `auth.login`, `auth.login_failed`, `auth.logout`, `auth.password`, `router.create`,
 `router.update`, `router.delete`, `router.rotate`, `router.script`, `router.exchange`,
-`luci.open`, `console.start`, `console.open`, `console.close`, `console.terminate_cmd_failed`,
+`luci.open`, `console.start`, `console.open`, `console.close`, `console.terminate`,
 `user.create`, `user.update`, `user.delete`, `settings.agent_endpoint.save`,
 `settings.agent_endpoint.reset`, `settings.agent_endpoint.test`.
 

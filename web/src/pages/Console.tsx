@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
@@ -15,6 +15,7 @@ import { StatusPill, pillStateFor } from '../components/Badge'
 import { Button } from '../components/Button'
 import { Icon } from '../components/Icon'
 import type { IconName } from '../components/Icon'
+import { ConfirmDialog } from '../components/Modal'
 import { EmptyState, ErrorState, InlineAlert, Skeleton, Spinner } from '../components/States'
 import { useToast } from '../components/Toast'
 
@@ -142,6 +143,11 @@ export function ConsolePage() {
         <RecentSessions
           sessions={(sessionsQuery.data?.items ?? []).filter((s) => s.router_id === id)}
           loading={sessionsQuery.isLoading}
+          canKill={user?.role === 'admin'}
+          onKilled={() => {
+            void sessionsQuery.refetch()
+            void infoQuery.refetch()
+          }}
         />
       </div>
     </div>
@@ -581,9 +587,39 @@ function useElapsed(startedAt: number | null): number {
 }
 
 /* ------------------------------------------------------------ sessions */
-function RecentSessions({ sessions, loading }: { sessions: ConsoleSession[]; loading: boolean }) {
+function RecentSessions({
+  sessions,
+  loading,
+  canKill,
+  onKilled,
+}: {
+  sessions: ConsoleSession[]
+  loading: boolean
+  canKill: boolean
+  onKilled: () => void
+}) {
   const [expanded, setExpanded] = useState(false)
   const rows = useMemo(() => (expanded ? sessions : sessions.slice(0, 4)), [sessions, expanded])
+  const toast = useToast()
+  const queryClient = useQueryClient()
+  const [killing, setKilling] = useState<ConsoleSession | null>(null)
+
+  // Killing is a server signal, not a row edit: the owning WebSocket handler tears the shell
+  // down and writes the close itself, so the list must be refetched rather than patched here.
+  const killMutation = useMutation({
+    mutationFn: (id: string) => api.terminateConsoleSession(id),
+    onSuccess: () => {
+      toast.success('Console session closed.')
+      setKilling(null)
+      onKilled()
+      void queryClient.invalidateQueries({ queryKey: ['console-sessions'] })
+    },
+    onError: (err) => {
+      setKilling(null)
+      toast.error(friendlyMessage(err))
+      onKilled()
+    },
+  })
 
   if (loading) {
     return (
@@ -629,6 +665,11 @@ function RecentSessions({ sessions, loading }: { sessions: ConsoleSession[]; loa
             <th scope="col" className="px-3.5 py-1 font-medium">Duration</th>
             <th scope="col" className="px-3.5 py-1 font-medium">Traffic</th>
             <th scope="col" className="px-3.5 py-1 font-medium">Closed</th>
+            {canKill ? (
+              <th scope="col" className="w-0 px-3.5 py-1">
+                <span className="sr-only">Actions</span>
+              </th>
+            ) : null}
           </tr>
         </thead>
         <tbody>
@@ -655,10 +696,43 @@ function RecentSessions({ sessions, loading }: { sessions: ConsoleSession[]; loa
                 {bytes(s.bytes_in)} / {bytes(s.bytes_out)}
               </td>
               <td className="px-3.5 py-1.5 text-3xs text-muted">{s.close_reason ?? '—'}</td>
+              {canKill ? (
+                <td className="px-3.5 py-1.5 text-right">
+                  {s.closed_at ? null : (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      icon="trash"
+                      onClick={() => setKilling(s)}
+                      aria-label={`Kill the console session of ${s.username ?? 'this user'}`}
+                      title="Close this console session"
+                    >
+                      Kill
+                    </Button>
+                  )}
+                </td>
+              ) : null}
             </tr>
           ))}
         </tbody>
       </table>
+
+      <ConfirmDialog
+        open={killing !== null}
+        onClose={() => setKilling(null)}
+        onConfirm={() => {
+          if (killing) killMutation.mutate(killing.id)
+        }}
+        title="Close this console session?"
+        description={
+          killing
+            ? `${killing.username ?? 'This user'}'s shell on ${killing.client_ip ?? 'another host'} will be closed. The command running inside it stops.`
+            : ''
+        }
+        confirmLabel="Close session"
+        destructive
+        loading={killMutation.isPending}
+      />
     </section>
   )
 }

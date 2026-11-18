@@ -69,6 +69,12 @@ DEFAULT_CONSOLE_TERM = "xterm-256color"
 DEFAULT_CONSOLE_COLS = 80
 DEFAULT_CONSOLE_ROWS = 24
 
+# Close reasons the PANEL chooses (the frozen vocabulary is documented in docs/API.md; a client
+# may name its own reason in the WebSocket close frame, but these are the ones the panel itself
+# is responsible for). Kept here so the API layer and the bridge cannot drift apart.
+CLOSE_REASON_ADMIN_TERMINATED = "admin_terminated"
+CLOSE_REASON_ROUTER_DELETED = "router_disconnected"
+
 # console_state() results (frozen vocabulary - the API and the frontend switch on these).
 STATE_DISABLED = "disabled"
 STATE_NO_KEY = "no_key"

@@ -649,3 +649,170 @@ def test_non_ip_peer_still_binds_the_console_ticket(client, settings, fake_conne
 
     assert console_api._ticket_ip_matches("testclient", "othertransport") is False
     assert console_api._ticket_ip_matches("testclient", "testclient") is True
+
+
+# --------------------------------------------------------------------------- admin terminate
+def _csrf(client: TestClient, session) -> None:
+    """Put the CSRF header on the client; mutating routes require it."""
+    from app.config import get_settings
+
+    client.headers[get_settings().csrf_header] = session.csrf_token
+
+
+def test_admin_can_terminate_a_live_session(client, settings, fake_connection):
+    """DELETE signals the owning handler; the handler tears down and stamps the row itself."""
+    _c, user, session = _login(client, settings)
+    _csrf(client, session)
+    item = _make_router(settings)
+    ticket = _ticket(item, user)
+
+    with client.websocket_connect(_ws_url(item, ticket)) as ws:
+        status = ws.receive_json()
+        session_id = status["session_id"]
+
+        r = client.delete(f"/api/v1/console/sessions/{session_id}")
+        assert r.status_code == 204, r.text
+
+        exit_frame = ws.receive_json()
+        assert exit_frame["type"] == "exit"
+        assert exit_frame["reason"] == "admin_terminated"
+
+    # The row is closed by the bridge teardown, not by the DELETE: same single-writer rule the
+    # rest of the console follows.
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        with session_scope() as s:
+            row = s.get(ConsoleSession, session_id)
+            if row is not None and row.closed_at is not None:
+                break
+        time.sleep(0.01)
+    with session_scope() as s:
+        row = s.get(ConsoleSession, session_id)
+        assert row.close_reason == "admin_terminated"
+
+
+def test_terminate_is_audited(client, settings, fake_connection):
+    _c, user, session = _login(client, settings)
+    _csrf(client, session)
+    item = _make_router(settings)
+    ticket = _ticket(item, user)
+
+    with client.websocket_connect(_ws_url(item, ticket)) as ws:
+        session_id = ws.receive_json()["session_id"]
+        assert client.delete(f"/api/v1/console/sessions/{session_id}").status_code == 204
+        ws.receive_json()
+
+    with session_scope() as s:
+        rows = (
+            s.query(AuditLog)
+            .filter(AuditLog.action == "console.terminate")
+            .order_by(AuditLog.id.desc())
+            .all()
+        )
+        assert rows, "the kill must leave an audit trail"
+        assert rows[0].router_id == item.id
+        assert session_id in (rows[0].detail or "")
+
+
+def test_terminate_unknown_session_is_404(client, settings):
+    _c, _user, session = _login(client, settings)
+    _csrf(client, session)
+
+    r = client.delete("/api/v1/console/sessions/does-not-exist")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "console_session_not_found"
+
+
+def test_terminate_a_closed_session_is_409(client, settings):
+    _c, _user, session = _login(client, settings)
+    _csrf(client, session)
+    item = _make_router(settings)
+    with session_scope() as s:
+        row = ConsoleSession(
+            router_id=item.id,
+            router_name=item.name,
+            username="alice",
+            started_at=utcnow(),
+            closed_at=utcnow(),
+            close_reason="client_closed",
+        )
+        s.add(row)
+        s.flush()
+        session_id = row.id
+
+    r = client.delete(f"/api/v1/console/sessions/{session_id}")
+    assert r.status_code == 409
+    body = r.json()["error"]
+    assert body["code"] == "console_session_closed"
+    # The reason is echoed so the admin understands it was not their kill that ended it.
+    assert body["details"]["close_reason"] == "client_closed"
+
+
+def test_terminate_an_open_row_without_a_live_handle_is_409(client, settings):
+    """A row with no live handle cannot be killed; claiming 204 would lie to the admin."""
+    _c, _user, session = _login(client, settings)
+    _csrf(client, session)
+    item = _make_router(settings)
+    with session_scope() as s:
+        row = ConsoleSession(
+            router_id=item.id, router_name=item.name, username="alice", started_at=utcnow()
+        )
+        s.add(row)
+        s.flush()
+        session_id = row.id
+
+    r = client.delete(f"/api/v1/console/sessions/{session_id}")
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "console_session_not_live"
+
+
+def test_terminate_requires_admin(client, settings, make_user, fake_connection):
+    """An operator may open shells but may not kill other people's."""
+    make_user("op1", role="operator")
+    login = client.post("/api/auth/login", json={"username": "op1", "password": "user-t3st-pass"})
+    client.headers[settings.csrf_header] = login.json()["csrf_token"]
+    item = _make_router(settings)
+    with session_scope() as s:
+        row = ConsoleSession(
+            router_id=item.id, router_name=item.name, username="alice", started_at=utcnow()
+        )
+        s.add(row)
+        s.flush()
+        session_id = row.id
+
+    r = client.delete(f"/api/v1/console/sessions/{session_id}")
+    assert r.status_code == 403
+    assert r.json()["error"]["code"] == "forbidden"
+
+
+def test_terminate_requires_csrf(client, settings):
+    _c, _user, _session = _login(client, settings)
+    item = _make_router(settings)
+    with session_scope() as s:
+        row = ConsoleSession(
+            router_id=item.id, router_name=item.name, username="alice", started_at=utcnow()
+        )
+        s.add(row)
+        s.flush()
+        session_id = row.id
+
+    r = client.delete(f"/api/v1/console/sessions/{session_id}")
+    assert r.status_code == 403
+    assert r.json()["error"]["code"] == "csrf_failed"
+
+
+def test_deleting_a_router_ends_its_live_shells(client, settings, fake_connection):
+    """A shell on a router the panel no longer knows would be unreachable forever."""
+    _c, user, session = _login(client, settings)
+    _csrf(client, session)
+    item = _make_router(settings)
+    ticket = _ticket(item, user)
+
+    with client.websocket_connect(_ws_url(item, ticket)) as ws:
+        ws.receive_json()
+        assert client.delete(f"/api/v1/routers/{item.id}").status_code == 204
+        exit_frame = ws.receive_json()
+        assert exit_frame["type"] == "exit"
+        assert exit_frame["reason"] == "router_disconnected"
+
+    assert console_service.SESSIONS.count_for_router(item.id) == 0

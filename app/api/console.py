@@ -8,6 +8,9 @@ Authorization model
 * `operator` / `admin` may open one, subject to a per-user rate limit and the live-session cap.
 * `start` is CSRF-protected and fully audited (`console.start`); a failed attempt is audited as
   `console.start` with `outcome="error"` so an operator cannot probe routers silently.
+* `terminate` (DELETE /console/sessions/{id}) is admin-only and CSRF-protected: it signals the
+  handler that owns the shell rather than writing the row itself, so the teardown stays the only
+  writer of `closed_at`. Admins are audited as `console.terminate`.
 """
 
 from __future__ import annotations
@@ -17,11 +20,19 @@ import logging
 from datetime import timedelta
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Query, Request, Response
 from sqlalchemy import func, select
 
 from ..config import utcnow
-from ..deps import CurrentUser, DbSession, SettingsDep, client_ip, csrf_protect
+from ..deps import (
+    AdminUser,
+    CsrfGuard,
+    CurrentUser,
+    DbSession,
+    SettingsDep,
+    client_ip,
+    csrf_protect,
+)
 from ..errors import ApiError
 from ..models import ConsoleSession, Router
 from ..schemas import ConsoleSessionListOut, ConsoleSessionOut, ConsoleStartOut, iso
@@ -275,6 +286,74 @@ def console_info(
     """Read-only console state. Available to every authenticated user (viewers included)."""
     item = _get_router(db, router_id)
     return _console_read_out(db, item, settings)
+
+
+@router.delete("/console/sessions/{session_id}", status_code=204)
+async def terminate_console_session(
+    session_id: str,
+    request: Request,
+    db: DbSession,
+    admin: AdminUser,
+    _csrf: Annotated[None, CsrfGuard],
+) -> Response:
+    """Force-close one live console session (kill console).
+
+    The panel does not touch the SSH channel here: it signals the handler that owns it, and the
+    handler watchdog turns that into an exit frame and the usual teardown, which is also what
+    stamps closed_at, the byte counters and the console.close audit row. Keeping a single writer
+    of the session row matters: a DELETE that wrote closed_at itself could race the teardown and
+    leave the shell running behind a row the UI already shows as finished.
+
+    A session that is not live in THIS process cannot be killed: the row may belong to a panel
+    that is still starting the shell (between the row insert and the registry add) or to a
+    previous process that died without closing it. Both are 409, not 204 - reporting success for
+    a shell that keeps running is worse than telling the admin to look again.
+    """
+    row = db.get(ConsoleSession, session_id)
+    if row is None:
+        raise ApiError(404, "console_session_not_found", "No such console session")
+
+    if row.closed_at is not None:
+        raise ApiError(
+            409,
+            "console_session_closed",
+            "That console session has already ended",
+            {"close_reason": row.close_reason, "closed_at": iso(row.closed_at)},
+        )
+
+    live = console_service.SESSIONS.get(session_id)
+    if live is None:
+        raise ApiError(
+            409,
+            "console_session_not_live",
+            "That console session is not running in this panel process, so there is nothing to "
+            "close; it is either still starting or was left open by a previous run",
+        )
+
+    live.request_close(console_service.CLOSE_REASON_ADMIN_TERMINATED)
+    audit_record(
+        db,
+        "console.terminate",
+        actor=admin,
+        router_id=row.router_id,
+        router_name=row.router_name,
+        ip=client_ip(request),
+        user_agent=request.headers.get("user-agent"),
+        detail={
+            "session_id": row.id,
+            "target_username": row.username,
+            "target_client_ip": row.client_ip,
+            "reason": console_service.CLOSE_REASON_ADMIN_TERMINATED,
+        },
+    )
+    db.commit()
+    log.info(
+        "console terminated by admin=%s router=%s session=%s",
+        admin.username,
+        row.router_id,
+        row.id,
+    )
+    return Response(status_code=204)
 
 
 @router.get("/console/sessions", response_model=ConsoleSessionListOut)

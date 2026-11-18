@@ -48,6 +48,7 @@ from ..schemas import (
     iso,
 )
 from ..services import bootstrap as bootstrap_service
+from ..services import console as console_service
 from ..services import keys as keys_service
 from ..services import ports as ports_service
 from ..services.audit import record as audit_record
@@ -388,13 +389,23 @@ async def delete_router(
     user: OperatorUser,
     _csrf: Annotated[None, CsrfGuard],
 ) -> Response:
-    """Revoke the key first, then free the ports, then delete the row.
+    """Revoke the key first, kill the shells, then free the ports, then delete the row.
 
     That order is the whole point: a deleted row with a live authorized_keys line would leave a
     listener nobody can see or revoke from the panel.
+
+    Live console shells are signalled BEFORE the row goes away. They are not managed by this
+    request - a WebSocket handler in this process owns each one - and nothing else would ever end
+    them: the ConsoleSession rows disappear with the router through the foreign key, so a shell
+    left running would keep a root shell on a router the panel no longer knows about, with no
+    session row and no way to reach it from the UI. Deleting the router is an operator action, so
+    the shells of other users die with it.
     """
     item = _get_router(db, router_id)
     ports = [p for p in (item.remote_port, item.console_port) if p]
+    killed = console_service.SESSIONS.close_all(
+        item.id, console_service.CLOSE_REASON_ROUTER_DELETED
+    )
     keys_service.revoke_router_key(db, item)
     db.flush()
     audit_record(
@@ -405,7 +416,7 @@ async def delete_router(
         router_name=item.name,
         ip=client_ip(request),
         user_agent=request.headers.get("user-agent"),
-        detail={"slug": item.slug, "ports": ports},
+        detail={"slug": item.slug, "ports": ports, "console_sessions_killed": killed},
     )
     db.delete(item)
     db.commit()

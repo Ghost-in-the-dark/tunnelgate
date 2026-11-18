@@ -112,7 +112,10 @@ def finish_session_row(
     """
     with session_scope() as db:
         row = db.get(ConsoleSession, session_id)
-        if row is None:  # pragma: no cover - row cannot vanish in practice
+        if row is None:
+            # The router was deleted while this shell was being torn down: its ConsoleSession
+            # rows go with it through ON DELETE CASCADE (app/models.py), so there is nothing left
+            # to stamp. Reproduced by tests/test_console_ws.py::test_deleting_a_router_ends_its_live_shells.
             return
         row.closed_at = utcnow()
         row.close_reason = (close_reason or "unknown")[:32]

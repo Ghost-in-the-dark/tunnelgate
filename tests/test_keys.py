@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import contextlib
 import os
+import pwd
 import shutil
 import socket
 import stat
 import subprocess
 import time
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -195,6 +197,148 @@ def test_write_replaces_stale_content(db, settings, tmp_authorized_keys):
     body = tmp_authorized_keys.read_text()
     assert "stale-line" not in body
     assert body.count("ssh-ed25519") == 1
+
+
+def test_rewrite_preserves_the_owner_of_an_existing_file(db, settings, tmp_authorized_keys):
+    """Rewriting must never change who owns authorized_keys.
+
+    Renaming a temp file over the target replaces the directory entry, so the new inode keeps
+    the ownership of whoever created the temp file. A panel running as root would therefore
+    turn a tunnelgate-readable file into a root-only one, and sshd - which opens the file AS
+    the SSH account - would refuse every router from then on.
+    """
+    item = _router(db, settings)
+    keys_service.issue_key(db, item)
+    db.commit()
+    keys_service.write_authorized_keys(db, settings)
+    tmp_authorized_keys.chmod(0o600)
+    before = tmp_authorized_keys.stat()
+
+    recorded: list[tuple[str, int, int]] = []
+    with (
+        mock.patch.object(keys_service.os, "geteuid", return_value=0),
+        mock.patch.object(
+            keys_service.os, "chown", side_effect=lambda p, u, g: recorded.append((p, u, g))
+        ),
+    ):
+        keys_service.write_authorized_keys(db, settings)
+
+    assert recorded, "a root-owned rewrite must restore the previous owner before the rename"
+    _, uid, gid = recorded[0]
+    assert (uid, gid) == (before.st_uid, before.st_gid)
+
+
+def test_a_new_file_is_handed_to_the_ssh_account(db, settings, tmp_authorized_keys):
+    """When there is no file yet, root hands it to the account sshd will read it as."""
+    owner = pwd.getpwuid(os.getuid())
+    ssh_settings = settings.model_copy(update={"ssh_user": owner.pw_name})
+    item = _router(db, ssh_settings)
+    keys_service.issue_key(db, item)
+    db.commit()
+    assert not tmp_authorized_keys.exists()
+
+    recorded: list[tuple[str, int, int]] = []
+    with (
+        mock.patch.object(keys_service.os, "geteuid", return_value=0),
+        mock.patch.object(
+            keys_service.os, "chown", side_effect=lambda p, u, g: recorded.append((p, u, g))
+        ),
+    ):
+        keys_service.write_authorized_keys(db, ssh_settings)
+
+    assert recorded == [(recorded[0][0], owner.pw_uid, owner.pw_gid)]
+
+
+def test_authorized_keys_owner_is_none_without_a_known_ssh_account(tmp_path, settings):
+    """An unknown SSH user must not crash the writer: it simply skips the chown."""
+    unknown = settings.model_copy(update={"ssh_user": "no-such-user-tunnelgate"})
+    target = tmp_path / "authorized_keys"
+    assert keys_service.authorized_keys_owner(target, unknown) is None
+
+
+def _another_account(current_uid: int):
+    """Any real account that is not the one running the tests."""
+    for entry in pwd.getpwall():
+        if entry.pw_uid != current_uid:
+            return entry
+    pytest.skip("this system has exactly one account")
+
+
+def test_a_key_file_left_unreadable_by_an_older_release_is_repaired(tmp_path, settings):
+    """Preserving the current owner would preserve the outage.
+
+    A panel running as root used to leave authorized_keys root-owned at 0600. Keeping "whoever
+    owns it now" would then keep every router locked out forever, so the writer must notice that
+    the account sshd drops to cannot read the file and hand it over instead.
+    """
+    target = tmp_path / "authorized_keys"
+    target.write_text("ssh-ed25519 AAAA test\n", encoding="utf-8")
+    target.chmod(0o600)
+    other = _another_account(os.getuid())
+    ssh_settings = settings.model_copy(update={"ssh_user": other.pw_name})
+
+    assert keys_service.authorized_keys_owner(target, ssh_settings) == (other.pw_uid, other.pw_gid)
+
+
+def test_a_directory_the_ssh_account_cannot_traverse_is_repaired(tmp_path, settings):
+    """The directory blocks sshd before the file's own mode ever matters.
+
+    An older release run as root left .ssh root-owned at 0700. Repairing only the file would
+    leave sshd unable to reach it, so the writer takes the directory over as well.
+    """
+    other = _another_account(os.getuid())
+    ssh_settings = settings.model_copy(update={"ssh_user": other.pw_name})
+    data = tmp_path / "data"
+    data.mkdir(exist_ok=True)
+    directory = data / ".ssh"
+    directory.mkdir(exist_ok=True)
+    directory.chmod(0o700)
+    ssh_settings = ssh_settings.model_copy(
+        update={"authorized_keys_path": directory / "authorized_keys"}
+    )
+
+    with mock.patch.object(keys_service.os, "geteuid", return_value=0):
+        repaired = keys_service.repair_authorized_keys_dir(ssh_settings)
+
+    assert repaired is True
+    info = directory.stat()
+    assert (info.st_uid, info.st_gid) == (other.pw_uid, other.pw_gid)
+    assert (info.st_mode & 0o777) == 0o700
+
+
+def test_a_directory_the_ssh_account_can_reach_is_left_alone(tmp_path, settings):
+    """The installer's directories are already correct; nothing may churn them."""
+    tmp_path.chmod(0o755)
+    data = tmp_path / "data"
+    data.mkdir(exist_ok=True)
+    directory = data / ".ssh"
+    directory.mkdir(exist_ok=True)
+    directory.chmod(0o755)
+    other = _another_account(os.getuid())
+    ssh_settings = settings.model_copy(
+        update={"ssh_user": other.pw_name, "authorized_keys_path": directory / "authorized_keys"}
+    )
+
+    with mock.patch.object(keys_service.os, "chown") as chown:
+        repaired = keys_service.repair_authorized_keys_dir(ssh_settings)
+
+    assert repaired is False
+    chown.assert_not_called()
+
+
+def test_a_key_file_the_ssh_account_can_read_keeps_its_owner(tmp_path, settings):
+    """The common case: the installer's owner is right, so a rewrite must not churn it."""
+    # tmp_path itself is 0700 and owned by the test runner, which no other account could
+    # traverse; the realistic case is a 0755 directory with a world-readable key file.
+    tmp_path.chmod(0o755)
+    target = tmp_path / "authorized_keys"
+    target.write_text("ssh-ed25519 AAAA test\n", encoding="utf-8")
+    target.chmod(0o644)
+    info = target.stat()
+    other = _another_account(os.getuid())
+    ssh_settings = settings.model_copy(update={"ssh_user": other.pw_name})
+
+    assert keys_service.authorized_keys_owner(target, ssh_settings) == (info.st_uid, info.st_gid)
 
 
 def test_revoke_removes_the_line_from_disk(db, settings, tmp_authorized_keys):

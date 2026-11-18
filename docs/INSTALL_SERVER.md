@@ -24,10 +24,23 @@ host needs **no certificate, no DNS record and no ACME client**, there is a one-
 for exactly that shape:
 
 ```bash
-git clone https://github.com/Ghost-in-the-dark/tunnelgate.git /opt/tunnelgate-src
-cd /opt/tunnelgate-src
-sudo ./scripts/quick-install.sh --host gate.example.com
+curl -fsSL https://raw.githubusercontent.com/Ghost-in-the-dark/tunnelgate/main/scripts/quick-install.sh \
+  | sudo sh -s -- --host gate.example.com
 ```
+
+That is the whole install: the script downloads the sources it needs into a temporary
+directory, installs the panel and removes that directory afterwards. Using the tag instead of
+`main` pins a version:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Ghost-in-the-dark/tunnelgate/v1.0.0/scripts/quick-install.sh \
+  | sudo sh -s -- --host gate.example.com --ref v1.0.0
+```
+
+Piping a shell script to `sh` is only reasonable when you can read it first, so the script
+carries its own documentation and every step it takes is printed as it runs. Read it with
+`curl -fsSL <url> | less` before you run it, or run it from a checkout if you prefer (see below)
+- both paths install the same thing.
 
 It installs `deploy/nginx/tunnelgate-behind-proxy.conf`: plain HTTP on one port, **path routing
 in the merged layout**, so every router is `<your-public-url>/<slug>/` on the panel's own name.
@@ -35,10 +48,47 @@ That is what makes a single ordinary name - including a free dynamic-DNS one - e
 wildcard DNS, no wildcard certificate, no per-router DNS step. It stops after nginx answers on
 that port and prints the forwarding snippet your proxy has to replicate.
 
+Before it touches anything it asks **which account the panel service should run as**. Press
+Enter for the recommended answer, a dedicated `tunnelgate` system account. (It also asks the
+public hostname unless `--host` supplied it.)
+
+```
+Which account should the PANEL SERVICE run as?
+  1) a dedicated "tunnelgate" system account   [recommended]
+  2) root                                      [NOT recommended]
+Choice [1]:
+```
+
+Running the panel as `root` is supported because some operators want it, and it is not
+recommended: the panel holds every router's key and your operator database, and the shipped
+systemd unit's sandbox (`ProtectSystem=strict`, an empty `CapabilityBoundingSet`,
+`SystemCallFilter=@system-service`, `NoNewPrivileges`) exists to contain exactly that. In root
+mode the installer removes those directives from the installed unit and leaves a comment saying
+so, because an empty `CapabilityBoundingSet` on root strips even root's capabilities and turns
+writes into `EPERM` while the UID still says `root`. Switching back later needs
+`chown -R tunnelgate:tunnelgate /var/lib/tunnelgate`.
+
+Either way, the account the **routers** log in as is the unprivileged `tunnelgate` account:
+a leaked router key stays confined whatever the panel runs as.
+
+From a checkout, with the same flags:
+
 ```bash
-sudo ./scripts/quick-install.sh --host 192.168.1.10 --public-scheme http   # IP / LAN
-sudo ./scripts/quick-install.sh --host gate.example.com --proxy-hops 2    # proxy in front of a proxy
-sudo ./scripts/quick-install.sh --host gate.example.com --dry-run         # print, change nothing
+git clone https://github.com/Ghost-in-the-dark/tunnelgate.git /opt/tunnelgate-src
+cd /opt/tunnelgate-src
+sudo ./scripts/quick-install.sh --host gate.example.com
+```
+
+Nothing is asked when the output is not a terminal (`| tee install.log`, a cloud-init run):
+the hostname then has to come from `--host` and the account defaults to `user`.
+`--non-interactive` says that out loud, so a run that would have prompted fails instead of
+picking silently.
+
+```bash
+... | sudo sh -s -- --host 192.168.1.10 --public-scheme http   # IP / LAN
+... | sudo sh -s -- --host gate.example.com --proxy-hops 2     # proxy in front of a proxy
+... | sudo sh -s -- --host gate.example.com --run-as root      # panel as root, not recommended
+... | sudo sh -s -- --host gate.example.com --dry-run          # print, change nothing
 ```
 
 `--proxy-hops` is how many proxies append `X-Forwarded-For`; set it and
@@ -69,6 +119,7 @@ every flag.
 |---|---|
 | the tunnel account's password field starts as `!` | `ssh` refuses the router key with "account is locked", indistinguishable from a bad key |
 | `authorized_keys` under `/tmp` or another world-writable dir | sshd refuses it outright ("bad ownership or modes") even with `StrictModes no` |
+| `authorized_keys` (or `.ssh`) owned by `root` because the panel runs as root | sshd opens the file AS `tunnelgate`, so a root-only file gives "Could not open user ... authorized keys: Permission denied" and every router gets "Permission denied (publickey)" - the installer leaves `.ssh` and the file with the tunnel account in both `--run-as` modes, and the panel preserves that owner when it rewrites |
 | an empty router fleet renders a `routes.conf` that references `$tg_router` | `nginx -t` fails with `unknown "tg_router" variable` and nothing reloads |
 | `TUNNELGATE_TRUSTED_PROXIES=[...]` unquoted in the env file | systemd strips the inner quotes, pydantic-settings fails to parse it, the panel never starts |
 | `TUNNELGATE_PROXY_RELOAD_COMMAND` set | the unit runs `NoNewPrivileges=yes`, so the panel cannot reload nginx; the shipped `.path`/`.service` pair does it as root instead |
@@ -76,6 +127,7 @@ every flag.
 | `app.cli doctor` run as `tunnelgate` | a false FAIL on the routes include (it cannot read the private key or the pid file) - run it as `root` |
 | a `web/dist` that was never built | the API works and every page 404s - the script builds it and warns when it cannot |
 | `systemctl restart` returning while the panel is still failing | the unit is "active" for a moment even when the panel cannot bind, so an install looking only at the unit exits 0 into a panel that never serves - the script polls `/api/v1/health` and stops with the journal when it does not answer |
+| the panel run as `root` with the shipped unit | an empty `CapabilityBoundingSet` strips even root's capabilities, so writes fail with `EPERM` while the UID says `root`; `ProtectHome=yes` also hides `/root` - the installer removes those directives in `--run-as root` mode and records it in the unit |
 | a plain-HTTP origin with the default settings | every router link and install command says `https://`, and no router can complete the handshake - the script writes `TUNNELGATE_PUBLIC_URL` with the scheme you asked for, which sets the scheme of router URLs and is also the agent address routers dial when `PANEL_URL` is loopback |
 
 If demo routers are present in the database from a trial run, drop them before going live:
@@ -327,6 +379,44 @@ This is why the documented location is `/var/lib/tunnelgate/.ssh/authorized_keys
 parent directories, a `0600` file and owner `tunnelgate`. The same rule applies to
 `console_authorized_keys_path` on the router; dropbear's default
 `/etc/dropbear/authorized_keys` (mode `0600`/`0644`, inside `/etc`) is fine.
+
+### The file and its directory must be readable **as** the tunnel user
+
+sshd does not read `authorized_keys` as root. It switches to the target account first and then
+opens the file, so both the `.ssh` directory and the file itself have to be traversable and
+readable by `tunnelgate` - regardless of which account runs the panel. A root-owned directory
+at mode `0700` produces exactly one log line and a fleet-wide outage:
+
+```
+Could not open user 'tunnelgate' authorized keys '/var/lib/tunnelgate/.ssh/authorized_keys': Permission denied
+```
+
+Every router then fails with `Permission denied (publickey)`, which reads like a broken key.
+Measured on OpenSSH 10.0p2:
+
+| `/var/lib/tunnelgate` | `.ssh` | `authorized_keys` | result |
+| --- | --- | --- | --- |
+| root:`0755` | tunnelgate:`0700` | tunnelgate:`0600` | works |
+| root:`0755` | tunnelgate:`0700` | root:`0644` | works |
+| root:`0755` | root:`0700` | tunnelgate:`0600` | **fails** |
+| root:`0755` | root:`0700` | root:`0600` | **fails** |
+
+So if you install with `--run-as root` (the panel as root), the data directory is root-owned as
+you asked, but `.ssh` and `authorized_keys` stay `tunnelgate`-owned: that is what sshd reads.
+The panel writes the file atomically and chooses the owner from what sshd needs, not from who is
+writing: a file the SSH account can read keeps its owner, and anything it cannot read - including
+a root-owned `0600` file left behind by an older release - is handed to the SSH account on the
+next key change. The same rule covers the `.ssh` directory, because a root-owned `0700` directory
+blocks the traversal before the file's mode ever matters. `app.cli doctor` checks readability as
+the SSH account and names this fix if it is wrong.
+
+If you suspect this, repair it by hand; the next rewrite will then keep the corrected owner:
+
+```bash
+chown -R tunnelgate:tunnelgate /var/lib/tunnelgate/.ssh
+chmod 0700 /var/lib/tunnelgate/.ssh
+chmod 0600 /var/lib/tunnelgate/.ssh/authorized_keys
+```
 
 The panel writes `authorized_keys` for this user. Point TunnelGate at it:
 

@@ -20,6 +20,7 @@ import hashlib
 import hmac
 import logging
 import os
+import pwd
 import subprocess
 import tempfile
 from pathlib import Path
@@ -138,6 +139,111 @@ def _reload_sshd(settings: Settings) -> None:
         log.warning("sshd reload command failed: %s", command, exc_info=True)
 
 
+def ssh_account_ids(settings: Settings) -> tuple[int, int] | None:
+    """(uid, gid) of the account sshd drops to when it reads authorized_keys.
+
+    sshd does NOT read this file as root: it switches to the target account first and then
+    opens the file, so the account must be able to traverse the directory and read the file.
+    That is why an authorized_keys file left root-owned at mode 0600 locks out every router
+    with a bare "Permission denied (publickey)" - the log line is only
+    "Could not open user '<user>' authorized keys: Permission denied".
+    """
+    try:
+        entry = pwd.getpwnam(settings.ssh_user)
+    except (ImportError, KeyError):
+        return None
+    return entry.pw_uid, entry.pw_gid
+
+
+def _stat_mode(path: Path) -> int | None:
+    try:
+        return path.stat().st_mode
+    except OSError:
+        return None
+
+
+def _readable_as(
+    mode: int, uid: int, gid: int, account: tuple[int, int], *, execute: bool = False
+) -> bool:
+    """Can this object be traversed/read by the account sshd drops to?
+
+    Judged from the mode bits, not from who is asking. os.access() cannot answer this: the
+    caller is usually root (or the panel's own account) and root passes every check, which is
+    exactly the question that must not be asked.
+    """
+    if account[0] == 0:
+        return True
+    if account[0] == uid:
+        bits = (mode >> 6) & 0o7
+    elif account[1] == gid:
+        bits = (mode >> 3) & 0o7
+    else:
+        bits = mode & 0o7
+    needed = 0o4 | (0o1 if execute else 0)
+    return bits & needed == needed
+
+
+def authorized_keys_owner(target: Path, settings: Settings) -> tuple[int, int] | None:
+    """Which uid/gid a rewritten authorized_keys file must end up with.
+
+    sshd's ability to read the file depends on this, so the writer must not drift it: an
+    existing file keeps its owner when that owner can actually read it, and is handed to the
+    SSH account in every other case. Only root can chown, which is exactly the case that needs
+    it: a panel running as root writes a root-owned temp file, renames it over the target, and
+    would otherwise take the whole fleet offline.
+
+    The repair branch matters as much as the preservation one. A file already left root-owned
+    by an earlier version cannot be repaired by "keep the current owner" - that would preserve
+    the outage forever. Deciding on the mode bits (not on who is asking) means the account that
+    sshd drops to is the one that ends up owning the file.
+    """
+    account = ssh_account_ids(settings)
+    try:
+        info = target.stat()
+    except OSError:
+        return account
+    parent_mode = _stat_mode(target.parent)
+    if account is None or parent_mode is None:
+        return info.st_uid, info.st_gid
+    if not _readable_as(parent_mode, info.st_uid, info.st_gid, account, execute=True):
+        return account
+    if not _readable_as(info.st_mode, info.st_uid, info.st_gid, account):
+        return account
+    return info.st_uid, info.st_gid
+
+
+def repair_authorized_keys_dir(settings: Settings) -> bool:
+    """Hand the directory sshd must walk through to the SSH account, if it cannot reach it.
+
+    Fixing the file alone is not enough: a root-owned .ssh at 0700 blocks the traversal no
+    matter who owns the file inside it, and that is the state an older release leaves behind
+    when the panel itself runs as root. Only root can repair it, and it is checked from the
+    SSH account's point of view so a correct directory is left untouched. Returns True when a
+    repair happened, so the caller can log it once instead of silently changing ownership.
+    """
+    account = ssh_account_ids(settings)
+    if account is None:
+        return False
+    parent = Path(settings.authorized_keys_path).parent
+    parent_mode = _stat_mode(parent)
+    if parent_mode is None:
+        return False
+    info = parent.stat()
+    if _readable_as(parent_mode, info.st_uid, info.st_gid, account, execute=True):
+        return False
+    with contextlib.suppress(OSError):
+        os.chown(parent, account[0], account[1])
+        os.chmod(parent, 0o700)
+        log.warning(
+            "authorized_keys directory %s was not reachable by %s; took ownership of it so "
+            "sshd can read the keys again",
+            parent,
+            settings.ssh_user,
+        )
+        return True
+    return False
+
+
 def write_authorized_keys(db: Session, settings: Settings | None = None) -> int:
     """Atomically replace the authorized_keys file. Returns the number of lines written.
 
@@ -150,6 +256,10 @@ def write_authorized_keys(db: Session, settings: Settings | None = None) -> int:
     target = Path(s.authorized_keys_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     mode = int(s.authorized_keys_mode)
+    can_chown = hasattr(os, "geteuid") and os.geteuid() == 0
+    if can_chown:
+        repair_authorized_keys_dir(s)
+    owner = authorized_keys_owner(target, s) if can_chown else None
     fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=".authorized_keys.")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -157,6 +267,11 @@ def write_authorized_keys(db: Session, settings: Settings | None = None) -> int:
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(tmp_name, mode)
+        if owner is not None:
+            # Rename replaces the directory entry, not the inode, so the fresh temp file would
+            # bring its own (root) ownership along. Restore it before the file becomes visible.
+            with contextlib.suppress(OSError):
+                os.chown(tmp_name, owner[0], owner[1])
         os.replace(tmp_name, target)
     except BaseException:
         with contextlib.suppress(OSError):

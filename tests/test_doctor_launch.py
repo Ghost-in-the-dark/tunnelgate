@@ -18,6 +18,7 @@ from app.cli import (
     WARN,
     Report,
     _check_agent_endpoint,
+    _check_authorized_keys_readable,
     _check_launch,
     _check_proxy,
     _check_routes_include,
@@ -33,6 +34,73 @@ from app.services.proxy import (
     render_nginx,
     render_nginx_auth_snippet,
 )
+
+
+def test_doctor_fails_when_sshd_could_not_read_authorized_keys(tmp_path, settings):
+    """sshd opens authorized_keys AS the tunnel account; root-only is a fleet outage.
+
+    Nothing else in the report notices it: the file exists, the path is right and the panel
+    keeps serving - every router just gets "Permission denied (publickey)".
+    """
+    import os
+    import pwd
+
+    account = pwd.getpwuid(os.getuid())
+    s = settings.model_copy(update={"ssh_user": account.pw_name})
+    zone = tmp_path / "zone"
+    zone.mkdir()
+    keys = zone / "authorized_keys"
+    keys.write_text("ssh-ed25519 AAAA test\n")
+    keys.chmod(0o600)
+    s = s.model_copy(update={"authorized_keys_path": keys})
+
+    report = Report()
+    _check_authorized_keys_readable(s, report, s.ssh_user)
+    # readable by its owner, so this one passes
+    assert _statuses(report)["authorized_keys"] == OK
+
+    # Now the directory is traversable by nobody but root: the file is still fine, sshd is not.
+    zone.chmod(0o700)
+    report = Report()
+    _check_authorized_keys_readable(s, report, "root")
+    if os.geteuid() == 0:
+        assert _statuses(report)["authorized_keys"] == OK
+    else:
+        assert _statuses(report)["authorized_keys"] == FAIL
+
+
+def test_doctor_names_the_chown_when_authorized_keys_is_unreadable(tmp_path, settings):
+    """The fix text has to be the command that puts it right, with the SSH account name."""
+    import os
+    import pwd
+
+    account = pwd.getpwuid(os.getuid())
+    if account.pw_uid == 0:
+        pytest.skip("running as root: every mode bit is readable, nothing to prove")
+    s = settings.model_copy(update={"ssh_user": account.pw_name})
+    zone = tmp_path / "locked"
+    zone.mkdir()
+    zone.chmod(0o700)
+    keys = zone / "authorized_keys"
+    keys.write_text("ssh-ed25519 AAAA test\n")
+    keys.chmod(0o600)
+    s = s.model_copy(update={"authorized_keys_path": keys})
+
+    report = Report()
+    _check_authorized_keys_readable(s, report, s.ssh_user)
+    check = next(c for c in report.checks if c.name == "authorized_keys")
+    assert check.status == FAIL
+    assert f"chown {s.ssh_user}:{s.ssh_user}" in check.fix
+    assert "Permission denied (publickey)" in check.fix
+
+
+def test_doctor_does_not_treat_a_missing_file_as_a_failure(tmp_path, settings):
+    """Before the first router exists there is nothing to read; that is not a fault."""
+    s = settings.model_copy(update={"authorized_keys_path": tmp_path / "data" / "authorized_keys"})
+    (tmp_path / "data").mkdir(exist_ok=True)
+    report = Report()
+    _check_authorized_keys_readable(s, report, s.ssh_user)
+    assert _statuses(report)["authorized_keys"] == WARN
 
 
 def _statuses(report: Report) -> dict[str, str]:

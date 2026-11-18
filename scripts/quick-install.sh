@@ -1,58 +1,21 @@
-#!/bin/sh
-# TunnelGate quick install - for a host whose TLS is terminated SOMEWHERE ELSE.
-#
-# WHAT THIS IS FOR
-#   You have one public name, no certificate on this box, and your own reverse proxy
-#   (nginx, Caddy, Traefik, a cloud load balancer) will terminate TLS in front of it.
-#   This script installs everything up to that point and stops there: it does not
-#   touch certificates, DNS or your edge. You add the proxy afterwards.
-#
-#   It installs deploy/nginx/tunnelgate-behind-proxy.conf: plain HTTP on one port,
-#   PATH routing with the MERGED layout, so every router is <public-url>/<slug>/ on
-#   the same name as the panel. That is what makes a single ordinary name - including
-#   a free dynamic-DNS one - enough: no wildcard DNS, no wildcard certificate. What
-#   the merged layout costs is in docs/SECURITY.md 6.1; read it before you add
-#   routers you do not physically control.
-#
-# WHAT IT DOES, IN ORDER
-#    1. validates arguments and checks the host (existing vhost, busy ports)
-#    2. installs the apt packages (nginx, python3-venv, openssh-server, iproute2, ...)
-#    3. creates the unprivileged tunnel user and its authorized_keys
-#    4. installs the sshd drop-in, validating with sshd -t BEFORE reloading
-#    5. writes the environment file (secrets generated once, never overwritten)
-#    6. installs the sources, builds the virtualenv and the SPA
-#    7. initialises the database and seeds the admin user
-#    8. installs and starts the systemd units (panel + nginx reload watcher)
-#    9. installs the plain-HTTP vhost, seeds the route includes, reloads nginx
-#   10. verifies the panel answers through nginx and prints your edge config
-#
-# USAGE
-#   sudo ./scripts/quick-install.sh --host gate.example.duckdns.org
-#   sudo ./scripts/quick-install.sh --host gate.example.duckdns.org --proxy-hops 2
-#   sudo ./scripts/quick-install.sh --host 192.168.1.10 --public-scheme http
-#   sudo ./scripts/quick-install.sh --host gate.example.duckdns.org --dry-run
-#   sudo ./scripts/quick-install.sh --help
-#
-# ADVANCED (side-by-side instances, staging trees, tests)
-#   --install-dir DIR    sources and the virtualenv          (default /opt/tunnelgate)
-#   --data-dir DIR       database, keys, authorized_keys     (default /var/lib/tunnelgate)
-#   --env-file FILE      environment file handed to systemd  (default /etc/tunnelgate.env)
-#   --service-name NAME  systemd unit and nginx site name    (default tunnelgate)
-#   --panel-port N       loopback port the panel listens on  (default 8080)
-#
-# FIREWALL - THE PART PEOPLE GET WRONG
-#   Exactly ONE port is opened: the plain-HTTP port your proxy talks to, and only if
-#   ufw is present here. The tunnel pool (20000-25000) and the console pool
-#   (25001-30000) stay CLOSED. Both are sshd listeners on 127.0.0.1; publishing them
-#   hands the internet every router's LuCI and every console port directly, bypassing
-#   the panel's authentication. Verify at any time:
-#       ss -ltnp | grep -E ':(2[0-9]{4})'
-#   Every one of those sockets must show 127.0.0.1 as its local address.
-
 set -eu
 
-SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-REPO=$(cd "$SCRIPT_DIR/.." && pwd)
+# ---------------------------------------------------------------- where am I
+# Two ways in, and they need different answers:
+#   * a checkout         -> install the tree this script lives in
+#   * "curl ... | sh"    -> $0 is "sh", there is no tree, so fetch one
+# Treating the piped case like the checkout is not a cosmetic bug: dirname("sh") is
+# ".", so a naive "sources next to the script" would resolve to / and every deploy/
+# file would be missing. The detection below is the whole difference.
+SCRIPT_DIR=""
+case "$0" in
+    */quick-install.sh) SCRIPT_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd || true) ;;
+esac
+CHECKOUT=""
+if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/../requirements.txt" ] && \
+   [ -f "$SCRIPT_DIR/../deploy/sshd/tunnelgate.conf" ]; then
+    CHECKOUT=$(cd "$SCRIPT_DIR/.." && pwd)
+fi
 
 HOST=""
 HTTP_PORT=80
@@ -66,9 +29,66 @@ ENV_FILE=/etc/tunnelgate.env
 SERVICE=tunnelgate
 DRY_RUN=0
 SKIP_FIREWALL=0
+RUN_AS=""
+SOURCE=""
+REF=main
+REPO_URL=https://github.com/Ghost-in-the-dark/tunnelgate
+KEEP_SOURCE=0
+NON_INTERACTIVE=0
+SOURCE_TMP=""
+REPO=""
 
 usage() {
-    sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'
+    cat <<'TUNNELGATE_USAGE_EOF'
+TunnelGate quick install - TLS is terminated by YOUR OWN reverse proxy.
+
+  curl -fsSL https://raw.githubusercontent.com/Ghost-in-the-dark/tunnelgate/main/scripts/quick-install.sh \
+    | sudo sh -s -- --host gate.example.com
+
+Installs the panel behind a plain-HTTP port and stops before any certificate, DNS or
+ACME work. You point your own proxy at it afterwards. Routers are served as
+https://<host>/<slug>/ (path routing, one name, no wildcard certificate).
+
+USAGE
+  curl ... | sudo sh -s -- --host NAME     install by downloading the sources
+  sudo ./scripts/quick-install.sh --host NAME   install from this checkout
+  ... --dry-run                            print the plan, change nothing
+  ... --help                               this text
+
+QUESTIONS ASKED ON A TERMINAL (never when output is redirected)
+  the public hostname, unless --host is given
+  the account the PANEL SERVICE runs as (--run-as user|root, default user)
+      user = a dedicated "tunnelgate" system account            [recommended]
+      root = run the panel as root                              [NOT recommended]
+
+OPTIONS
+  --host NAME            public name a browser uses
+  --run-as user|root     panel service account (default: ask, then user)
+  --port N               plain-HTTP port your proxy forwards to    (default 80)
+  --panel-port N         loopback port the panel listens on        (default 8080)
+  --public-scheme http   scheme browsers use                       (default https)
+  --proxy-hops N         how many proxies append X-Forwarded-For   (default 1)
+  --admin-password PW    admin password (else generated, printed nowhere)
+  --source DIR           install from this checkout instead of downloading
+  --ref REF              git ref to download when piped            (default main)
+  --repo-url URL         repository to download from
+  --keep-source          keep the downloaded tree (removed otherwise)
+  --non-interactive      never prompt; fail instead of asking
+  --skip-firewall        do not touch ufw
+  --dry-run              print the plan, change nothing
+  --install-dir DIR      sources and the virtualenv     (default /opt/tunnelgate)
+  --data-dir DIR         database, keys, authorized_keys (default /var/lib/tunnelgate)
+  --env-file FILE        environment file for systemd    (default /etc/tunnelgate.env)
+  --service-name NAME    systemd unit and nginx site name (default tunnelgate)
+
+The tunnel account the ROUTERS log in as is always the unprivileged "tunnelgate"
+account, in both --run-as modes: it is created passwordless, shell-less and allowed
+only to open reverse listeners.
+
+FIREWALL: exactly one port is opened, the plain-HTTP one, and only if ufw exists. The
+tunnel pool (20000-25000) and console pool (25001-30000) are sshd listeners on
+127.0.0.1 and must stay closed: publishing them exposes every router's LuCI directly.
+TUNNELGATE_USAGE_EOF
     exit "${1:-0}"
 }
 
@@ -99,6 +119,30 @@ sed_repl() {
     printf '%s' "$1" | sed -e 's/[&#\\]/\\&/g'
 }
 
+# Questions are asked on /dev/tty, never on stdin. "curl ... | sh" means stdin is the
+# script itself, so a plain "read" there reads the next LINE OF THE SCRIPT as the
+# answer and the install dies in a way that looks nothing like a bad answer.
+#
+# A prompt is only attempted when there is a terminal to prompt on AND output is not
+# redirected: "sudo sh -s -- --host x >install.log" must not stop and wait for input
+# nobody can see. Redirecting output or passing --non-interactive is the automation
+# escape hatch, and both fall back to the documented default.
+have_tty() {
+    [ "$NON_INTERACTIVE" -eq 0 ] && [ -t 1 ] && [ -r /dev/tty ] && [ -w /dev/tty ]
+}
+
+ask() {   # ask <prompt> <default>; prints the answer (or the default)
+    if ! have_tty; then
+        printf '%s' "$2"
+        return 0
+    fi
+    printf '%s ' "$1" >/dev/tty
+    ask_reply=""
+    read -r ask_reply </dev/tty || ask_reply=""
+    [ -n "$ask_reply" ] || ask_reply=$2
+    printf '%s' "$ask_reply"
+}
+
 # ---------------------------------------------------------------- arguments
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -114,6 +158,16 @@ while [ $# -gt 0 ]; do
         --proxy-hops=*) PROXY_HOPS=${1#*=}; shift ;;
         --admin-password) need_value "$@"; ADMIN_PASSWORD=$2; shift 2 ;;
         --admin-password=*) ADMIN_PASSWORD=${1#*=}; shift ;;
+        --run-as) need_value "$@"; RUN_AS=$2; shift 2 ;;
+        --run-as=*) RUN_AS=${1#*=}; shift ;;
+        --source) need_value "$@"; SOURCE=$2; shift 2 ;;
+        --source=*) SOURCE=${1#*=}; shift ;;
+        --ref) need_value "$@"; REF=$2; shift 2 ;;
+        --ref=*) REF=${1#*=}; shift ;;
+        --repo-url) need_value "$@"; REPO_URL=$2; shift 2 ;;
+        --repo-url=*) REPO_URL=${1#*=}; shift ;;
+        --keep-source) KEEP_SOURCE=1; shift ;;
+        --non-interactive) NON_INTERACTIVE=1; shift ;;
         --install-dir) need_value "$@"; INSTALL_DIR=$2; shift 2 ;;
         --install-dir=*) INSTALL_DIR=${1#*=}; shift ;;
         --data-dir) need_value "$@"; DATA_DIR=$2; shift 2 ;;
@@ -129,7 +183,38 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# ---------------------------------------------------------------- what to install
+# Asked first, because it decides the account every later step uses.
+case "$RUN_AS" in
+    "") if have_tty; then
+            printf '\nWhich account should the PANEL SERVICE run as?\n' >/dev/tty
+            printf '  1) a dedicated "tunnelgate" system account   [recommended]\n' >/dev/tty
+            printf '  2) root                                      [NOT recommended]\n' >/dev/tty
+            RUN_AS=$(ask 'Choice [1]:' '1')
+            case "$RUN_AS" in
+                1|user|USER|'') RUN_AS=user ;;
+                2|root|ROOT) RUN_AS=root ;;
+                *) die "--run-as must be user or root (got: $RUN_AS)" ;;
+            esac
+        else
+            RUN_AS=user
+        fi
+        ;;
+    user|USER) RUN_AS=user ;;
+    root|ROOT) RUN_AS=root ;;
+    *) die "--run-as must be user or root" ;;
+esac
+RUN_USER=tunnelgate
+RUN_GROUP=tunnelgate
+if [ "$RUN_AS" = root ]; then
+    RUN_USER=root
+    RUN_GROUP=root
+fi
+
 # ---------------------------------------------------------------- validation
+if [ -z "$HOST" ]; then
+    HOST=$(ask 'Public hostname a browser uses (e.g. gate.example.duckdns.org):' '')
+fi
 if [ -z "$HOST" ]; then
     echo "--host is required: the public name a browser uses, e.g." >&2
     echo "  --host gate.example.duckdns.org" >&2
@@ -156,6 +241,11 @@ case "$PANEL_PORT" in ''|*[!0-9]*) die "--panel-port must be a number" ;; esac
 [ "$HTTP_PORT" != "$PANEL_PORT" ] || die "--port and --panel-port must differ"
 case "$SERVICE" in
     *[!a-zA-Z0-9_.-]*|'') die "--service-name may contain only letters, digits, dot, dash and underscore" ;;
+    root|sudo|systemd|nginx|ssh|sshd|dbus)
+        die "--service-name $SERVICE would collide with a system unit" ;;
+esac
+case "$REF" in
+    *[!a-zA-Z0-9._/-]*) die "--ref may contain only letters, digits, dot, dash, slash and underscore" ;;
 esac
 
 # Root is needed for what this script CHANGES - packages, a user, systemd units, nginx.
@@ -165,6 +255,55 @@ if [ "$DRY_RUN" -eq 1 ]; then
     [ "$(id -u)" -eq 0 ] || warn "dry run as a non-root user: the plan is complete, but the real run needs root"
 else
     [ "$(id -u)" -eq 0 ] || die "run this as root: it installs packages, creates a user and writes systemd units"
+fi
+
+# ---------------------------------------------------------------- source tree
+# From a checkout: use it. Piped: there is none, so download the ref and remember to
+# remove it. --source forces a specific tree (offline hosts, air-gapped installs).
+if [ -n "$SOURCE" ]; then
+    [ -f "$SOURCE/requirements.txt" ] || die "--source $SOURCE does not look like a TunnelGate checkout (no requirements.txt there)"
+    [ -d "$SOURCE/deploy" ] || die "--source $SOURCE has no deploy/ directory"
+    REPO=$(cd "$SOURCE" && pwd)
+elif [ -n "$CHECKOUT" ]; then
+    REPO=$CHECKOUT
+else
+    command -v curl >/dev/null 2>&1 || die "curl is needed to download the sources; install it, or pass --source DIR"
+    command -v tar >/dev/null 2>&1 || die "tar is needed to unpack the sources; install it, or pass --source DIR"
+    SOURCE_TMP=$(mktemp -d "${TMPDIR:-/tmp}/tunnelgate-src.XXXXXX")
+    # Only ever remove the directory mktemp just made for us - never a computed path.
+    cleanup_source() {
+        status=$?
+        if [ "$KEEP_SOURCE" -eq 0 ] && [ -n "$SOURCE_TMP" ] && [ -d "$SOURCE_TMP" ]; then
+            case "$SOURCE_TMP" in
+                */tunnelgate-src.*) rm -rf -- "$SOURCE_TMP" ;;
+            esac
+        fi
+        exit "$status"
+    }
+    trap cleanup_source EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    say "downloading $REF from $REPO_URL"
+    if ! curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 \
+            "$REPO_URL/archive/$REF.tar.gz" | tar -xzf - -C "$SOURCE_TMP" --strip-components=1; then
+        die "could not download $REPO_URL (ref: $REF).
+       Pass --ref with an existing branch or tag, --repo-url for a fork, or
+       --source DIR to install from a checkout you already have."
+    fi
+    [ -f "$SOURCE_TMP/requirements.txt" ] || die "the archive for $REF is not a TunnelGate tree (no requirements.txt)"
+    REPO=$SOURCE_TMP
+    ok "sources downloaded to $REPO"
+fi
+[ -f "$REPO/requirements.txt" ] || die "no sources at $REPO: is this a full checkout?"
+
+if [ "$RUN_AS" = root ]; then
+    warn "the panel service will run as ROOT (--run-as root). This is NOT recommended:"
+    warn "  the panel holds every router key and the operator database, and the shipped"
+    warn "  unit's sandboxing is there to contain exactly that. Everything it writes"
+    warn "  (database, authorized_keys, generated routes) will be root-owned, so a"
+    warn "  later switch to the dedicated account needs a chown -R of $DATA_DIR."
+    warn "  The account the ROUTERS log in as stays the unprivileged 'tunnelgate'"
+    warn "  account either way, so this does not widen what a router key can do."
 fi
 
 # Derived once, so nothing can drift half-way through the run.
@@ -198,17 +337,33 @@ SED_ROUTES=$(sed_repl "$ROUTES")
 SED_AUTH_ROUTES=$(sed_repl "$AUTH_ROUTES")
 SED_HOST=$(sed_repl "$HOST")
 SED_SERVICE=$(sed_repl "$SERVICE")
+SED_RUN_USER=$(sed_repl "$RUN_USER")
+SED_RUN_GROUP=$(sed_repl "$RUN_GROUP")
 
 say "installing TunnelGate ($SERVICE)"
 printf '     public name   %s\n' "$PUBLIC_URL"
 printf '     this host     http://0.0.0.0:%s  ->  panel %s\n' "$HTTP_PORT" "$PANEL_URL"
 printf '     routers       %s/<slug>/   (path mode, merged layout)\n' "$PUBLIC_URL"
+printf '     service user  %s%s\n' "$RUN_USER" "$( [ "$RUN_AS" = root ] && printf '   (NOT recommended)' || printf '   (dedicated account)')"
+printf '     ssh account   tunnelgate  (routers log in here; always unprivileged)\n'
 printf '     sources       %s\n' "$INSTALL_DIR"
 printf '     data          %s\n' "$DATA_DIR"
 printf '     environment   %s\n' "$ENV_FILE"
 if [ "$DRY_RUN" -eq 1 ]; then
     warn "DRY RUN: nothing will be installed, written or started"
 fi
+
+# Run a command as the account the PANEL SERVICE will use. In --run-as root mode
+# that is plain execution; in the default mode it drops to the tunnelgate account, so
+# the database, the venv and web/dist end up owned by the account that reads them.
+# Defined before the first use (the SPA build) rather than next to the database step.
+as_panel() {
+    if [ "$RUN_AS" = root ]; then
+        "$@"
+        return $?
+    fi
+    runuser -u "$RUN_USER" --preserve-environment -- "$@"
+}
 
 # ---------------------------------------------------------------- 1. preflight
 say "checking the host"
@@ -307,12 +462,30 @@ fi
 if [ "$DRY_RUN" -eq 0 ]; then
     usermod -p '*' tunnelgate 2>/dev/null || true
 fi
-run install -d -m 0755 -o tunnelgate -g tunnelgate "$DATA_DIR"
+# The account the ROUTERS authenticate as is always this one, never root, whichever
+# account runs the panel: a router key is a credential held by a device on somebody's
+# network, and the drop-in in deploy/sshd gives it exactly one power (open a reverse
+# listener). --run-as root does not change that.
+#
+# Which is why the SSH material is owned by THAT account and not by $RUN_USER. sshd does
+# not read authorized_keys as root: it switches to the target account first and then opens
+# the file, so both the .ssh directory and the file itself must be traversable/readable as
+# tunnelgate. A root-owned 0700 .ssh makes sshd log only "Could not open user 'tunnelgate'
+# authorized keys: Permission denied" and every router gets "Permission denied (publickey)"
+# - a fleet-wide outage that looks like broken keys. Root can still write in here whatever
+# the directory says, so a panel running as root keeps working.
+#
+# The DATA DIR itself follows the panel's account (that is where the database lives).
+run install -d -m 0755 -o "$RUN_USER" -g "$RUN_GROUP" "$DATA_DIR"
 run install -d -m 0700 -o tunnelgate -g tunnelgate "$DATA_DIR/.ssh"
 if [ ! -f "$AUTHORIZED_KEYS" ]; then
     run install -m 0600 -o tunnelgate -g tunnelgate /dev/null "$AUTHORIZED_KEYS"
+else
+    # An earlier run (or a hand-made file) may already have the wrong owner: fix it.
+    run chown tunnelgate:tunnelgate "$AUTHORIZED_KEYS"
+    run chmod 0600 "$AUTHORIZED_KEYS"
 fi
-ok "authorized_keys at $AUTHORIZED_KEYS"
+ok "authorized_keys at $AUTHORIZED_KEYS (readable by sshd as tunnelgate)"
 
 # ---------------------------------------------------------------- 4. sshd
 say "installing the sshd drop-in"
@@ -385,8 +558,8 @@ say "preparing directories and the environment file"
 # The panel writes routes.conf with write-temp-then-rename, so it needs CREATE on the
 # DIRECTORY. A root:root 0755 directory makes every monitor cycle fail with
 # PermissionError while the panel keeps serving stale routes and looks healthy.
-run install -d -m 0750 -o tunnelgate -g tunnelgate "$ROUTES_DIR"
-run install -d -m 0755 -o tunnelgate -g tunnelgate /var/backups/tunnelgate
+run install -d -m 0750 -o "$RUN_USER" -g "$RUN_GROUP" "$ROUTES_DIR"
+run install -d -m 0755 -o "$RUN_USER" -g "$RUN_GROUP" /var/backups/tunnelgate
 run install -d -m 0755 "$(dirname "$ENV_FILE")"
 run install -d -m 0755 "$INSTALL_DIR"
 
@@ -511,7 +684,7 @@ else
         ok "sources copied"
     fi
 fi
-run chown -R tunnelgate:tunnelgate "$INSTALL_DIR"
+run chown -R "$RUN_USER:$RUN_GROUP" "$INSTALL_DIR"
 
 say "creating the virtualenv"
 if [ -x "$INSTALL_DIR/.venv/bin/python" ]; then
@@ -520,7 +693,7 @@ elif [ "$DRY_RUN" -eq 0 ]; then
     python3 -m venv "$INSTALL_DIR/.venv"
     "$INSTALL_DIR/.venv/bin/pip" install --upgrade pip >/dev/null
     "$INSTALL_DIR/.venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt" >/dev/null
-    chown -R tunnelgate:tunnelgate "$INSTALL_DIR/.venv"
+    chown -R "$RUN_USER:$RUN_GROUP" "$INSTALL_DIR/.venv"
     ok "virtualenv ready"
 fi
 
@@ -532,9 +705,9 @@ if [ -f "$INSTALL_DIR/web/dist/index.html" ] && \
 elif [ "$DRY_RUN" -eq 1 ]; then
     printf '  [dry-run] build the SPA as tunnelgate in %s\n' "$INSTALL_DIR/web"
 elif command -v npm >/dev/null 2>&1; then
-    # As the service user: a root-owned node_modules or dist is a permission trap on
+    # As the service user: a foreign-owned node_modules or dist is a permission trap on
     # the next upgrade (npm ci refuses, and the panel cannot read what root wrote).
-    if runuser -u tunnelgate -- env HOME="$DATA_DIR" sh -c \
+    if as_panel env HOME="$DATA_DIR" sh -c \
             "cd '$INSTALL_DIR/web' && npm ci --no-audit --no-fund >/dev/null 2>&1 && npm run build >/dev/null 2>&1"; then
         ok "SPA built into web/dist"
     else
@@ -545,20 +718,19 @@ elif command -v npm >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------- 7. database
-# The panel owns its database: running these as root would leave a root-owned sqlite
-# file the service user cannot write, and the first write fails at runtime.
+# The panel owns its database: running these as the wrong account leaves a file the
+# service user cannot write, and the first write fails at runtime.
 panel_cli() {
     if [ "$DRY_RUN" -eq 1 ]; then
-        printf '  [dry-run] (as tunnelgate) app.cli %s\n' "$*"
+        printf '  [dry-run] (as %s) app.cli %s\n' "$RUN_USER" "$*"
         return 0
     fi
-    runuser -u tunnelgate --preserve-environment -- \
-        "$INSTALL_DIR/.venv/bin/python" -m app.cli "$@"
+    as_panel "$INSTALL_DIR/.venv/bin/python" -m app.cli "$@"
 }
 
 say "initialising the database"
 if [ "$DRY_RUN" -eq 1 ]; then
-    printf '  [dry-run] (as tunnelgate) init-db, then seed-admin, against sqlite://%s\n' "$DATA_DIR/tunnelgate.db"
+    printf '  [dry-run] (as %s) init-db, then seed-admin, against sqlite://%s\n' "$RUN_USER" "$DATA_DIR/tunnelgate.db"
 else
     set -a
     # shellcheck disable=SC1090
@@ -587,9 +759,54 @@ if [ "$DRY_RUN" -eq 0 ]; then
             -e "s#/etc/nginx/tunnelgate/routes\.auth\.conf#$SED_AUTH_ROUTES#g" \
             -e "s#/etc/nginx/tunnelgate/routes\.conf#$SED_ROUTES#g" \
             -e "s#--port 8080#--port $PANEL_PORT#g" \
+            -e "s#^User=tunnelgate\$#User=$SED_RUN_USER#" \
+            -e "s#^Group=tunnelgate\$#Group=$SED_RUN_GROUP#" \
             "$1"
     }
-    render_service "$REPO/deploy/systemd/tunnelgate.service" >"/etc/systemd/system/$SERVICE.service"
+    # --run-as root: the shipped unit's sandbox assumes an unprivileged account. On root
+    # it stops protecting anything, and two directives actively misbehave:
+    # ProtectHome=yes hides /root from the panel, and CapabilityBoundingSet= (empty) strips
+    # even root's capabilities, so writes that rely on CAP_DAC_OVERRIDE fail with EPERM
+    # while the UID still says root - a confusing failure inside somebody else's service.
+    # The privileged-sandbox lines are therefore removed BY NAME (not the whole block: the
+    # restart policy, timeouts and EnvironmentFile are unchanged), and a comment records
+    # the trade so a later "why is this unit unlike the documented one" has an answer.
+    render_root_unit() {
+        render_service "$REPO/deploy/systemd/tunnelgate.service" \
+            | sed -e '/^NoNewPrivileges=/d' \
+                  -e '/^PrivateDevices=/d' \
+                  -e '/^ProtectSystem=/d' \
+                  -e '/^ProtectHome=/d' \
+                  -e '/^ProtectKernel/d' \
+                  -e '/^ProtectControlGroups=/d' \
+                  -e '/^ProtectClock=/d' \
+                  -e '/^ProtectHostname=/d' \
+                  -e '/^ProtectProc=/d' \
+                  -e '/^Restrict/d' \
+                  -e '/^LockPersonality=/d' \
+                  -e '/^MemoryDenyWriteExecute=/d' \
+                  -e '/^SystemCall/d' \
+                  -e '/^CapabilityBoundingSet=/d' \
+                  -e '/^UMask=/d'
+    }
+    if [ "$RUN_AS" = root ]; then
+        # The note goes at the TOP of the unit, where a reader looking at "why is this file
+        # unlike the documented one" starts. printf '%s\n' prints one argument per line, so
+        # the sentence mentioning the data directory is its own printf with the path
+        # substituted - otherwise the path lands on a line of its own.
+        {
+            printf '%s\n' \
+                '# INSTALLED WITH --run-as root: the sandbox directives from' \
+                '# deploy/systemd/tunnelgate.service were removed because the panel runs as root' \
+                '# and they protect nothing there. Restoring them means creating the tunnelgate'
+            printf '# account, "chown -R tunnelgate:tunnelgate %s",\n' "$DATA_DIR"
+            printf '%s\n' '# re-running the installer without --run-as root, or editing this unit by hand.'
+            printf '\n'
+            render_root_unit
+        } >"/etc/systemd/system/$SERVICE.service"
+    else
+        render_service "$REPO/deploy/systemd/tunnelgate.service" >"/etc/systemd/system/$SERVICE.service"
+    fi
     render_service "$REPO/deploy/systemd/tunnelgate-nginx-reload.service" \
         >"/etc/systemd/system/$SERVICE-nginx-reload.service"
     sed -e "s#Unit=tunnelgate-nginx-reload\.service#Unit=$SED_SERVICE-nginx-reload.service#" \

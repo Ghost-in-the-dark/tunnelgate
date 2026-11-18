@@ -82,15 +82,17 @@ balancer), one command installs everything up to that point - no certificate, no
 ACME client:
 
 ```bash
-git clone https://github.com/Ghost-in-the-dark/tunnelgate.git /opt/tunnelgate-src
-cd /opt/tunnelgate-src
-sudo ./scripts/quick-install.sh --host gate.example.com
+curl -fsSL https://raw.githubusercontent.com/Ghost-in-the-dark/tunnelgate/main/scripts/quick-install.sh \
+  | sudo sh -s -- --host gate.example.com
 ```
 
-It serves plain HTTP on one port and uses path routing in the merged layout, so every router is
-`<your-public-url>/<slug>/` on the panel's own name - one ordinary name (a free dynamic-DNS one
-included) and no wildcard certificate are enough. It then prints the `proxy_set_header` lines
-your edge has to replicate. Run with `--help` for the flags, `--dry-run` to see the plan, and
+It downloads the sources into a temporary directory (removed when it finishes), asks one
+question - which account the panel service runs as: a dedicated `tunnelgate` account
+(recommended, the default) or `root` (not recommended) - and serves plain HTTP on one port.
+Path routing in the merged layout means every router is `<your-public-url>/<slug>/` on the
+panel's own name - one ordinary name (a free dynamic-DNS one included) and no wildcard
+certificate are enough. It then prints the `proxy_set_header` lines your edge has to
+replicate. Run with `--help` for the flags, `--dry-run` to see the plan, and
 read [docs/INSTALL_SERVER.md](docs/INSTALL_SERVER.md#quick-install-tls-terminated-by-your-own-proxy)
 for what it does and the traps it handles. Merged layout shares the panel's origin with every
 router - read [docs/SECURITY.md §6.1](docs/SECURITY.md) before adding routers you do not control.

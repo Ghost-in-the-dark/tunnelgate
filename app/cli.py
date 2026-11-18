@@ -24,6 +24,7 @@ import json
 import os
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 from collections.abc import Iterable
@@ -599,6 +600,77 @@ def _check_ssh(settings: Settings, report: Report) -> None:
             f"{ssh_user} does not exist on this host",
             f"useradd --system --home {settings.data_dir} --shell /usr/sbin/nologin {ssh_user}",
         )
+    _check_authorized_keys_readable(settings, report, ssh_user)
+
+
+def _check_authorized_keys_readable(settings: Settings, report: Report, ssh_user: str) -> None:
+    """Can the SSH account actually read authorized_keys? sshd reads it AS that account.
+
+    sshd switches to the target user before opening the file, so a key file that exists and
+    looks correct but is root-owned at 0600 - exactly what a panel running as root writes -
+    makes every router fail with "Permission denied (publickey)" while the log only says
+    "Could not open user '...' authorized keys: Permission denied". Nothing else in this
+    report would notice, so it is checked here by asking the kernel, not by parsing configs.
+    """
+    path = Path(settings.authorized_keys_path)
+    if not path.parent.exists():
+        report.warn(
+            "authorized_keys",
+            f"{path.parent} does not exist yet",
+            "the panel creates it on the first key issue; nothing to check before that",
+        )
+        return
+    try:
+        import pwd
+
+        owner = pwd.getpwnam(ssh_user)
+    except (ImportError, KeyError):
+        return  # the missing-user warning above already covers this
+    unreadable = [
+        str(p)
+        for p in (path.parent, path)
+        if p.exists() and not _readable_by(p, owner.pw_uid, owner.pw_gid)
+    ]
+    if not unreadable:
+        if path.exists():
+            report.ok("authorized_keys", f"{path} is readable as {ssh_user}")
+        else:
+            report.warn(
+                "authorized_keys",
+                f"{path} does not exist yet",
+                "nothing to check until the first router is created",
+            )
+        return
+    report.fail(
+        "authorized_keys",
+        f"sshd cannot read {', '.join(unreadable)} as {ssh_user}",
+        f"chown {ssh_user}:{ssh_user} {path.parent} {path} 2>/dev/null; "
+        f"chmod 0700 {path.parent}; chmod 0600 {path} - sshd opens this file AS {ssh_user}, "
+        "so a root-owned copy locks out every router with 'Permission denied (publickey)'",
+    )
+
+
+def _readable_by(path: Path, uid: int, gid: int) -> bool:
+    """Can this uid/gid read (and, for a directory, traverse) the path?
+
+    Judged from the mode bits alone, deliberately not with os.access(): doctor usually runs as
+    root, and root passes every check, which is precisely the wrong answer here. The SSH account
+    is what sshd uses. A directory needs the execute bit as well as read, because sshd has to
+    walk through .ssh to reach the file.
+    """
+    try:
+        info = path.stat()
+    except OSError:
+        return False
+    mode = info.st_mode
+    if info.st_uid == uid:
+        bits = (mode >> 6) & 0o7
+    elif info.st_gid == gid:
+        bits = (mode >> 3) & 0o7
+    else:
+        bits = mode & 0o7
+    needed = 0o4 | (0o1 if stat.S_ISDIR(mode) else 0)
+    return bits & needed == needed
 
 
 def _check_slug_namespace(settings: Settings, report: Report) -> None:

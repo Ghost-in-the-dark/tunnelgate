@@ -69,14 +69,20 @@ def test_quick_install_only_opens_the_one_http_port() -> None:
 
 
 def test_quick_install_makes_the_routes_dir_writable_for_the_panel() -> None:
-    """The panel writes routes.conf with temp+rename, so it needs CREATE on the dir."""
+    """The panel writes routes.conf with temp+rename, so it needs CREATE on the dir.
+
+    The owner follows the account the panel runs as (--run-as), because the panel is the
+    process that writes the file. It defaults to the dedicated account, which the SSH
+    section pins separately.
+    """
     text = _text()
     line = next(
         (ln.strip() for ln in _directives(text) if "$ROUTES_DIR" in ln and "install -d" in ln),
         None,
     )
     assert line is not None, "the installer must create the nginx routes directory"
-    assert "-o tunnelgate" in line
+    assert '-o "$RUN_USER"' in line
+    assert '-g "$RUN_GROUP"' in line
     # 0750 leaves the panel CREATE but keeps the directory unlistable by others.
     assert "-m 0750" in line
 
@@ -212,11 +218,139 @@ def test_quick_install_keeps_the_single_trusted_hop_documented() -> None:
 
 
 def test_quick_install_runs_the_panel_commands_as_the_service_user() -> None:
-    """init-db as root leaves a root-owned sqlite file the panel cannot write."""
+    """init-db as root leaves a root-owned sqlite file the panel cannot write.
+
+    Every panel-side command goes through as_panel(), which drops to the dedicated
+    account by default and only runs bare in the explicit --run-as root mode.
+    """
     text = _text()
-    assert "runuser -u tunnelgate" in text
+    assert "as_panel() {" in text
+    assert 'runuser -u "$RUN_USER" --preserve-environment' in text
+    assert 'as_panel "$INSTALL_DIR/.venv/bin/python" -m app.cli' in text
     assert "panel_cli init-db" in text
     assert "seed-admin" in text
+
+
+def test_quick_install_asks_which_account_to_run_as() -> None:
+    """The question is asked, defaults to the safe answer, and names the risk.
+
+    m05654: the operator chooses between a dedicated account and root, and root must be
+    labelled as not recommended rather than merely offered.
+    """
+    text = _text()
+    assert "--run-as" in text
+    assert "Which account should the PANEL SERVICE run as?" in text
+    assert "[recommended]" in text
+    assert "[NOT recommended]" in text
+    # Asked before the hostname: it decides the account every later step uses.
+    assert text.index("Which account should the PANEL SERVICE run as?") < text.index("HOST=$(ask ")
+    # A non-interactive run must never stop on the question, and must pick the safe mode.
+    assert "RUN_AS=user" in text
+    assert "--non-interactive" in text
+
+
+def test_quick_install_never_widens_the_account_the_routers_use() -> None:
+    """--run-as root moves the panel, never the SSH account routers log in as.
+
+    A leaked router key must stay confined to the unprivileged tunnelgate account, so
+    the service account and the SSH account are separate variables on purpose.
+    """
+    text = _text()
+    assert "RUN_USER=tunnelgate" in text
+    assert "RUN_GROUP=tunnelgate" in text
+    # The sshd drop-in is shipped verbatim, so its Match block cannot follow $RUN_USER.
+    assert 'install -m 0644 "$REPO/deploy/sshd/tunnelgate.conf"' in text
+    dropin = (REPO / "deploy" / "sshd" / "tunnelgate.conf").read_text()
+    assert "Match User tunnelgate" in dropin
+    assert "ForceCommand /bin/false" in dropin
+    assert "AllowTcpForwarding remote" in dropin
+    assert "GatewayPorts no" in dropin
+    # And the installer says, in the dry-run-resolvable banner, which account that is.
+    assert "routers log in here; always unprivileged" in text
+
+
+def test_quick_install_gives_the_ssh_material_to_the_ssh_account() -> None:
+    """sshd opens authorized_keys AS the tunnel account, whatever account runs the panel.
+
+    --run-as root made the data dir root-owned, and the .ssh directory inherited that: a
+    0700 root-owned directory is unreadable to uid tunnelgate, so sshd logged only
+    "Could not open user 'tunnelgate' authorized keys: Permission denied" and every router
+    failed with "Permission denied (publickey)" while the panel looked healthy. Proven with a
+    real sshd: root:root/700 + root:root/600 fails, tunnelgate:700 + tunnelgate:600 works.
+    """
+    lines = [ln.strip() for ln in _directives(_text())]
+    ssh_dir = next(ln for ln in lines if '"$DATA_DIR/.ssh"' in ln and "install -d" in ln)
+    assert "-o tunnelgate" in ssh_dir
+    assert "-g tunnelgate" in ssh_dir
+    assert "-m 0700" in ssh_dir
+    # The data dir itself still follows the panel account: it holds the database.
+    data_dir = next(ln for ln in lines if ln.endswith('"$DATA_DIR"') and "install -d" in ln)
+    assert '-o "$RUN_USER"' in data_dir
+    # And a pre-existing file with the wrong owner is repaired rather than left alone.
+    assert 'run chown tunnelgate:tunnelgate "$AUTHORIZED_KEYS"' in _text()
+    assert 'chmod 0600 "$AUTHORIZED_KEYS"' in _text()
+
+
+def test_quick_install_fetches_its_sources_when_piped() -> None:
+    """ "curl ... | sh" leaves no checkout behind, so the tree must be downloaded.
+
+    Piped, "$0" is "sh" and dirname(".") resolves to "/", so a tree-relative lookup would
+    silently point at the filesystem root and every deploy/ file would be missing.
+    """
+    text = _text()
+    assert "*/quick-install.sh) SCRIPT_DIR=" in text, "only trust $0 when it is the script"
+    assert '"$SCRIPT_DIR/../requirements.txt"' in text
+    assert '"$SCRIPT_DIR/../deploy/sshd/tunnelgate.conf"' in text
+    # The fallback download, at a pinned ref, into a directory we remember to remove.
+    assert '"$REPO_URL/archive/$REF.tar.gz"' in text
+    assert "--strip-components=1" in text
+    assert "tunnelgate-src.XXXXXX" in text
+    # The cleanup may only ever delete the directory mktemp created for us.
+    assert "*/tunnelgate-src.*) rm -rf -- " in text
+    assert "trap cleanup_source EXIT" in text
+    # Offline installs must still be possible, from a tree the operator names.
+    assert "--source DIR" in text or "--source" in text
+
+
+def test_quick_install_reads_answers_from_the_terminal_not_the_pipe() -> None:
+    """ "curl ... | sh" means stdin IS the script: a plain read eats the next line.
+
+    So prompts must open /dev/tty, and a run whose output is redirected (no tty) must take
+    the defaults instead of blocking on a prompt nobody can see.
+    """
+    text = _text()
+    assert "read -r ask_reply </dev/tty" in text
+    assert "-r /dev/tty" in text and "-w /dev/tty" in text
+    # No bare read from stdin anywhere: every prompt goes through ask().
+    for line in _directives(text):
+        stripped = line.strip()
+        if stripped.startswith("read ") or stripped.startswith("read -r "):
+            assert "/dev/tty" in stripped, f"prompt reads stdin: {stripped!r}"
+    assert "--non-interactive" in text
+
+
+def test_quick_install_has_no_sed_delimiter_swallowed_by_the_shell() -> None:
+    r"""A sed "s#...#...#" written with # delimiters inside double quotes is a trap.
+
+    "$#" is the shell's argument count, so "s#^User=tunnelgate$#User=root#" expands to
+    "s#^User=tunnelgate<argc>User=root#": the delimiter disappears and sed dies with
+    "unterminated s command" - in the middle of section 8, after the database exists.
+    Only the two legitimate "[ $# -gt 0 ]" style tests may contain that pair.
+    """
+    text = _text()
+    for number, line in enumerate(_directives(text), start=1):
+        index = 0
+        while (index := line.find("$#", index)) != -1:
+            escaped = index > 0 and line[index - 1] == "\\"
+            in_arg_count_test = line[max(0, index - 2) : index] == "[ "
+            assert escaped or in_arg_count_test, (
+                f"line {number} has an unescaped $# outside an argument-count test: {line.strip()!r}"
+            )
+            index += 2
+    # And the sed expressions themselves must still be present, so the test cannot pass by
+    # the lines simply being deleted.
+    assert "s#^User=tunnelgate\\$#User=" in text
+    assert "s#^Group=tunnelgate\\$#Group=" in text
 
 
 def test_quick_install_is_honest_about_dry_run() -> None:

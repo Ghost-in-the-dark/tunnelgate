@@ -399,10 +399,18 @@ def _check_runtime(settings: Settings, report: Report) -> None:
     if settings.cookie_secure or settings.env != "production":
         report.ok("cookie flags", f"secure={settings.cookie_secure}")
     else:
+        # Not a failure any more, and it cannot be decided from configuration alone: the app
+        # also sets Secure when a request arrives over HTTPS from a trusted proxy, which is how
+        # a TLS-terminating deployment should behave. Forcing the flag on is only safe when the
+        # panel is *never* served over plain http - a LAN deployment that forces it hands out a
+        # cookie browsers silently drop.
         report.warn(
             "cookie flags",
             "TUNNELGATE_COOKIE_SECURE is false in production",
-            "set TUNNELGATE_COOKIE_SECURE=true; without it the session cookie travels over http",
+            "the cookie is still marked Secure when the request arrives over https from a "
+            "trusted proxy (TUNNELGATE_TRUSTED_PROXIES). Set TUNNELGATE_COOKIE_SECURE=true only "
+            "if the panel is never reachable over plain http; otherwise leave it and let the "
+            "request scheme decide.",
         )
 
 

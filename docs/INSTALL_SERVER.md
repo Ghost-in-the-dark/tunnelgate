@@ -747,7 +747,7 @@ are most likely to touch:
 | `TUNNELGATE_PANEL_URL` | `http://127.0.0.1:8080` | Where the panel listens for its own proxy - **not** necessarily what routers dial. Fallback for the agent endpoint; override it from the UI instead. See §7 |
 | `TUNNELGATE_PANEL_HOST` | `panel.example.com` | nginx `server_name` for the panel |
 | `TUNNELGATE_SUBDOMAIN_SUFFIX` | =`panel_host` | Suffix for router vhosts |
-| `TUNNELGATE_COOKIE_SECURE` | `false` | Set `true` behind HTTPS |
+| `TUNNELGATE_COOKIE_SECURE` | `false` | Usually leave it. The cookie is already marked `Secure` when a request arrives over HTTPS from a trusted proxy, so a TLS-terminating deployment needs nothing. Set `true` only when the panel is **never** reachable over plain HTTP - forcing it on a LAN deployment makes browsers drop the cookie over `http://` and logins silently do not stick |
 | `TUNNELGATE_COOKIE_DOMAIN` | unset (host-only) | **Leave unset.** Operator opt-in only; a domain cookie is sent to every router host - see §5 "Do not widen the session cookie" |
 | `TUNNELGATE_DB_URL` | `sqlite:///./data/tunnelgate.db` | SQLAlchemy URL |
 | `TUNNELGATE_SSH_USER` | `tunnelgate` | The system user holding forwards |

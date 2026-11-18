@@ -181,7 +181,8 @@ write access to `/etc/config` and `ubus` to be useful; the installer documents t
   `SCRYPT_N` (cost: ~0.5 s per login) or switch to Argon2id.
 * **Sessions**: opaque 256-bit token in an `HttpOnly`, `SameSite=Lax` cookie; the DB stores only
   its SHA-256. Server-side revocation is immediate (logout, password change, admin action).
-  `Secure` is set when `TUNNELGATE_COOKIE_SECURE=true` (default in Docker/systemd installs), and
+  `Secure` is set when the request arrived over HTTPS from a trusted proxy (the normal case
+  behind a TLS terminator), or unconditionally when `TUNNELGATE_COOKIE_SECURE=true`; and
   also when the request reached the panel over HTTPS from a trusted proxy
   (`X-Forwarded-Proto: https`, see §7) - so a panel published as `https://...` cannot quietly
   hand out a non-Secure session cookie because one setting was forgotten.

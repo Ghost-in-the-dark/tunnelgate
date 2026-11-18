@@ -3,6 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
+    # A release tag is a claim about that exact commit, and an operator installing from it
+    # never sees main's CI run. Build the tag too, so the run a release links to is the one
+    # that tested the bytes it ships.
+    tags: ["v*"]
   pull_request:
 
 env:

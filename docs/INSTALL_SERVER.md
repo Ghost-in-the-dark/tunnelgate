@@ -33,8 +33,8 @@ directory, installs the panel and removes that directory afterwards. Using the t
 `main` pins a version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Ghost-in-the-dark/tunnelgate/v1.0.0/scripts/quick-install.sh \
-  | sudo sh -s -- --host gate.example.com --ref v1.0.0
+curl -fsSL https://raw.githubusercontent.com/Ghost-in-the-dark/tunnelgate/v1.1.0/scripts/quick-install.sh \
+  | sudo sh -s -- --host gate.example.com --ref v1.1.0
 ```
 
 Piping a shell script to `sh` is only reasonable when you can read it first, so the script

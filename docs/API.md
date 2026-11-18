@@ -607,7 +607,7 @@ audited (`settings.agent_endpoint.test`, `detail: {checked_url, error}`).
 ### `GET /api/v1/health` (no auth)
 
 ```json
-{"status": "ok", "version": "1.0.0", "time": "2026-11-17T21:42:34Z"}
+{"status": "ok", "version": "1.1.0", "time": "2026-11-17T21:42:34Z"}
 ```
 
 ### `GET /api/v1/config`
@@ -616,7 +616,7 @@ audited (`settings.agent_endpoint.test`, `detail: {checked_url, error}`).
 {"panel_url": "http://127.0.0.1:8080", "subdomain_suffix": "panel.example.com",
  "route_mode": "subdomain", "gateway_host": "gate.panel.example.com",
  "bootstrap_ttl_minutes": 15, "poll_interval_seconds": 2, "proxy_driver": "nginx",
- "version": "1.0.0",
+ "version": "1.1.0",
  "agent_url": "https://panel.example.com",
  "agent_endpoint": {"scheme": "https", "host": "panel.example.com", "port": null,
                     "source": "environment"},

@@ -155,6 +155,7 @@ Then **Open LuCI** or **Console** from the router list.
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | something is broken, or it is 3 a.m. |
 | [docs/UI.md](docs/UI.md) | you are working on the SPA |
 | [CONTRACT.md](CONTRACT.md) | you are adding a module and need the frozen interfaces |
+| [CHANGELOG.md](CHANGELOG.md) | you want to know what changed, and which release fixed it |
 
 ## Repository layout
 
@@ -171,6 +172,7 @@ scripts/              quick-install.sh (behind your own proxy), setup-server.sh 
 web/                  React + TypeScript + Vite SPA (list, wizard, router page, console)
 tests/                pytest suite
 docs/                 the documents above
+CHANGELOG.md          what changed in each release, and why
 ```
 
 ## How the pieces fit

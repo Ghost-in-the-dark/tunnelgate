@@ -8,7 +8,10 @@ place an operator can be told about it is here.
 
 from __future__ import annotations
 
+import os
+import pwd
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -36,58 +39,76 @@ from app.services.proxy import (
 )
 
 
+def pwd_account(name: str, uid: int, gid: int) -> pwd.struct_passwd:
+    """A passwd entry for an account that need not exist on the machine running the tests.
+
+    The check must be judgeable from the mode bits alone, so the account is described rather
+    than looked up: otherwise the result depends on whether the suite runs as root (as it does
+    on a developer box) or as an ordinary user (as it does in CI), and a test that passes in
+    one and fails in the other proves nothing.
+    """
+    return pwd.struct_passwd((name, "x", uid, gid, "", "/nonexistent", "/usr/sbin/nologin"))
+
+
+STRANGER = pwd_account("tunnelgate", 12345, 12345)
+
+
+def _as_account(account: pwd.struct_passwd):
+    return mock.patch("pwd.getpwnam", return_value=account)
+
+
 def test_doctor_fails_when_sshd_could_not_read_authorized_keys(tmp_path, settings):
     """sshd opens authorized_keys AS the tunnel account; root-only is a fleet outage.
 
     Nothing else in the report notices it: the file exists, the path is right and the panel
     keeps serving - every router just gets "Permission denied (publickey)".
     """
-    import os
-    import pwd
-
-    account = pwd.getpwuid(os.getuid())
-    s = settings.model_copy(update={"ssh_user": account.pw_name})
     zone = tmp_path / "zone"
     zone.mkdir()
+    zone.chmod(0o755)
     keys = zone / "authorized_keys"
     keys.write_text("ssh-ed25519 AAAA test\n")
     keys.chmod(0o600)
-    s = s.model_copy(update={"authorized_keys_path": keys})
+    os.chown(keys, os.getuid(), os.getgid())
+    s = settings.model_copy(update={"ssh_user": STRANGER.pw_name, "authorized_keys_path": keys})
 
-    report = Report()
-    _check_authorized_keys_readable(s, report, s.ssh_user)
-    # readable by its owner, so this one passes
-    assert _statuses(report)["authorized_keys"] == OK
+    with _as_account(STRANGER):
+        report = Report()
+        _check_authorized_keys_readable(s, report, s.ssh_user)
+    # 0600 owned by somebody else: the account sshd drops to cannot read it.
+    assert _statuses(report)["authorized_keys"] == FAIL
 
-    # Now the directory is traversable by nobody but root: the file is still fine, sshd is not.
+    # The directory is what blocks it: a world-readable file inside a 0700 directory is
+    # unreachable even though every mode bit on the file itself says otherwise.
+    keys.chmod(0o644)
     zone.chmod(0o700)
-    report = Report()
-    _check_authorized_keys_readable(s, report, "root")
-    if os.geteuid() == 0:
-        assert _statuses(report)["authorized_keys"] == OK
-    else:
-        assert _statuses(report)["authorized_keys"] == FAIL
+    with _as_account(STRANGER):
+        report = Report()
+        _check_authorized_keys_readable(s, report, s.ssh_user)
+    assert _statuses(report)["authorized_keys"] == FAIL
+
+    # Make both reachable by that account and the same check must pass.
+    zone.chmod(0o755)
+    with _as_account(STRANGER):
+        report = Report()
+        _check_authorized_keys_readable(s, report, s.ssh_user)
+    assert _statuses(report)["authorized_keys"] == OK
 
 
 def test_doctor_names_the_chown_when_authorized_keys_is_unreadable(tmp_path, settings):
     """The fix text has to be the command that puts it right, with the SSH account name."""
-    import os
-    import pwd
-
-    account = pwd.getpwuid(os.getuid())
-    if account.pw_uid == 0:
-        pytest.skip("running as root: every mode bit is readable, nothing to prove")
-    s = settings.model_copy(update={"ssh_user": account.pw_name})
     zone = tmp_path / "locked"
     zone.mkdir()
-    zone.chmod(0o700)
+    zone.chmod(0o755)
     keys = zone / "authorized_keys"
     keys.write_text("ssh-ed25519 AAAA test\n")
     keys.chmod(0o600)
-    s = s.model_copy(update={"authorized_keys_path": keys})
+    os.chown(keys, os.getuid(), os.getgid())
+    s = settings.model_copy(update={"ssh_user": STRANGER.pw_name, "authorized_keys_path": keys})
 
-    report = Report()
-    _check_authorized_keys_readable(s, report, s.ssh_user)
+    with _as_account(STRANGER):
+        report = Report()
+        _check_authorized_keys_readable(s, report, s.ssh_user)
     check = next(c for c in report.checks if c.name == "authorized_keys")
     assert check.status == FAIL
     assert f"chown {s.ssh_user}:{s.ssh_user}" in check.fix

@@ -256,12 +256,20 @@ def test_authorized_keys_owner_is_none_without_a_known_ssh_account(tmp_path, set
     assert keys_service.authorized_keys_owner(target, unknown) is None
 
 
-def _another_account(current_uid: int):
-    """Any real account that is not the one running the tests."""
-    for entry in pwd.getpwall():
-        if entry.pw_uid != current_uid:
-            return entry
-    pytest.skip("this system has exactly one account")
+def _stranger() -> pwd.struct_passwd:
+    """A synthetic account that owns nothing in this test.
+
+    Described rather than looked up: the suite must reach the same verdict whether it runs as
+    root (a developer box, where every mode bit is readable and "any other account" would be
+    root itself) or as an ordinary user (CI). Only the uid/gid the decision depends on matters.
+    """
+    return pwd.struct_passwd(
+        ("tg-stranger", "x", 12345, 12345, "", "/nonexistent", "/usr/sbin/nologin")
+    )
+
+
+def _as_stranger(account: pwd.struct_passwd):
+    return mock.patch.object(keys_service.pwd, "getpwnam", return_value=account)
 
 
 def test_a_key_file_left_unreadable_by_an_older_release_is_repaired(tmp_path, settings):
@@ -271,39 +279,53 @@ def test_a_key_file_left_unreadable_by_an_older_release_is_repaired(tmp_path, se
     owns it now" would then keep every router locked out forever, so the writer must notice that
     the account sshd drops to cannot read the file and hand it over instead.
     """
+    tmp_path.chmod(0o755)
     target = tmp_path / "authorized_keys"
     target.write_text("ssh-ed25519 AAAA test\n", encoding="utf-8")
     target.chmod(0o600)
-    other = _another_account(os.getuid())
-    ssh_settings = settings.model_copy(update={"ssh_user": other.pw_name})
+    os.chown(target, os.getuid(), os.getgid())
+    stranger = _stranger()
+    ssh_settings = settings.model_copy(update={"ssh_user": stranger.pw_name})
 
-    assert keys_service.authorized_keys_owner(target, ssh_settings) == (other.pw_uid, other.pw_gid)
+    with _as_stranger(stranger):
+        owner = keys_service.authorized_keys_owner(target, ssh_settings)
+
+    assert owner == (stranger.pw_uid, stranger.pw_gid)
 
 
 def test_a_directory_the_ssh_account_cannot_traverse_is_repaired(tmp_path, settings):
     """The directory blocks sshd before the file's own mode ever matters.
 
     An older release run as root left .ssh root-owned at 0700. Repairing only the file would
-    leave sshd unable to reach it, so the writer takes the directory over as well.
+    leave sshd unable to reach it, so the writer takes the directory over as well. The chown
+    is mocked because a test that really hands a directory to another account needs root -
+    and then the assertion would only prove that root can chown, not that the panel tries.
     """
-    other = _another_account(os.getuid())
-    ssh_settings = settings.model_copy(update={"ssh_user": other.pw_name})
+    stranger = _stranger()
     data = tmp_path / "data"
     data.mkdir(exist_ok=True)
     directory = data / ".ssh"
     directory.mkdir(exist_ok=True)
     directory.chmod(0o700)
-    ssh_settings = ssh_settings.model_copy(
-        update={"authorized_keys_path": directory / "authorized_keys"}
+    ssh_settings = settings.model_copy(
+        update={
+            "ssh_user": stranger.pw_name,
+            "authorized_keys_path": directory / "authorized_keys",
+        }
     )
 
-    with mock.patch.object(keys_service.os, "geteuid", return_value=0):
+    recorded: list[tuple[str, int, int]] = []
+    with (
+        _as_stranger(stranger),
+        mock.patch.object(
+            keys_service.os, "chown", side_effect=lambda p, u, g: recorded.append((str(p), u, g))
+        ),
+    ):
         repaired = keys_service.repair_authorized_keys_dir(ssh_settings)
 
     assert repaired is True
-    info = directory.stat()
-    assert (info.st_uid, info.st_gid) == (other.pw_uid, other.pw_gid)
-    assert (info.st_mode & 0o777) == 0o700
+    assert recorded == [(str(directory), stranger.pw_uid, stranger.pw_gid)]
+    assert (directory.stat().st_mode & 0o777) == 0o700
 
 
 def test_a_directory_the_ssh_account_can_reach_is_left_alone(tmp_path, settings):
@@ -314,12 +336,15 @@ def test_a_directory_the_ssh_account_can_reach_is_left_alone(tmp_path, settings)
     directory = data / ".ssh"
     directory.mkdir(exist_ok=True)
     directory.chmod(0o755)
-    other = _another_account(os.getuid())
+    stranger = _stranger()
     ssh_settings = settings.model_copy(
-        update={"ssh_user": other.pw_name, "authorized_keys_path": directory / "authorized_keys"}
+        update={"ssh_user": stranger.pw_name, "authorized_keys_path": directory / "authorized_keys"}
     )
 
-    with mock.patch.object(keys_service.os, "chown") as chown:
+    with (
+        _as_stranger(stranger),
+        mock.patch.object(keys_service.os, "chown") as chown,
+    ):
         repaired = keys_service.repair_authorized_keys_dir(ssh_settings)
 
     assert repaired is False
@@ -335,10 +360,13 @@ def test_a_key_file_the_ssh_account_can_read_keeps_its_owner(tmp_path, settings)
     target.write_text("ssh-ed25519 AAAA test\n", encoding="utf-8")
     target.chmod(0o644)
     info = target.stat()
-    other = _another_account(os.getuid())
-    ssh_settings = settings.model_copy(update={"ssh_user": other.pw_name})
+    stranger = _stranger()
+    ssh_settings = settings.model_copy(update={"ssh_user": stranger.pw_name})
 
-    assert keys_service.authorized_keys_owner(target, ssh_settings) == (info.st_uid, info.st_gid)
+    with _as_stranger(stranger):
+        owner = keys_service.authorized_keys_owner(target, ssh_settings)
+
+    assert owner == (info.st_uid, info.st_gid)
 
 
 def test_revoke_removes_the_line_from_disk(db, settings, tmp_authorized_keys):

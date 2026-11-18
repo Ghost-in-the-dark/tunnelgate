@@ -37,6 +37,8 @@ import logging
 import time
 from typing import Any
 
+from sqlalchemy import select
+
 from ..config import Settings, get_settings, utcnow
 from ..db import session_scope
 from ..models import ConsoleSession, Router, User
@@ -149,6 +151,50 @@ def audit_event(
             user_agent=user_agent,
             detail=detail,
         )
+
+
+def close_orphaned_session_rows() -> int:
+    """Close console rows a previous panel process left open, and return how many.
+
+    A ConsoleSession row is opened when the shell opens and closed in the bridge's teardown.
+    Nothing else can close it: the row has no "still alive" reference outside this process, so
+    a panel that is restarted (an upgrade, a crash, systemd's Restart=) leaves every session it
+    was serving stamped closed_at IS NULL forever. That is not cosmetic - /api/v1/stats counts
+    open rows as "console_sessions_active", so the dashboard and any alert on that metric show
+    phantom live shells that no user can end, and a concurrent-session limit silently eats into
+    its budget.
+
+    Called once from the lifespan startup, before the app serves a request, so the sweep cannot
+    race a live session: at that instant this process serves none. The close reason is its own
+    value ("panel_restart") so an audit reader can tell a sweep from a real disconnect, and the
+    byte counters stay as they were written - the sweep has no idea what the shell transferred
+    and must not invent zeroes that would read as "nothing happened".
+    """
+    with session_scope() as db:
+        rows = (
+            db.execute(select(ConsoleSession).where(ConsoleSession.closed_at.is_(None)))
+            .scalars()
+            .all()
+        )
+        if not rows:
+            return 0
+        now = utcnow()
+        for row in rows:
+            row.closed_at = now
+            row.close_reason = "panel_restart"
+            audit_record(
+                db,
+                "console.close",
+                actor_username=row.username,
+                router_id=row.router_id,
+                router_name=row.router_name,
+                detail={
+                    "session_id": row.id,
+                    "reason": "panel_restart",
+                    "started_at": row.started_at.isoformat() if row.started_at else None,
+                },
+            )
+        return len(rows)
 
 
 # --------------------------------------------------------------------------- frame helpers

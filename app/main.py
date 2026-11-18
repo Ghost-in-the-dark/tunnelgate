@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -18,12 +19,76 @@ from .errors import install_error_handlers
 
 log = logging.getLogger("tunnelgate")
 
+# The logger names the panel's own diagnostics ("tunnelgate" and its "tunnelgate.*" children:
+# proxy, monitor, console, launch, api.*). Uvicorn configures only its own "uvicorn" loggers and
+# leaves the root logger bare, so without this the tree inherits root's WARNING default and every
+# log.info() in app/ is silently dropped - including the operator-facing ones (created initial
+# admin user, router state changes, the console-session sweep). TUNNELGATE_LOG_LEVEL was
+# documented in three places before anything read it; this is what reads it.
+LOG_LEVELS = {
+    "critical": logging.CRITICAL,
+    "error": logging.ERROR,
+    "warning": logging.WARNING,
+    "info": logging.INFO,
+    "debug": logging.DEBUG,
+}
+
+
+class _StderrHandler(logging.StreamHandler):
+    """A stderr sink that follows sys.stderr instead of pinning it at construction.
+
+    logging.StreamHandler captures its stream when it is built. That is fine for a process
+    that never swaps stderr, but the panel is also started by wrappers, test harnesses and
+    journald bridges that replace sys.stderr after import time - the handler would then write
+    to a stale (often closed) object and the diagnostics would disappear again.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(sys.stderr)
+        self._tunnelgate_sink = True  # type: ignore[attr-defined]
+
+    @property
+    def stream(self):  # type: ignore[override]
+        return sys.stderr
+
+    @stream.setter
+    def stream(self, value) -> None:
+        """Accepted and ignored: StreamHandler.__init__ assigns here."""
+
+
 MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 # Explicit CORS allow-lists. A wildcard here would mirror the caller's request back at them,
 # which is exactly the combination the credentialed-request check exists to prevent.
 CORS_ALLOW_METHODS = ("GET", "POST", "PATCH", "DELETE", "OPTIONS")
 CORS_ALLOW_HEADERS = ("Accept", "Content-Type", "X-Requested-With")
+
+
+def configure_logging(settings: Settings) -> None:
+    """Apply TUNNELGATE_LOG_LEVEL to the panel's logger tree, with one stderr sink.
+
+    Called from create_app, i.e. on every process start (systemd, docker, uvicorn, and each
+    app instance a test builds). Idempotent: the sink carries a marker attribute and is only
+    added when absent, so a second call cannot make every line appear twice.
+
+    Propagation is left on so an embedding process that configures its own root handler
+    (uvicorn --log-config, gunicorn, pytest's log capture) still receives the records. A plain
+    deployment gets exactly one sink, because neither uvicorn nor the interpreter puts a
+    handler on the root logger - which is exactly why INFO lines vanished before this existed.
+    """
+    name = str(getattr(settings, "log_level", "info") or "info").strip().lower()
+    level = LOG_LEVELS.get(name)
+    logger = logging.getLogger("tunnelgate")
+    logger.setLevel(level if level is not None else logging.INFO)
+    if not any(getattr(h, "_tunnelgate_sink", False) for h in logger.handlers):
+        handler = _StderrHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
+        logger.addHandler(handler)
+    if level is None:
+        # Not fatal: a typo in one env var must not stop the panel from booting, and INFO is
+        # the documented default. Say so, because silently logging more than asked for (or
+        # less) is how "why is my log empty" tickets start.
+        log.warning("unknown TUNNELGATE_LOG_LEVEL %r: using info", name)
 
 
 def _seed_admin() -> None:
@@ -60,8 +125,19 @@ async def lifespan(app: FastAPI):
     s.ensure_dirs()
     init_db()
 
+    from .services.console_ws import close_orphaned_session_rows
     from .services.monitor import run_monitor
     from .services.proxy import ProxyManager
+
+    # Before serving anything: console rows left open by a previous process can never be
+    # closed by anything else, and /api/v1/stats reads them as live shells (see the docstring).
+    try:
+        reaped = close_orphaned_session_rows()
+    except Exception:
+        log.exception("could not close console sessions left open by a previous process")
+    else:
+        if reaped:
+            log.info("closed %d console session(s) orphaned by a previous process", reaped)
 
     stop = asyncio.Event()
     proxy = ProxyManager()
@@ -94,6 +170,7 @@ def create_app(settings: Settings | None = None, *, use_monitor: bool = True) ->
     if settings is not None:
         set_settings_override(settings)
     s = get_settings()
+    configure_logging(s)
 
     # The OpenAPI schema and the interactive docs describe every route, every field and every
     # auth scheme in the panel, unauthenticated. That is a gift to reconnaissance on a public

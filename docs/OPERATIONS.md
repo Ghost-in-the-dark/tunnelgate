@@ -34,6 +34,25 @@ journalctl -u tunnelgate -n 100 --no-pager
 `routers_pending`, `ports_free`, `users_total`, `console_sessions_active`. Alert on
 `ports_free < 50` and on `routers_online` dropping.
 
+### What the panel writes to the journal
+
+The panel logs under the `tunnelgate` logger tree (`tunnelgate.proxy`, `tunnelgate.monitor`,
+`tunnelgate.console`, `tunnelgate.launch`, `tunnelgate.api.*`). Verbosity follows
+`TUNNELGATE_LOG_LEVEL` (default `info`); `debug` is for a reproduced problem, not a steady
+state, because the monitor and the proxy renderer log per decision.
+
+At `info` the lines worth knowing:
+
+| line | means |
+| --- | --- |
+| `created initial admin user <name>` | first boot; the password came from `TUNNELGATE_ADMIN_PASSWORD` |
+| `closed N console session(s) orphaned by a previous process` | the panel restarted mid-shell; those rows are now closed with reason `panel_restart` |
+| `initial proxy sync failed` | nginx/caddy render failed at boot - the panel serves, routers do not |
+| `api docs and OpenAPI schema are disabled` | production default, expected |
+
+A warning is always written, whatever the level: `unknown TUNNELGATE_LOG_LEVEL ...: using info`
+means a typo in the env file, and the panel silently used the default.
+
 ### What "online" means
 
 `online` requires **both**: a listening port in the router's `tunnel_port` observed by the

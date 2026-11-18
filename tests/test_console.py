@@ -437,6 +437,43 @@ def test_console_session_row_roundtrip(db, settings):
         assert (row.bytes_in, row.bytes_out) == (12, 34)
 
 
+def test_orphaned_console_rows_are_closed_on_startup(db, settings):
+    """A restart strands open rows; the sweep must close them and leave a trail.
+
+    Nothing but the bridge closes a ConsoleSession row, so a panel that dies mid-session leaves
+    closed_at IS NULL forever - and /api/v1/stats counts that as a live shell.
+    """
+    from app.db import session_scope
+    from app.services.console_ws import close_orphaned_session_rows, create_session_row
+
+    item = _make_router(db, settings, name="S", slug="s")
+    user = User(username="dave", role="operator", password_hash="x")
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    stranded = create_session_row(item, user, "10.2.2.2", "pytest-agent")
+    finished = create_session_row(item, user, "10.2.2.3", "pytest-agent")
+    from app.services.console_ws import finish_session_row
+
+    finish_session_row(finished["id"], close_reason="client_closed", bytes_in=5, bytes_out=6)
+
+    assert close_orphaned_session_rows() == 1
+
+    with session_scope() as s:
+        row = s.get(ConsoleSession, stranded["id"])
+        assert row.closed_at is not None
+        assert row.close_reason == "panel_restart"
+        # the sweep cannot know the traffic, so it must not overwrite the counters
+        assert (row.bytes_in, row.bytes_out) == (0, 0)
+        # an already-closed row is untouched: its reason survives
+        done = s.get(ConsoleSession, finished["id"])
+        assert done.close_reason == "client_closed"
+
+    # a second sweep is a no-op rather than re-stamping the same rows
+    assert close_orphaned_session_rows() == 0
+
+
 def test_private_key_is_not_stored_in_plaintext(db, settings):
     """encrypt_secret must be what lands in the row: the raw PEM must not appear."""
     pair = generate_ed25519_keypair("leak-check")

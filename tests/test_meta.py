@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -154,3 +156,52 @@ def test_blank_origins_do_not_add_cors(settings, monkeypatch):
     with _client_for(settings, monkeypatch) as c:
         r = c.get("/api/v1/health", headers={"Origin": "https://evil.example"})
         assert "access-control-allow-origin" not in r.headers
+
+
+# ------------------------------------------------------------------- logging (TUNNELGATE_LOG_LEVEL)
+def test_log_level_setting_reaches_the_panel_logger(settings, monkeypatch):
+    """TUNNELGATE_LOG_LEVEL is documented in the env example and the install guide.
+
+    Nothing read it: the panel's logger inherited root's WARNING default, so every
+    log.info() in app/ was dropped. create_app must apply the setting.
+    """
+    monkeypatch.setattr(settings, "log_level", "debug")
+    create_app(settings, use_monitor=False)
+    assert logging.getLogger("tunnelgate").getEffectiveLevel() == logging.DEBUG
+
+
+def test_a_log_info_line_is_emitted_at_the_configured_level(settings, monkeypatch, capsys):
+    """The behavioural half: setting a level proves nothing if no handler is attached."""
+    monkeypatch.setattr(settings, "log_level", "info")
+    create_app(settings, use_monitor=False)
+    logging.getLogger("tunnelgate").info("probe line %d", 7)
+    captured = capsys.readouterr()
+    assert "probe line 7" in captured.err
+
+
+def test_an_info_line_is_suppressed_when_the_level_is_warning(settings, monkeypatch, capsys):
+    """A configured level has to cut both ways, or it is decoration."""
+    monkeypatch.setattr(settings, "log_level", "warning")
+    create_app(settings, use_monitor=False)
+    logging.getLogger("tunnelgate").info("dropped line")
+    logging.getLogger("tunnelgate").warning("kept line")
+    captured = capsys.readouterr()
+    assert "dropped line" not in captured.err
+    assert "kept line" in captured.err
+
+
+def test_an_unknown_log_level_falls_back_to_info_and_says_so(settings, monkeypatch, capsys):
+    """A typo must not stop the boot, and must not silently change verbosity."""
+    monkeypatch.setattr(settings, "log_level", "verbose")
+    create_app(settings, use_monitor=False)
+    assert logging.getLogger("tunnelgate").getEffectiveLevel() == logging.INFO
+    assert "unknown TUNNELGATE_LOG_LEVEL" in capsys.readouterr().err
+
+
+def test_configure_logging_is_idempotent(settings, monkeypatch, capsys):
+    """Two app instances in one process must not double lines (journald rate-limits, alerts trip)."""
+    monkeypatch.setattr(settings, "log_level", "info")
+    create_app(settings, use_monitor=False)
+    create_app(settings, use_monitor=False)
+    logging.getLogger("tunnelgate").info("exactly once")
+    assert capsys.readouterr().err.count("exactly once") == 1

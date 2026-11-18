@@ -11,3 +11,7 @@ web/dist/
 .pytest_cache/
 .ruff_cache/
 .artifacts/
+
+# devkb:begin (managed by `devkb init`)
+.devkb/
+# devkb:end

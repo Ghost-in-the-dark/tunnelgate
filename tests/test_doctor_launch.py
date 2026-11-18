@@ -119,8 +119,12 @@ def test_doctor_does_not_treat_a_missing_file_as_a_failure(tmp_path, settings):
     """Before the first router exists there is nothing to read; that is not a fault."""
     s = settings.model_copy(update={"authorized_keys_path": tmp_path / "data" / "authorized_keys"})
     (tmp_path / "data").mkdir(exist_ok=True)
-    report = Report()
-    _check_authorized_keys_readable(s, report, s.ssh_user)
+    # Describe the account: on a runner where settings.ssh_user does not exist the check has
+    # nothing to judge and stays silent, which would turn this into a KeyError instead of the
+    # WARN the behaviour is supposed to produce.
+    with _as_account(STRANGER):
+        report = Report()
+        _check_authorized_keys_readable(s, report, s.ssh_user)
     assert _statuses(report)["authorized_keys"] == WARN
 
 

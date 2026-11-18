@@ -528,9 +528,13 @@ def test_handler_release_on_disconnect(client, settings, fake_connection):
         ws.receive_json()
         assert console_service.SESSIONS.count_for_router(item.id) == 1
 
+    # Teardown drops the session from the registry BEFORE it closes the SSH channel
+    # (_teardown: SESSIONS.remove -> persist -> connection.close), so waiting on the
+    # registry alone would let the poll win the race and read "closed" too early. Wait
+    # for both facts; the assertions then state the invariant instead of the timing.
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        if console_service.SESSIONS.count_for_router(item.id) == 0:
+        if console_service.SESSIONS.count_for_router(item.id) == 0 and fake_connection[0].closed:
             break
         time.sleep(0.02)
     assert console_service.SESSIONS.count_for_router(item.id) == 0

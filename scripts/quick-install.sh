@@ -158,7 +158,14 @@ case "$SERVICE" in
     *[!a-zA-Z0-9_.-]*|'') die "--service-name may contain only letters, digits, dot, dash and underscore" ;;
 esac
 
-[ "$(id -u)" -eq 0 ] || die "run this as root: it installs packages, creates a user and writes systemd units"
+# Root is needed for what this script CHANGES - packages, a user, systemd units, nginx.
+# A dry run changes nothing, so it must stay usable without sudo: an operator reading the
+# plan before handing root to a script is the desired behaviour, not an error.
+if [ "$DRY_RUN" -eq 1 ]; then
+    [ "$(id -u)" -eq 0 ] || warn "dry run as a non-root user: the plan is complete, but the real run needs root"
+else
+    [ "$(id -u)" -eq 0 ] || die "run this as root: it installs packages, creates a user and writes systemd units"
+fi
 
 # Derived once, so nothing can drift half-way through the run.
 ROUTES_DIR=/etc/nginx/tunnelgate

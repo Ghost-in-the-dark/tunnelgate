@@ -9,6 +9,7 @@ of the same server block, and it silently rots unless a test keeps the two in st
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -1096,6 +1097,31 @@ def _self_signed_cert(directory: Path) -> tuple[Path, Path]:
     return cert, key
 
 
+_LOW_PORT_RE = re.compile(r"^\s*listen\s+(?:\[::\]:)?(443|80)\b.*$", re.MULTILINE)
+
+
+def _rebind_low_ports(text: str) -> str:
+    """Point the rendered config's privileged listeners at one unprivileged port.
+
+    'nginx -t' binds every listening socket before it reports, so a config that listens on
+    443 fails under an unprivileged user with "bind() to 0.0.0.0:443 failed (13: Permission
+    denied)" - an environment limitation, not a verdict about the config. CI runs as a
+    normal user, so the parse tests would never run there. The port itself is not what these
+    tests assert (the separate layout's TLS listener is pinned by string assertions); every
+    directive that matters to them is left untouched.
+    """
+    first = True
+
+    def rewrite(match: re.Match[str]) -> str:
+        nonlocal first
+        if first:
+            first = False
+            return "    listen 127.0.0.1:18443;"
+        return "    # duplicate listener dropped for the unprivileged test run"
+
+    return _LOW_PORT_RE.sub(rewrite, text)
+
+
 def _nginx_accepts(
     tmp_path: Path,
     include_text: str,
@@ -1108,16 +1134,24 @@ def _nginx_accepts(
     prefix = tmp_path / "prefix"
     (prefix / "logs").mkdir(parents=True, exist_ok=True)
     included = prefix / "routes.conf"
-    included.write_text(include_text)
+    included.write_text(_rebind_low_ports(include_text))
+    # nginx touches its pid file and logs before it parses anything, and the compiled-in
+    # defaults (/run/nginx.pid, /var/log/nginx/*.log) are unwritable for an unprivileged run.
+    # Without these, CI fails the whole module with "open() /run/nginx.pid failed (13:
+    # Permission denied)" - a permission error, not a verdict about the config under test.
+    preamble = (
+        f"pid {prefix}/nginx.pid;\n"
+        f"error_log {prefix}/logs/error.log;\n"
+        "events {}\n"
+        f"http {{\n    access_log {prefix}/logs/access.log;\n"
+    )
     if inside_server:
         # Merged layout: locations only, included inside the panel server block, which is
         # the operator's block in production - this driver stands in for it.
         if cert is None or key is None:
             cert, key = _self_signed_cert(prefix / "tls")
         body = (
-            "events {}\n"
-            "http {\n"
-            "    map $http_upgrade $connection_upgrade { default upgrade; '' close; }\n"
+            preamble + "    map $http_upgrade $connection_upgrade { default upgrade; '' close; }\n"
             "    server {\n"
             "        listen 127.0.0.1:8443 ssl;\n"
             f"        ssl_certificate {cert};\n"
@@ -1130,7 +1164,7 @@ def _nginx_accepts(
         )
     else:
         # Separate layout: the file declares its own server{} block.
-        body = f"events {{}}\nhttp {{\n    include {included};\n}}\n"
+        body = preamble + f"    include {included};\n}}\n"
     conf = prefix / "nginx.conf"
     conf.write_text(body)
     proc = subprocess.run(

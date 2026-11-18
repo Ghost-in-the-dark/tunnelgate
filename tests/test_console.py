@@ -12,6 +12,7 @@ from app.config import utcnow
 from app.models import ConsoleSession, Router, User
 from app.security import encrypt_secret, generate_ed25519_keypair
 from app.services import console as console_service
+from app.services import keys as keys_service
 from app.services.console import (
     STATE_DISABLED,
     STATE_NO_KEY,
@@ -25,6 +26,7 @@ from app.services.console import (
     console_ssh_user,
     console_state,
 )
+from app.services.keys import console_remote_user
 
 
 # --------------------------------------------------------------------------- fixtures
@@ -161,21 +163,29 @@ def test_registry_reset():
 
 
 # --------------------------------------------------------------------------- ssh user
-def test_console_ssh_user_reads_router(db, settings):
+# The console login is NOT Router.ssh_user: that column holds the panel-side tunnel login
+# ("tunnelgate"), an account the router does not have. The console must dial the account the
+# console key was actually installed for, or every real router fails authentication while
+# console_state() still says ready.
+def test_console_ssh_user_is_the_account_the_key_was_installed_for(db, settings):
     item = _make_router(db, settings, name="A", slug="a", ssh_user="tunnelgate")
-    assert console_ssh_user(item) == "tunnelgate"
+    assert console_ssh_user(item) == console_remote_user()
+    assert console_ssh_user(item) != item.ssh_user
 
 
-def test_console_ssh_user_falls_back_to_root(db, settings):
-    item = _make_router(db, settings, name="B", slug="b", ssh_user="")
-    assert console_ssh_user(item) == "root"
+def test_console_ssh_user_ignores_the_tunnel_login(db, settings):
+    """A router whose tunnel login looks plausible must not change the console login."""
+    item = _make_router(db, settings, name="B", slug="b", ssh_user="root")
+    assert console_ssh_user(item) == console_remote_user()
 
 
-def test_console_ssh_user_falls_back_to_dedicated_console_field(db, settings):
-    """A future dedicated `ssh_user_console` field wins over the tunnel user."""
-    item = _make_router(db, settings, name="C", slug="c", ssh_user="root")
-    item.ssh_user_console = "tgc"  # attribute exists only on newer model revisions
-    assert console_ssh_user(item) == "tgc"
+def test_console_ssh_user_matches_the_registration_delivered_to_the_router(db, settings):
+    """End-to-end guard: the dialled login and the advertised one cannot drift apart."""
+    item = _make_router(db, settings, name="C", slug="c", ssh_user="tunnelgate")
+    item.console_installed_at = None  # still pending, so a registration is advertised
+    registration = keys_service.console_key_registration(item)
+    assert registration is not None
+    assert registration.user == console_ssh_user(item)
 
 
 # --------------------------------------------------------------------------- states
@@ -284,7 +294,9 @@ async def test_open_ssh_uses_sealed_key_and_loopback(db, settings, stub_ssh):
     assert kwargs is not None
     assert kwargs["hostname"] == "127.0.0.1"  # settings.console_bind_address
     assert kwargs["port"] == 25011
-    assert kwargs["username"] == "tunnelgate"
+    # The dial must use the account the console key was installed for, not Router.ssh_user.
+    assert kwargs["username"] == console_remote_user()
+    assert kwargs["username"] == "root"
     assert kwargs["allow_agent"] is False
     assert kwargs["look_for_keys"] is False
     assert isinstance(kwargs["pkey"], paramiko.Ed25519Key)

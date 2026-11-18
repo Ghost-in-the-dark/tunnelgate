@@ -181,13 +181,13 @@ def _issue_token(db, item: Router, purpose: str, actor, settings) -> tuple[str, 
     return bootstrap_service.issue_bootstrap_token(db, item, purpose, actor, settings=settings)
 
 
-def _created_response(item: Router, token_row: BootstrapToken, plaintext: str, settings):
+def _created_response(item: Router, token_row: BootstrapToken, plaintext: str, settings, db=None):
     base = router_out(item, token=token_row, settings=settings)
     return RouterCreatedOut(
         **base.model_dump(),
         bootstrap_token=plaintext,
-        install_command=bootstrap_service.build_install_command(plaintext, settings),
-        install_script_url=bootstrap_service.install_script_url(settings),
+        install_command=bootstrap_service.build_install_command(plaintext, settings, db=db),
+        install_script_url=bootstrap_service.install_script_url(settings, db=db),
     )
 
 
@@ -234,7 +234,7 @@ async def create_router(
     )
     db.commit()
     db.refresh(item)
-    return _created_response(item, token_row, plaintext, settings)
+    return _created_response(item, token_row, plaintext, settings, db)
 
 
 @router.get("", response_model=RouterListOut)
@@ -434,8 +434,8 @@ async def rotate_key(
     return RotateKeyOut(
         bootstrap_token=plaintext,
         bootstrap_expires_at=iso(token_row.expires_at) or "",
-        install_command=bootstrap_service.build_install_command(plaintext, settings),
-        install_script_url=bootstrap_service.install_script_url(settings),
+        install_command=bootstrap_service.build_install_command(plaintext, settings, db=db),
+        install_script_url=bootstrap_service.install_script_url(settings, db=db),
     )
 
 
@@ -480,8 +480,8 @@ async def router_script(
     return {
         "bootstrap_token": plaintext,
         "bootstrap_expires_at": iso(token_row.expires_at),
-        "install_command": bootstrap_service.build_install_command(plaintext, settings),
-        "install_script_url": bootstrap_service.install_script_url(settings),
+        "install_command": bootstrap_service.build_install_command(plaintext, settings, db=db),
+        "install_script_url": bootstrap_service.install_script_url(settings, db=db),
     }
 
 

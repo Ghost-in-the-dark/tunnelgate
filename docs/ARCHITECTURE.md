@@ -115,7 +115,7 @@ sequenceDiagram
     API->>API: monitor: ss sees the listener, health check against LuCI
     API->>DB: status=online, RouterRuntime.tunnel_present=true
     R->>API: POST /{id}/heartbeat every 60 s (X-Api-Token)
-    API-->>R: {status, desired, console?}
+    API-->>R: {status, tunnel_present, desired:{heartbeat_url}, console?}
     UI->>API: GET /{id}/status (polled every 2 s)
     API-->>UI: phase=done
     UI-->>OP: redirect to /routers/{id}
@@ -230,6 +230,13 @@ stateDiagram-v2
   alive (401 = "LuCI is asking for credentials", which means LuCI is up).
 * The heartbeat is **advisory only**: it refreshes metadata (firmware version, model, uptime)
   and delivers console key registrations. It can never mark a router online on its own.
+* The one thing it *does* decide is where the router dials next. `desired.heartbeat_url` is
+  built from the agent endpoint (an admin-editable database override, else
+  `TUNNELGATE_PANEL_URL` - see [API.md](API.md#settings-admin-only-csrf)) and the agent adopts
+  it verbatim when it differs from its own UCI setting. That is the only way an operator can
+  move the panel to a new hostname or port without re-running the installer on every device in
+  the field, and it is why the panel's internal address and the address routers use are two
+  separate settings rather than one.
 * `stale_offline_seconds` (default 90) covers the case where `ss` is unavailable: a router whose
   heartbeat stopped is demoted to offline.
 
@@ -337,7 +344,8 @@ erDiagram
 
 * [SECURITY.md](SECURITY.md) - threat model, key restrictions, the `restrict`+ `permitlisten` trap.
 * [API.md](API.md) - the frozen REST surface.
-* [INSTALL_SERVER.md](INSTALL_SERVER.md) - VPS bring-up (DNS, TLS, sshd, firewall, systemd).
+* [INSTALL_SERVER.md](INSTALL_SERVER.md) - VPS bring-up (DNS, TLS, sshd, firewall, systemd), plus
+  running behind a reverse proxy or load balancer and moving the panel without re-installing routers.
 * [INSTALL_ROUTER.md](INSTALL_ROUTER.md) - the router side.
 * [OPERATIONS.md](OPERATIONS.md) - runbooks: add/rotate/delete, incident response, backups.
 * [UI.md](UI.md) - panel screens, wizard state machine, accessibility notes.

@@ -572,6 +572,8 @@ write_heartbeat_bin() {
 #
 # Responsibilities
 #   * POST metadata to the panel so a quiet tunnel still proves the router is alive;
+#   * adopt the heartbeat_url the panel puts in its "desired" payload, so a panel that moved
+#     does not orphan routers that are already installed;
 #   * consume the console key registration delivered in the response: when the serial in
 #     UCI is behind the serial shipped by the panel, rewrite the tunnelgate-console line in
 #     /etc/dropbear/authorized_keys, bump the stored serial and report console_installed.
@@ -714,6 +716,24 @@ case "$http_code" in
 "") log "heartbeat failed: no HTTP status (DNS, TLS or network problem)"; exit 0 ;;
 *) log "heartbeat failed: HTTP $http_code"; exit 0 ;;
 esac
+
+# --- desired state ------------------------------------------------------------------------
+# The panel can move (new hostname, TLS terminating in front, another port). An installed
+# router cannot be re-installed from here, so the heartbeat response carries the address it
+# should use from now on; adopting it is what keeps a fleet alive across a panel move.
+desired_url=$(json_get desired.heartbeat_url "$RESPONSE")
+if [ -n "$desired_url" ] && [ "$desired_url" != "$heartbeat_url" ]; then
+    case "$desired_url" in
+    http://* | https://*)
+        if cfg_set heartbeat_url "$desired_url"; then
+            log "panel moved: heartbeat_url updated to $desired_url"
+        else
+            log "panel moved to $desired_url but UCI could not be updated"
+        fi
+        ;;
+    *) log "ignoring desired heartbeat_url '$desired_url': not an http(s) URL" ;;
+    esac
+fi
 
 # --- console key registration -------------------------------------------------------------
 # Only when the panel enabled the console for this router; otherwise this is a no-op.

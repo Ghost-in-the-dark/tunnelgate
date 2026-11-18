@@ -20,6 +20,7 @@ from ..deps import DbSession, SettingsDep, client_ip
 from ..errors import ApiError
 from ..models import STATUS_AWAITING, STATUS_OFFLINE, STATUS_ONLINE, Router
 from ..schemas import HeartbeatIn, HeartbeatOut, iso
+from ..services import agent_endpoint
 from ..services import keys as keys_service
 
 log = logging.getLogger(__name__)
@@ -39,6 +40,12 @@ def _authenticate(db, router_id: str, supplied: str | None) -> Router:
     if not keys_service.api_token_matches(item, supplied):
         raise ApiError(401, "invalid_api_token", "Unknown router or invalid api token")
     return item
+
+
+def _heartbeat_url(item: Router, db, settings) -> str:
+    """The address this router should POST to, derived from the effective agent endpoint."""
+    base = agent_endpoint.agent_url(db, settings)
+    return f"{base}/api/v1/routers/{item.id}/heartbeat"
 
 
 async def _console_installed_flag(request: Request) -> bool:
@@ -105,6 +112,12 @@ async def heartbeat(
         item.console_installed_at = now
         registration = None
 
+    # The ONLY channel that can re-point an already-installed router: the agent reads this and
+    # rewrites its own heartbeat_url when it differs. It exists because an operator who moves the
+    # panel (new hostname, TLS in front, another port) cannot re-run the installer on devices
+    # that are already in the field - and without it they would silently rot on the old address.
+    desired = {"heartbeat_url": _heartbeat_url(item, db, settings)}
+
     db.commit()
     db.refresh(item)
     return HeartbeatOut(
@@ -112,6 +125,6 @@ async def heartbeat(
         status=item.status,
         server_time=iso(now) or "",
         tunnel_present=tunnel_present,
-        desired=None,
+        desired=desired,
         console=registration,
     )

@@ -219,13 +219,20 @@ def issue_console_key(db: Session, router: Router) -> KeyPair:
     return keypair
 
 
-def console_remote_user() -> str:
+def console_remote_user(settings: Settings | None = None) -> str:
     """The account the panel logs in as on the router.
 
-    dropbear on OpenWrt only has root and optionally an admin user, so this is deliberately a
-    module constant rather than a per-router column: one operator decision, one place to change.
+    One operator decision, not a per-router column: dropbear on OpenWrt has root and optionally
+    an admin user, and a per-router value would let a typo silently break one console while
+    every other router still works. `TUNNELGATE_CONSOLE_SSH_USER` is the single switch
+    (docs/SECURITY.md describes creating a dedicated account and pointing this at it).
+
+    This is the ONLY place the console login may come from. The key registration ships it to
+    the router, so the installer, the heartbeat and the panel dial cannot disagree.
     """
-    return CONSOLE_REMOTE_USER
+    s = settings or get_settings()
+    value = str(getattr(s, "console_ssh_user", CONSOLE_REMOTE_USER) or "").strip()
+    return value or CONSOLE_REMOTE_USER
 
 
 def console_key_registration(router: Router) -> ConsoleRegistration | None:

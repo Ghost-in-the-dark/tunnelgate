@@ -295,6 +295,13 @@ def render_nginx(routes: list[RouteSpec], settings) -> str:
                 "        proxy_set_header X-Forwarded-Port  $server_port;",
                 "        proxy_set_header X-Tg-Router       $tg_router;",
                 "",
+                "        # The panel session cookie must never reach a router. If",
+                "        # TUNNELGATE_COOKIE_DOMAIN is set, a browser sends tg_session to",
+                "        # <slug>.<suffix> too, and without this line the router's LuCI (and anyone",
+                "        # reading its logs) receives a live panel session - full panel access, not",
+                "        # just that one device. An empty value deletes the header.",
+                '        proxy_set_header Cookie "";',
+                "",
                 "        # LuCI uses websockets for ubus notifications; the tunnel is plain HTTP.",
                 "        proxy_set_header Upgrade    $http_upgrade;",
                 "        proxy_set_header Connection $tg_connection_upgrade;",
@@ -413,7 +420,12 @@ def render_caddy_route(spec: RouteSpec, settings) -> dict[str, Any]:
                             "X-Forwarded-Host": ["{http.request.host}"],
                             "X-Forwarded-Proto": ["{http.request.scheme}"],
                             "X-Tg-Router": [spec.router_id],
-                        }
+                        },
+                        # The panel's session cookie must never reach a router: with
+                        # TUNNELGATE_COOKIE_DOMAIN set the browser sends tg_session to
+                        # <slug>.<suffix> as well, and a router that keeps it holds a live
+                        # panel session. Delete it on the way through.
+                        "delete": ["Cookie"],
                     }
                 },
             },

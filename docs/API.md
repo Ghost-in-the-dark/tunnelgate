@@ -3,9 +3,12 @@
 Base URL: `https://panel.example.com`. Everything is JSON (`application/json`) except
 `GET /api/v1/routers/install`, which returns `text/x-shellscript`.
 
-Interactive documentation is generated from the same code at `/api/docs` (OpenAPI at
-`/api/openapi.json`) - **that** is the authoritative field list; this document is the contract
-and the reasoning behind it.
+Interactive documentation (`/api/docs`, `/api/openapi.json`) is **disabled in production** -
+both return `404`, because an unauthenticated schema dump is free reconnaissance. The switch is
+`TUNNELGATE_DOCS_ENABLED`; unset, it is on for every `TUNNELGATE_ENV` except `prod`/`production`.
+Both the shipped env file and `scripts/setup-server.sh` set `TUNNELGATE_ENV=production`, so a
+normal install has no `/api/docs`. This document is the field list you have in production, plus
+the contract and the reasoning behind it.
 
 ## Conventions
 
@@ -47,8 +50,10 @@ Every error, including install-script errors, uses one envelope:
 | 403 | `csrf_failed` | Missing/incorrect `X-CSRF-Token` |
 | 404 | `not_found` | Unknown router/user |
 | 409 | `already_installed` | Re-issuing a script for a router that already has a key |
+| 409 | `agent_endpoint_unusable` | `TUNNELGATE_PANEL_URL` does not parse as http(s) and no override is stored (settings routes) |
 | 409 | `console_not_ready` | Console key not installed yet, or router offline |
 | 422 | `slug_taken` | Slug collision that could not be resolved |
+| 422 | `validation_error` | A field failed a business rule; `details.fields` says which (settings routes) |
 | 429 | `rate_limited` | Login or exchange throttled (`Retry-After` header set) |
 | 503 | `no_free_port` | Port pool exhausted |
 
@@ -63,7 +68,7 @@ Two timestamps in the same second are indistinguishable by design.
 |---|---|
 | `viewer` | read routers, read audit, open **LuCI** |
 | `operator` | + create/rotate/delete routers, read install scripts, open a **console** |
-| `admin` | + manage users, terminate console sessions, reissue scripts for installed routers |
+| `admin` | + manage users, terminate console sessions, reissue scripts for installed routers, set the agent endpoint |
 
 ---
 
@@ -88,6 +93,11 @@ Two timestamps in the same second are indistinguishable by design.
 
 Sets `Set-Cookie: tg_session=<opaque>; HttpOnly; SameSite=Lax; Path=/; Max-Age=...`
 (`Secure` when `TUNNELGATE_COOKIE_SECURE=true`).
+
+No `Domain` attribute is emitted unless `TUNNELGATE_COOKIE_DOMAIN` is set, so the cookie is
+**host-only** and a browser sends it only to the panel hostname - never to a router vhost. Setting
+that variable makes the session cookie travel to every `<slug>.<suffix>`, which turns one
+compromised router into a panel session; see docs/SECURITY.md §6.
 
 Rate limited per client IP and per IP+username: `TUNNELGATE_LOGIN_RATE_LIMIT` (10) attempts per
 `TUNNELGATE_LOGIN_RATE_WINDOW_SECONDS` (900). Exceeding it → `429` with `Retry-After`.
@@ -268,6 +278,25 @@ The token is consumed **before** the key is generated, inside one transaction, s
 simultaneous exchanges cannot both succeed. The private key exists only in this response body:
 it is not logged, not cached, not written to a server file, and not recoverable afterwards.
 
+`heartbeat_url` is built from the **agent endpoint**, not from `TUNNELGATE_PANEL_URL`: it is the
+address this router will actually dial from its own network. If you are moving the panel later,
+change the agent endpoint (`PUT /api/v1/settings/agent-endpoint`) and re-issue the script;
+already installed routers are re-pointed by their heartbeat instead (see
+[Heartbeat](#heartbeat-router-facing)).
+
+Rate limits, all of which answer `429 rate_limited` with `Retry-After`:
+
+| Limit | Value | Scope |
+|---|---|---|
+| `EXCHANGE_LIMIT` | 60 per 60 s | per client IP, counted **separately** for `/install` and `/bootstrap/exchange` |
+| `SCRIPT_LIMIT` | 5 per 15 min | per **token**, on `/install` only - independent of the caller's address |
+
+The per-IP window is generous because a router may retry the installer while the operator watches
+its console. The per-token cap is the tighter of the two on purpose: every `/install` render
+echoes the live single-use credential into the response body, so a caller who rotates source
+addresses could otherwise keep pulling the same token for its whole TTL. Hitting it means
+"mint a new token", not "wait" - the token is telling you it has been handled enough.
+
 ---
 
 ## Heartbeat (router-facing)
@@ -275,23 +304,35 @@ it is not logged, not cached, not written to a server file, and not recoverable 
 ### `POST /api/v1/routers/{id}/heartbeat`
 
 Header: `X-Api-Token`. Body: `HeartbeatIn` (hostname, model, openwrt_version, uptime_seconds,
-mac, tunnel_pid, client_version).
+mac, tunnel_pid, client_version, console_serial, console_installed).
 
 → `200` `HeartbeatOut`
 
 ```json
 {"ok": true, "status": "online", "server_time": "...", "tunnel_present": true,
- "desired": null,
+ "desired": {"heartbeat_url": "https://panel.example.com/api/v1/routers/9f3c.../heartbeat"},
  "console": {"serial": 1, "user": "root",
              "public_key": "ssh-ed25519 AAAA... tunnelgate-console",
              "fingerprint": "SHA256:...",
              "authorized_keys_path": "/etc/dropbear/authorized_keys", "shell": "/bin/ash"}}
 ```
 
+`desired` is the **only** channel that re-points a router which is already installed. It carries
+the address the router should use from now on, built from the agent endpoint (Settings →
+Agent endpoint, falling back to `TUNNELGATE_PANEL_URL`; see [Settings](#settings-admin-only-csrf)),
+**not** from the panel's internal address. The agent compares it with the `heartbeat_url` it has
+stored, and when the two differ and the new value starts with `http://` or `https://` it rewrites
+`tunnelgate.main.heartbeat_url` in UCI and logs `panel moved: heartbeat_url updated to ...`. It is
+repeated on every heartbeat, so a router that missed a beat still converges, and a value that is
+not an http(s) URL is ignored with a log line rather than written. See
+`docs/INSTALL_SERVER.md`, "Moving the panel without re-installing routers".
+
 `console` is present only while the router's stored key serial is behind the server's, so a
 router rewrites its `authorized_keys` exactly once per rotation. A heartbeat can refresh
 metadata and deliver the console key; it can **never** mark a router online (that requires an
-observed tunnel - see ARCHITECTURE.md §7).
+observed tunnel - see ARCHITECTURE.md §7). It also records the router's observed source address
+in `client_ip`, which is why the reverse-proxy trust rules in `docs/SECURITY.md` §7 matter for
+the audit trail.
 
 ---
 
@@ -370,7 +411,12 @@ Filters: `router_id`, `actor`, `action`, `outcome`, `limit` (default 100, max 10
 Actions: `auth.login`, `auth.login_failed`, `auth.logout`, `auth.password`, `router.create`,
 `router.update`, `router.delete`, `router.rotate`, `router.script`, `router.exchange`,
 `luci.open`, `console.start`, `console.open`, `console.close`, `console.terminate_cmd_failed`,
-`user.create`, `user.update`, `user.delete`.
+`user.create`, `user.update`, `user.delete`, `settings.agent_endpoint.save`,
+`settings.agent_endpoint.reset`, `settings.agent_endpoint.test`.
+
+`settings.agent_endpoint.test` is written with `outcome: "error"` when the probe failed even
+though the request itself was allowed (the same convention `console.start` uses when the SSH
+dial fails): the row records what the panel found, not whether it was permitted to look.
 
 `luci.open` is throttled to at most one row per (user, router, minute) so a LuCI page with 40
 subresources does not create 40 rows.
@@ -390,6 +436,127 @@ The last active admin cannot be deleted or demoted (`409 last_admin`).
 
 ---
 
+## Settings *(admin only, CSRF)*
+
+One thing is editable from the panel: the **agent endpoint**, i.e. the scheme, host and port a
+router dials. It is deliberately not the same value as `TUNNELGATE_PANEL_URL`.
+
+| Value | Answers | Used by |
+|---|---|---|
+| `panel_url` (`TUNNELGATE_PANEL_URL`) | where the panel listens for **its own** proxy - the `proxy_pass` target, usually `http://127.0.0.1:8080` | the nginx/Caddy route renderer, login redirects |
+| agent endpoint | where a **router** dials the panel - `https://panel.example.com` | install command, script body, bootstrap exchange `heartbeat_url`, heartbeat `desired.heartbeat_url` |
+
+On a flat install they are the same string and nothing needs to be set. They must differ as soon
+as a TLS terminator, a cloud load balancer or a non-default port sits in front of the panel: the
+panel still binds loopback, while routers dial the public address. Pointing `panel_url` at the
+public name to fix that would break the panel's own routing, which is why the override lives in
+the database and not in the env file.
+
+Source is reported honestly in every response: `environment` (from `TUNNELGATE_PANEL_URL`) or
+`database` (the admin stored an override).
+
+### `GET /api/v1/settings/agent-endpoint`
+
+→ `200`
+
+```json
+{
+  "agent_url": "https://panel.example.com",
+  "agent_endpoint": {"scheme": "https", "host": "panel.example.com", "port": null,
+                     "source": "environment"}
+}
+```
+
+`port: null` means "the scheme default" (80/443); a port equal to that default is normalised
+away, so `https` + `443` and `https` + `null` produce the same `agent_url`. IPv6 hosts are
+stored unbracketed and rendered bracketed.
+
+→ `409 agent_endpoint_unusable` when `TUNNELGATE_PANEL_URL` cannot be parsed as an http(s) URL
+and no override is stored. Nothing is broken in that state - installs and heartbeats fall back to
+the raw string - but the panel cannot tell an operator what routers are dialling, so the fix is
+to `PUT` an endpoint.
+
+`403` for `viewer` and `operator`. The endpoint itself is public information (routers resolve
+it), but the panel's own reachability details are not something every account needs.
+
+### `PUT /api/v1/settings/agent-endpoint`
+
+```json
+{"scheme": "https", "host": "panel.example.com", "port": 8443}
+```
+
+`scheme` is `http` or `https`; `host` is a hostname, an IPv4 literal or an IPv6 literal (bare or
+bracketed) and must not carry a scheme, a port, a path, credentials or separators; `port` is
+optional. → `200` with the same envelope as `GET`, `source` now `database`.
+
+Field-level validation failures are a `422` in the standard envelope, with one entry per bad
+field so the SPA can highlight it:
+
+```json
+{"error": {"code": "validation_error", "message": "That endpoint is not usable",
+  "details": {"fields": [
+    {"loc": ["body", "host"], "msg": "Host must not contain spaces, paths, credentials or separators"},
+    {"loc": ["body", "port"], "msg": "Port must be between 1 and 65535"}]}}}
+```
+
+Nothing is written when validation fails. A stored value is re-validated on every read: a row
+that an older version wrote and that no longer parses is ignored with a log line and the
+environment value applies again, so a bad row can never produce a URL that routers cannot parse.
+
+Effect is immediate and needs no restart. The next `POST /api/v1/routers`, rotate-key and
+`GET .../script` render the install command from the new value; the next bootstrap exchange hands
+out the new `heartbeat_url`; the next heartbeat tells every already-installed router to move.
+See `docs/INSTALL_SERVER.md`, "Moving the panel without re-installing routers".
+
+Audit: `settings.agent_endpoint.save`, `detail.agent_url`.
+
+### `DELETE /api/v1/settings/agent-endpoint`
+
+Drops the override so `TUNNELGATE_PANEL_URL` applies again. → `200` with the now-effective
+envelope (`source: environment`). **Idempotent**: deleting when nothing is stored is not an
+error, it reports what is in effect. `409` if the override came out and the environment value is
+still unusable - that combination is worth seeing rather than hiding.
+
+Audit: `settings.agent_endpoint.reset`, `detail: {removed: bool, agent_url: ...}`.
+
+### `POST /api/v1/settings/agent-endpoint/test`
+
+Probes a **candidate** endpoint from the panel and reports what came back. Body is the same
+`{scheme, host, port}`; it is validated exactly like `PUT` and validated **before** anything is
+sent.
+
+→ `200`
+
+```json
+{"ok": true, "checked_url": "https://panel.example.com/api/v1/health",
+ "status_code": 200, "latency_ms": 41, "error": null}
+```
+
+A failure is still `200` with `ok: false` and a reason in `error` - "connection refused" is an
+answer, not a server error:
+
+```json
+{"ok": false, "checked_url": "https://panel.example.com/api/v1/health",
+ "status_code": null, "latency_ms": null, "error": "ConnectError: [Errno -2] Name or service not known"}
+```
+
+`error` is one of three shapes: `"<ExceptionType>: <message>"` (DNS, TCP, TLS - truncated to 300
+characters), `"HTTP <status> from <url>"` (something answered, not with a 200), or `"Reached
+something, but it is not a TunnelGate panel (no health payload)"` (200 but no
+`{"status": "ok"}` body - a captive portal, a proxy error page). `ok: true` requires **both**
+HTTP 200 and a JSON body whose `status` is `ok`.
+
+The probe is exactly one unauthenticated `GET <url>/api/v1/health` with redirects **not**
+followed and a 5 s timeout. It never persists the candidate: after a successful test the
+effective endpoint is unchanged.
+
+This is the only reliable way to tell "the router will reach this address" apart from "my
+browser can" - the panel's network position is the one that matters. It is admin-only because it
+makes the panel issue an outbound request to an operator-chosen address, and every attempt is
+audited (`settings.agent_endpoint.test`, `detail: {checked_url, error}`).
+
+---
+
 ## Meta
 
 ### `GET /api/v1/health` (no auth)
@@ -401,10 +568,27 @@ The last active admin cannot be deleted or demoted (`409 last_admin`).
 ### `GET /api/v1/config`
 
 ```json
-{"panel_url": "https://panel.example.com", "subdomain_suffix": "panel.example.com",
+{"panel_url": "http://127.0.0.1:8080", "subdomain_suffix": "panel.example.com",
  "bootstrap_ttl_minutes": 15, "poll_interval_seconds": 2, "proxy_driver": "nginx",
- "version": "1.0.0"}
+ "version": "1.0.0",
+ "agent_url": "https://panel.example.com",
+ "agent_endpoint": {"scheme": "https", "host": "panel.example.com", "port": null,
+                    "source": "environment"},
+ "agent_endpoint_testable": true}
 ```
+
+The two URLs answer different questions and are deliberately not the same field:
+
+| Field | Meaning |
+|---|---|
+| `panel_url` | where the panel listens for **its own** reverse proxy (`proxy_pass` target). Loopback in the shipped layout. |
+| `agent_url` | the base URL a **router** dials - what the installer, bootstrap exchange and heartbeat use. |
+| `agent_endpoint` | the parsed form of `agent_url` plus its `source` (`environment` or `database`). `null` when `TUNNELGATE_PANEL_URL` is unparseable and no override is stored. |
+| `agent_endpoint_testable` | `false` exactly when `agent_endpoint` is `null` - there is nothing well-formed to probe. |
+
+`agent_url` is always populated: it falls back to the raw `TUNNELGATE_PANEL_URL` string even when
+that string does not parse, so the SPA can show an operator what routers are being told. Setting
+the override is `PUT /api/v1/settings/agent-endpoint` (see [Settings](#settings-admin-only-csrf)).
 
 ### `GET /api/v1/stats`
 

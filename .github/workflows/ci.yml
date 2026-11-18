@@ -94,18 +94,48 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # docker-compose.yml reads /etc/tunnelgate.env (env_file:), which does not exist on a
+      # fresh runner. Materialise it from the shipped example first: without this the very
+      # first compose command fails with "env file /etc/tunnelgate.env not found" and the
+      # job reports a broken compose file that is actually fine.
+      - name: materialise /etc/tunnelgate.env
+        run: |
+          test -f deploy/env/tunnelgate.env.example
+          sudo install -m 0600 -o "$(id -u)" -g "$(id -g)" \
+            deploy/env/tunnelgate.env.example /etc/tunnelgate.env
+          # Sanity-check that the example still carries the two secrets compose needs, so a
+          # broken example fails here rather than as a confusing interpolation error.
+          grep -q '^TUNNELGATE_SECRET_KEY=' /etc/tunnelgate.env
+          grep -q '^TUNNELGATE_DB_URL=' /etc/tunnelgate.env
+
       - name: docker compose config
         run: |
           if [ -f docker-compose.yml ]; then
             docker compose -f docker-compose.yml config >/dev/null && echo "compose ok"
           fi
 
+      # The shipped tunnelgate.conf include()s /etc/nginx/tunnelgate/routes.conf (written by
+      # the panel at runtime) and points at a Let's Encrypt certificate path. Neither exists
+      # in CI, so nginx -t fails for reasons that say nothing about the config's syntax.
+      # Stub both: a throwaway self-signed cert and an empty route include.
       - name: nginx config syntax (containerised)
         run: |
-          if [ -d deploy/nginx ]; then
-            docker run --rm -v "$PWD/deploy/nginx:/etc/nginx/conf.d:ro" nginx:1.27-alpine nginx -t \
-              || echo "::warning::nginx syntax check needs the full site file; see deploy/nginx/README.md"
+          if [ ! -f deploy/nginx/tunnelgate.conf ]; then
+            echo "no site config shipped; nothing to check"; exit 0
           fi
+          stub=$(mktemp -d)
+          mkdir -p "$stub/tunnelgate" "$stub/letsencrypt/live/panel.example.com"
+          : > "$stub/tunnelgate/routes.conf"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -subj "/CN=panel.example.com" \
+            -keyout "$stub/letsencrypt/live/panel.example.com/privkey.pem" \
+            -out   "$stub/letsencrypt/live/panel.example.com/fullchain.pem" 2>/dev/null
+          docker run --rm \
+            -v "$PWD/deploy/nginx/tunnelgate.conf:/etc/nginx/conf.d/tunnelgate.conf:ro" \
+            -v "$stub/tunnelgate:/etc/nginx/tunnelgate" \
+            -v "$stub/letsencrypt:/etc/letsencrypt:ro" \
+            nginx:1.27-alpine nginx -t
+          rm -rf "$stub"
 
       - name: systemd unit sanity
         run: |

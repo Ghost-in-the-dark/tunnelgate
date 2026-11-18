@@ -321,6 +321,51 @@ class ConsoleSessionListOut(BaseModel):
     total: int
 
 
+class AgentEndpointOut(BaseModel):
+    """Where routers are told to dial, and whether that came from the env file or the UI."""
+
+    scheme: Literal["http", "https"]
+    host: str
+    # None means "the scheme default" (80/443), which is also what the SPA renders when the
+    # operator leaves the port box empty.
+    port: int | None = None
+    source: Literal["environment", "database"]
+
+
+class AgentEndpointIn(BaseModel):
+    """PUT body. Validation lives in app/services/agent_endpoint.py so the 422 can carry the
+    per-field messages the SPA maps onto its inputs."""
+
+    scheme: str
+    host: str
+    port: int | None = None
+
+
+class AgentEndpointOutEnvelope(BaseModel):
+    """What a save or reset returns: the effective URL plus the row behind it."""
+
+    agent_url: str
+    agent_endpoint: AgentEndpointOut
+
+
+class AgentEndpointTestIn(BaseModel):
+    """POST body for the probe: a candidate that is validated but never stored."""
+
+    scheme: str
+    host: str
+    port: int | None = None
+
+
+class AgentEndpointTestOut(BaseModel):
+    """Result of the "Test connection" button. Nothing is persisted by a test."""
+
+    ok: bool
+    checked_url: str
+    status_code: int | None = None
+    latency_ms: int | None = None
+    error: str | None = None
+
+
 class ConfigOut(BaseModel):
     panel_url: str
     subdomain_suffix: str
@@ -328,6 +373,12 @@ class ConfigOut(BaseModel):
     poll_interval_seconds: int
     proxy_driver: str
     version: str
+    # The agent-facing URL is separate from panel_url on purpose: panel_url is the panel's own
+    # internal address (what nginx proxy_passes to), while agent_url is what a router dials.
+    agent_url: str = ""
+    agent_endpoint: AgentEndpointOut | None = None
+    # False when the effective endpoint cannot be probed from the panel (no hostname at all).
+    agent_endpoint_testable: bool = True
 
 
 class StatsOut(BaseModel):

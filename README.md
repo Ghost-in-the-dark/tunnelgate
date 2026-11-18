@@ -29,6 +29,13 @@ router side; the panel dials **in** through the console listener for its shell.
   SSH client that travels down the same reverse tunnel).
 * Roles (`admin`/`operator`/`viewer`), per-request CSRF, login throttling and an append-only audit
   of every access and mutation.
+* An admin-editable **agent endpoint** (Settings → Panel): the protocol, host and port routers dial
+  can be changed from the UI, so moving the panel behind a new name needs no re-install - new
+  install commands use it immediately and already-installed routers are re-pointed over the
+  heartbeat.
+* Runs **behind a reverse proxy or load balancer** with a real trust boundary: `X-Forwarded-For`
+  is only believed from `TUNNELGATE_TRUSTED_PROXIES` and read from the right, so rate limits and
+  audit addresses cannot be forged by a header.
 * nginx **or** Caddy as the proxy driver, SQLite **or** PostgreSQL, Docker Compose **or** systemd.
 
 ## Quick start (development)
@@ -141,6 +148,9 @@ docs/                 the documents above
 * **TLS, DNS and a wildcard certificate are prerequisites**, not built in; the panel assumes it is
   reached over HTTPS and sets `Secure` cookies accordingly.
 * LuCI keeps its own users; TunnelGate does not manage them.
+* **The trust boundary is a setting, not a guess.** Behind a proxy, forwarded headers are believed
+  only from `TUNNELGATE_TRUSTED_PROXIES` (default `127.0.0.1,::1`); `TUNNELGATE_FORWARDED_ALLOW_HOPS`
+  says how many proxies of your own are in the path. Leave both alone for a direct-to-nginx setup.
 
 ## Known limitations (not implemented, on purpose or by scope)
 

@@ -17,6 +17,7 @@ from typing import Annotated
 from fastapi import APIRouter, Request, Response
 from sqlalchemy import select
 
+from .. import forwarded
 from ..config import get_settings, utcnow
 from ..deps import CsrfGuard, CurrentSession, CurrentUser, DbSession, SettingsDep, client_ip
 from ..errors import ApiError
@@ -35,6 +36,12 @@ from ..services.audit import record as audit_record
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+# A throwaway scrypt hash, generated once at import, used only to keep the failed-login path
+# flat. Returning early on "no such user" would skip a full scrypt (~85 ms) while an existing
+# account with a wrong password pays for one, so the response time itself says whether the
+# username exists. Verifying against this dummy costs exactly the same.
+DUMMY_PASSWORD_HASH = hash_password(new_token())
 
 # Per-ip and per-ip+username, both sliding windows. The limits come from settings at call time
 # so an operator can tighten them without a code change; the object is rebuilt only when the
@@ -55,7 +62,20 @@ def _limiter(settings) -> RateLimiter:
     return LOGIN_LIMITER
 
 
-def _set_cookie(response: Response, token: str, settings) -> None:
+def _cookie_secure(request: Request, settings) -> bool:
+    """Whether the session cookie carries Secure.
+
+    TUNNELGATE_COOKIE_SECURE=true forces it on. It is also set when the request itself arrived
+    over HTTPS from a trusted TLS terminator, because a panel published as https://... and
+    issuing a non-Secure session cookie is a downgrade the operator did not ask for - and one
+    they cannot see. False is only ever returned for a request that is genuinely plain HTTP.
+    """
+    if bool(settings.cookie_secure):
+        return True
+    return forwarded.request_scheme(request, settings) == "https"
+
+
+def _set_cookie(response: Response, token: str, settings, request: Request) -> None:
     max_age = int(settings.session_ttl_minutes) * 60
     response.set_cookie(
         settings.cookie_name,
@@ -63,7 +83,7 @@ def _set_cookie(response: Response, token: str, settings) -> None:
         max_age=max_age,
         httponly=True,
         samesite="lax",
-        secure=bool(settings.cookie_secure),
+        secure=_cookie_secure(request, settings),
         path="/",
         domain=settings.cookie_domain or None,
     )
@@ -125,7 +145,11 @@ async def login(
         )
 
     user = db.execute(select(User).where(User.username == payload.username)).scalar_one_or_none()
-    if user is None or not verify_password(payload.password, user.password_hash):
+    # Always run a full scrypt verification, even when there is no row to check against: the
+    # cost must not depend on whether the username exists, or the timing is an oracle.
+    candidate_hash = (user.password_hash if user is not None else None) or DUMMY_PASSWORD_HASH
+    password_ok = verify_password(payload.password, candidate_hash)
+    if user is None or not password_ok:
         # One code for "no such user" and "wrong password": the response must not be an
         # account-existence oracle. The audit row still records which username was tried.
         limiter.hit(*keys)
@@ -160,7 +184,7 @@ async def login(
     user.last_login_at = utcnow()
     audit_record(db, "auth.login", actor=user, ip=ip, user_agent=request.headers.get("user-agent"))
     db.commit()
-    _set_cookie(response, plaintext, settings)
+    _set_cookie(response, plaintext, settings, request)
     return SessionOut(
         user=UserOut.model_validate(user),
         csrf_token=session.csrf_token,

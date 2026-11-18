@@ -146,6 +146,29 @@ def test_render_nginx_proxies_the_tunnel_port_with_websocket_upgrade(db, setting
     assert "proxy_buffering         off;" in block
 
 
+def test_render_nginx_strips_the_panel_cookie_before_the_router(db, settings, edge):
+    """The session cookie must never reach a router's LuCI.
+
+    A router is a lower-trust device: whoever owns one - or reads one router's request log -
+    would otherwise hold a live panel session for the operator who opened it.
+    """
+    block = _block(render_nginx(load_routes(db), settings), "edge-one.panel.test")
+    assert 'proxy_set_header Cookie "";' in block
+
+
+def test_render_caddy_route_deletes_the_cookie_before_the_router(db, settings, edge):
+    """Same guarantee as the nginx renderer, in Caddy's expanded JSON form.
+
+    handle[0] is the auth subrequest (which must keep the cookie: it is how the panel
+    identifies the operator), handle[1] is the router upstream (which must not see it).
+    """
+    route = render_caddy_route(load_routes(db)[0], settings)
+    auth_headers = route["handle"][0]["headers"]["request"]
+    router_headers = route["handle"][1]["headers"]["request"]
+    assert "delete" not in auth_headers
+    assert router_headers["delete"] == ["Cookie"]
+
+
 def test_render_nginx_keeps_the_body_limit_for_luci_uploads(db, settings, edge):
     block = _block(render_nginx(load_routes(db), settings), "edge-one.panel.test")
     assert "client_max_body_size 64m;" in block

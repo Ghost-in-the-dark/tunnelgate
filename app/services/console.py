@@ -54,6 +54,7 @@ from paramiko import (
 from ..config import Settings, get_settings
 from ..models import STATUS_ONLINE, STATUS_REVOKED, Router
 from ..security import decrypt_secret, hash_token, key_fingerprint
+from .keys import console_remote_user
 
 log = logging.getLogger("tunnelgate.console")
 
@@ -341,16 +342,20 @@ SESSIONS = ConsoleSessionRegistry()
 
 # --------------------------------------------------------------------------- ssh
 def console_ssh_user(router: Router) -> str:
-    """The login the installer created for the console, without hardcoding one.
+    """The login the panel uses on the router: exactly the account the key was installed for.
 
-    api-core falls back to root when it cannot create a dedicated account, so the router row is
-    the only source of truth here.
+    This MUST agree with the account named in the console key registration
+    (app.services.keys.console_remote_user), because that is who the panel told the installer
+    and the heartbeat to authorise. Reading Router.ssh_user here - as an earlier revision did -
+    silently breaks every real router: Router.ssh_user is the panel-side TUNNEL login
+    ("tunnelgate"), an account that does not exist on OpenWrt at all, so the dial failed with
+    "Authentication failed" while console_state() still reported "ready".
+
+    A future per-router console account needs a dedicated column that the registration honours
+    too; until then there is exactly one source of truth and this function returns it.
     """
-    for attr in ("ssh_user_console", "ssh_user"):
-        value = getattr(router, attr, None)
-        if value and str(value).strip():
-            return str(value).strip()
-    return "root"
+    del router  # kept in the signature so callers need no change
+    return console_remote_user()
 
 
 def _fingerprint_of_key(key: Any) -> str:

@@ -42,7 +42,23 @@ class Settings(BaseSettings):
     cookie_secure: bool = False
     session_ttl_minutes: int = 720
     csrf_header: str = "X-CSRF-Token"
+    # Reverse-proxy support. The panel is usually published by nginx, Caddy, Traefik or a cloud
+    # load balancer, so the socket peer is the proxy and the client address arrives in
+    # X-Forwarded-For. Those headers are attacker-controlled unless the peer is one of ours,
+    # which is why the list below is the whole trust boundary: everything else falls back to
+    # the socket peer. Keeping the loopback defaults means "behind a proxy on this host works
+    # out of the box, a proxy anywhere else must be named".
     trust_proxy_headers: bool = True
+    trusted_proxies: list[str] = Field(default_factory=lambda: ["127.0.0.1", "::1"])
+    # How many proxy hops of our own sit in front of the panel. 1 = one proxy appending XFF
+    # (nginx/Caddy default). Set 2 for e.g. Cloudflare -> nginx, so the client address is read
+    # one entry further from the right. Higher values move the answer left, never right.
+    forwarded_allow_hops: int = 1
+    # Believe "X-Forwarded-Proto: https" from a trusted peer, so a panel published behind a TLS
+    # terminator marks its session cookie Secure without the operator also setting
+    # TUNNELGATE_COOKIE_SECURE. Off means the scheme is whatever uvicorn saw. Never believed
+    # from an untrusted peer, so a client cannot upgrade its own request.
+    trust_forwarded_proto: bool = True
     login_rate_limit: int = 10
     login_rate_window_seconds: int = 900
     admin_username: str = "admin"
@@ -86,16 +102,33 @@ class Settings(BaseSettings):
     console_max_sessions_per_user: int = 3
     console_max_session_seconds: int = 7200
     console_term: str = "xterm-256color"
+    # The account the panel logs in as on the router. "root" is the dropbear default and the
+    # only account guaranteed to exist on OpenWrt; docs/SECURITY.md explains how to create a
+    # dedicated user and point this at it. Changing it makes the panel re-issue console keys,
+    # because the key registration tells the installer which account to authorise.
+    console_ssh_user: str = "root"
     console_connect_timeout_seconds: float = 10.0
     secret_key: str | None = None
 
     # ------------------------------------------------------------------ frontend
     static_dir: Path | None = None
+    # Swagger UI and the OpenAPI document are development aids: an unauthenticated /api/docs
+    # advertises every route and every schema to anyone who can reach the panel. None means
+    # "on unless TUNNELGATE_ENV=production", which keeps the dev experience and closes the
+    # hole in the default production deployment.
+    docs_enabled: bool | None = None
 
     # ------------------------------------------------------------------ derived
     @property
     def is_sqlite(self) -> bool:
         return self.db_url.startswith("sqlite")
+
+    @property
+    def docs_visible(self) -> bool:
+        """Whether /api/docs and /api/openapi.json are served (secure by default)."""
+        if self.docs_enabled is not None:
+            return bool(self.docs_enabled)
+        return (self.env or "").strip().lower() not in ("prod", "production")
 
     @property
     def host_suffix(self) -> str:

@@ -80,6 +80,22 @@ vhost disappears. The router keeps retrying and gets `Permission denied` forever
 **always run the uninstaller on the router** (`/etc/init.d/tunnelgate stop; tunnelgate-uninstall`)
 - or, if you no longer have access, accept the retry noise on the router's log.
 
+### Move the panel to a new address
+
+Changing `TUNNELGATE_PANEL_URL` alone moves nothing that is already deployed: it is the panel's
+*internal* address. Routers dial the **agent endpoint**, which defaults to it but is stored in
+the database and is editable from **Settings → Agent endpoint**.
+
+1. Bring the new name up (DNS, certificate, proxy vhost) and press **Test** - the probe runs from
+   the panel, which is the only vantage point that predicts whether a router will reach it.
+2. Save. Every heartbeat (~60 s) carries the new `heartbeat_url` and each router rewrites its own
+   UCI config; installers issued afterwards carry it too.
+3. Watch `routers_online` until the fleet has converged before retiring the old name. A router
+   that is offline during the move cannot learn the new address - re-run the installer on it.
+
+No restart, no re-install, no SSH into a single router. `docs/INSTALL_SERVER.md` §7 has the
+curl form and the reasoning.
+
 ### Console sessions
 
 Admins can see live sessions and force-close them:
@@ -90,14 +106,16 @@ Admins can see live sessions and force-close them:
 
 | Symptom | Likely cause | Check | Fix |
 |---|---|---|---|
-| Wizard stuck on "Waiting for connection" | router never ran the script, or cannot reach the VPS on 22 | router: `logread | grep tunnelgate`; VPS: `journalctl -u ssh` | rerun the installer; check outbound SSH |
-| Wizard reaches "Connected" then "offline" | tunnel up but LuCI not answering | `ss -ltnp | grep <port>`; on the router `/etc/init.d/uhttpd status` | start/reconfigure `uhttpd` |
-| `502 Bad Gateway` on the router vhost | listener exists, nothing behind it (router rebooted) or the port is stale | `ss -ltnH | grep <port>` | restart the tunnel service on the router |
-| `403` from nginx on a router vhost | `/__tg/auth` denied: no session, or the router id in the vhost does not match | `journalctl -u tunnelgate | grep __tg`; `nginx -T | grep -A3 <slug>` | log in again; regenerate routes |
+| Wizard stuck on "Waiting for connection" | router never ran the script, or cannot reach the VPS on 22 | router: `logread \| grep tunnelgate`; VPS: `journalctl -u ssh` | rerun the installer; check outbound SSH |
+| Wizard reaches "Connected" then "offline" | tunnel up but LuCI not answering | `ss -ltnp \| grep <port>`; on the router `/etc/init.d/uhttpd status` | start/reconfigure `uhttpd` |
+| `502 Bad Gateway` on the router vhost | listener exists, nothing behind it (router rebooted) or the port is stale | `ss -ltnH \| grep <port>` | restart the tunnel service on the router |
+| `403` from nginx on a router vhost | `/__tg/auth` denied: no session, or the router id in the vhost does not match | `journalctl -u tunnelgate \| grep __tg`; `nginx -T \| grep -A3 <slug>` | log in again; regenerate routes |
 | Router vhost missing after adding a router | proxy sync failed (nginx config error) | `nginx -t`; `grep <slug> /etc/nginx/tunnelgate/routes.conf` | fix `nginx -t` output, then `systemctl reload tunnelgate` |
 | Console: "console_not_ready" | key created but the router has not picked it up (heartbeat not yet in), or the router is offline | panel `GET .../console` `state`; router heartbeat log | wait one heartbeat (60 s), or restart the tunnel service |
-| Console: "Connection refused" on start | `console_port` listener not present | `ss -ltnH | grep <console_port>` | the router's ssh has no console forward: reinstall |
+| Console: "Connection refused" on start | `console_port` listener not present | `ss -ltnH \| grep <console_port>` | the router's ssh has no console forward: reinstall |
 | Login always "rate_limited" | previous failures filled the window | `grep login_failed` in audit | wait `login_rate_window_seconds`, or clear the limiter by restarting the panel |
+| Everyone shares one rate-limit bucket, or the audit log shows the proxy's IP for every action | the panel does not trust the proxy, so the socket peer is the proxy | `TUNNELGATE_TRUSTED_PROXIES` and the unit's `--forwarded-allow-ips`; `journalctl -u tunnelgate \| grep -i trusted-proxy` | name the proxy in both - see `docs/INSTALL_SERVER.md` §7 |
+| `journalctl` shows the proxy address as the client, yet the audit log is right (or vice versa) | the two trust lists disagree: the app believes `TUNNELGATE_TRUSTED_PROXIES`, uvicorn believes `--forwarded-allow-ips` | the unit's `ExecStart` still says `--forwarded-allow-ips 127.0.0.1` while the proxy is elsewhere | widen `--forwarded-allow-ips` too, not just `TUNNELGATE_TRUSTED_PROXIES` - see `docs/INSTALL_SERVER.md` §7 |
 | `no_free_port` on create | pool exhausted (deleted routers leak) | `GET /api/v1/stats` `ports_free` | delete stale routers; `app.cli doctor` reports leaks |
 | Everything 500s after upgrade | schema drift (no migration engine) | `app.cli check-schema` | apply the printed `ALTER TABLE`s |
 
@@ -129,7 +147,7 @@ cp /var/lib/tunnelgate/.ssh/authorized_keys /var/backups/tg.keys
 Restore: stop the panel → copy DB + authorized_keys → start → `app.cli doctor` → check
 `/api/v1/stats`. Routers reconnect on their own; nothing needs to be touched on the router side.
 
-Upgrade: see `docs/INSTALL_SERVER.md` §8. There is no migration engine: model changes are
+Upgrade: see `docs/INSTALL_SERVER.md` §9. There is no migration engine: model changes are
 additive and `app.cli check-schema` prints the DDL you must apply by hand.
 
 ## 6. Scaling and capacity
@@ -150,6 +168,10 @@ additive and `app.cli check-schema` prints the DDL you must apply by hand.
   router you onboarded.
 * Review `console.open`/`console.close` rows: shells are the highest-value access this system
   grants.
+* Check the `ip` column occasionally against reality: if every row shows the same private
+  address, the proxy trust list is too narrow and the audit trail has lost its value (see
+  `docs/INSTALL_SERVER.md` §7). Review `settings.agent_endpoint.*` rows - an endpoint change is
+  the one control that can silently redirect every router in the fleet.
 * Rotate router keys after any operator leaves. Rotation is online and takes seconds per router
   (the command must be run on the router - do it during a maintenance window if you cannot
   automate it).

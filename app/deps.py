@@ -8,6 +8,7 @@ from fastapi import Depends, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from . import forwarded
 from .config import Settings, get_settings, utcnow
 from .db import get_db
 from .errors import ApiError
@@ -19,15 +20,13 @@ SettingsDep = Annotated[Settings, Depends(get_settings)]
 
 
 def client_ip(request: Request) -> str:
-    s = get_settings()
-    if s.trust_proxy_headers:
-        xff = request.headers.get("x-forwarded-for")
-        if xff:
-            return xff.split(",")[0].strip()
-        real = request.headers.get("x-real-ip")
-        if real:
-            return real.strip()
-    return request.client.host if request.client else "unknown"
+    """The client address, or the socket peer when no trusted proxy vouched for it.
+
+    The leftmost X-Forwarded-For entry is attacker-controlled: every proxy appends the address
+    it saw, so the honest value is "forwarded_allow_hops" entries from the RIGHT, and only when
+    the socket peer itself is a configured proxy. See app/forwarded.py for the full rule.
+    """
+    return forwarded.client_ip(request, get_settings())
 
 
 def get_session_optional(request: Request, db: DbSession) -> PanelSession | None:

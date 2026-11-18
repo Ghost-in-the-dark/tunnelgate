@@ -16,12 +16,14 @@ Everything after the handshake is raw bytes plus the JSON control frames documen
 from __future__ import annotations
 
 import contextlib
+import hmac
 import json
 import logging
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
 
+from .. import forwarded
 from ..config import get_settings, utcnow
 from ..db import session_scope
 from ..models import PanelSession, Router, User
@@ -71,17 +73,49 @@ async def _reject(websocket: WebSocket, close_code: int, code: str, message: str
         await websocket.close(code=close_code, reason=code)
 
 
+# Close code for "the ticket is real, but it is being redeemed from a different address".
+# Deliberately not CLOSE_FORBIDDEN (a role problem) and not CLOSE_INVALID_TICKET (the ticket
+# itself was fine), so a client can tell a stolen or replayed ticket apart from the others.
+CLOSE_TICKET_FOREIGN_IP = 4003
+
+# Placeholder when the peer address cannot be resolved to an IP at all.
+UNKNOWN_IP = "unknown"
+
+
 def _client_ip(websocket: WebSocket) -> str:
-    settings = get_settings()
-    if settings.trust_proxy_headers:
-        xff = websocket.headers.get("x-forwarded-for")
-        if xff:
-            return xff.split(",")[0].strip()
-        real = websocket.headers.get("x-real-ip")
-        if real:
-            return real.strip()
-    client = websocket.client
-    return client.host if client else "unknown"
+    """The address this socket is coming from, for ticket binding.
+
+    Delegated to app.forwarded so the console pins tickets against exactly the same notion of
+    client address the REST API writes into audit rows and rate-limit buckets: if the two
+    drifted apart, a ticket issued behind a proxy would never match the socket redeeming it.
+
+    forwarded answers "unknown" when the peer is not an IP at all, which really only happens for
+    a unix socket or a test transport. Falling back to the literal peer keeps the binding tight
+    there too, instead of silently disabling the check for anyone who can arrange a non-IP peer.
+    """
+    address = forwarded.client_ip(websocket, get_settings())
+    if address == UNKNOWN_IP:
+        peer = websocket.client.host if websocket.client else None
+        if peer:
+            return str(peer)
+    return address
+
+
+def _ticket_ip_matches(ticket_ip: str, peer_ip: str) -> bool:
+    """Whether a ticket minted from one address may be redeemed from another.
+
+    An empty or unroutable side is not pinned. "unknown" means the server genuinely cannot see
+    the peer (a unix socket, a test transport, a stripped client scope) - refusing those would
+    break the console without protecting anything, because an attacker who can make the server
+    forget its own peer address is already past this check.
+    """
+    ticket_ip = forwarded.normalize_ip(ticket_ip) or (ticket_ip or "")
+    peer_ip = forwarded.normalize_ip(peer_ip) or (peer_ip or "")
+    if not ticket_ip or ticket_ip == UNKNOWN_IP:
+        return True
+    if not peer_ip or peer_ip == UNKNOWN_IP:
+        return True
+    return hmac.compare_digest(ticket_ip, peer_ip)
 
 
 @router.websocket("/routers/{router_id}/console/ws")
@@ -137,6 +171,26 @@ async def console_websocket(
         )
         return
 
+    # docs/API.md promised the ticket is bound to the client ip; without this check the promise
+    # was fiction, and a leaked ws_path in a log or a Referer was replayable from anywhere for
+    # the ticket's whole TTL. The ticket is already consumed at this point, so a refusal burns
+    # it: an attacker holding a stolen ticket gets exactly one attempt, and it fails.
+    peer_ip = _client_ip(websocket)
+    if not _ticket_ip_matches(granted.client_ip, peer_ip):
+        log.warning(
+            "console ticket for router %s redeemed from %s, issued to %s",
+            router_id,
+            peer_ip,
+            granted.client_ip,
+        )
+        await _reject(
+            websocket,
+            CLOSE_TICKET_FOREIGN_IP,
+            "ticket_foreign_ip",
+            "This console ticket was issued to a different client address",
+        )
+        return
+
     item = _load_router(router_id)
     if item is None:
         await _reject(
@@ -167,7 +221,7 @@ async def console_websocket(
         websocket,
         router=item,
         user=user,
-        client_ip=_client_ip(websocket),
+        client_ip=peer_ip,
         user_agent=websocket.headers.get("user-agent"),
         settings=settings,
     )

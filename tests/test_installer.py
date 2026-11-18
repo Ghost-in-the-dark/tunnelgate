@@ -138,10 +138,17 @@ _INVALID_TOKEN = (
 class MockPanel:
     """The panel's two router-facing endpoints, with single-use bootstrap semantics."""
 
-    def __init__(self, response: dict, token: str, console: dict | None = None):
+    def __init__(
+        self,
+        response: dict,
+        token: str,
+        console: dict | None = None,
+        desired: dict | None = None,
+    ):
         self.response = response
         self.token = token
         self.console = console
+        self.desired = desired
         self.calls: list = []
         self.token_used = False
         self.port = free_port()
@@ -185,6 +192,8 @@ class MockPanel:
                     out = {"ok": True, "status": "active", "server_time": "2026-01-01T00:00:00Z"}
                     if panel.console is not None:
                         out["console"] = panel.console
+                    if panel.desired is not None:
+                        out["desired"] = panel.desired
                     self._reply(200, json.dumps(out).encode())
                     return
                 self._reply(404, b"{}")
@@ -904,3 +913,34 @@ def test_heartbeat_installs_the_console_key(installed) -> None:
     # same serial again: a no-op, not a second copy of the key
     run(["dash", str(tmp / "usr/bin/tunnelgate-heartbeat")], env=env)
     assert keys.read_text().count("tunnelgate-console") == 1
+
+
+@needs_sshd
+@pytest.mark.e2e
+@pytest.mark.skipif(not shutil.which("dash"), reason="needs dash")
+def test_heartbeat_adopts_a_moved_panel(installed) -> None:
+    """The panel can move; an installed router must follow it without a re-install.
+
+    The address arrives in the heartbeat response's "desired" payload, and adopting it is what
+    keeps a fleet alive across a panel hostname or port change.
+    """
+    panel = installed["panel"]
+    tmp, env = installed["tmp"], installed["env"]
+    config = tmp / "etc/config/tunnelgate"
+
+    moved = "http://moved.example.com:8443/api/v1/routers/r-test001/heartbeat"
+    panel.desired = {"heartbeat_url": moved}
+
+    result = run(["dash", str(tmp / "usr/bin/tunnelgate-heartbeat")], env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert uci_options(config)["heartbeat_url"] == moved
+
+    # A non-http(s) value is ignored rather than written: the response is untrusted input.
+    panel.desired = {"heartbeat_url": "ftp://attacker.example.com/x"}
+    run(["dash", str(tmp / "usr/bin/tunnelgate-heartbeat")], env=env)
+    assert uci_options(config)["heartbeat_url"] == moved
+
+    # An empty desired payload leaves the stored value alone.
+    panel.desired = {}
+    run(["dash", str(tmp / "usr/bin/tunnelgate-heartbeat")], env=env)
+    assert uci_options(config)["heartbeat_url"] == moved

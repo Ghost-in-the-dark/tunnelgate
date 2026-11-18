@@ -62,6 +62,16 @@ server {
         auth_request /__tg/auth;
         error_page 401 = @tg_login;
 
+        # The panel session cookie must NEVER leave the panel origin. Without this line
+        # the browser's Cookie header is forwarded verbatim to 127.0.0.1:<tunnel_port>,
+        # i.e. into the router's LuCI. Anyone who owns a single router - or reads one
+        # router's request log - would then hold a live tg_session for the operator who
+        # opened that router, which is full panel access, not just that router. An empty
+        # value tells nginx to drop the header instead of passing it through.
+        # If a future LuCI needs a cookie of its own, re-add it EXPLICITLY here from a
+        # dedicated variable - never by removing this line.
+        proxy_set_header Cookie "";
+
         proxy_pass http://<bind>:<tunnel_port>;
         proxy_http_version 1.1;
 

@@ -161,7 +161,14 @@ def _make_router(settings, **kw) -> Router:
     return item
 
 
-def _ticket(router: Router, user: User, ip: str = "10.0.0.5") -> str:
+# The Starlette TestClient dials in from the literal peer "testclient" (see
+# starlette/testclient.py: scope client is ("testclient", 50000)). Tickets are bound to the
+# client ip, so the helper must mint them for the address the socket will actually use;
+# tests that care about a mismatch pass their own ip.
+TESTCLIENT_PEER = "testclient"
+
+
+def _ticket(router: Router, user: User, ip: str = TESTCLIENT_PEER) -> str:
     return console_service.TICKETS.issue(router.id, user.id, ip)
 
 
@@ -528,3 +535,113 @@ def test_handler_release_on_disconnect(client, settings, fake_connection):
         time.sleep(0.02)
     assert console_service.SESSIONS.count_for_router(item.id) == 0
     assert fake_connection[0].closed is True
+
+
+class _FakeRequest:
+    """Minimal stand-in for an ASGI connection with a chosen peer and headers."""
+
+    def __init__(self, client_ip: str, xff: str | None = None):
+        self.client = type("C", (), {"host": client_ip})()
+        self.headers = {} if xff is None else {"x-forwarded-for": xff}
+
+
+# --------------------------------------------------------------------------- ticket ip binding (F8-a)
+def test_ticket_from_another_address_is_refused(client, settings, fake_connection):
+    """docs/API.md promises the ticket is bound to (router, user, client ip); enforce it.
+
+    A ws_path leaks easily - server logs, a Referer, a screenshot - and until this check it was
+    replayable from anywhere for its whole TTL. The ticket is consumed before the comparison, so
+    a stolen one buys exactly one failing attempt.
+    """
+    _c, user, _s = _login(client, settings)
+    item = _make_router(settings)
+    ticket = _ticket(item, user, ip="203.0.113.7")
+
+    from app.api import console_ws as console_api
+
+    frame, code = _expect_refusal(client, _ws_url(item, ticket))
+    assert frame["code"] == "ticket_foreign_ip"
+    assert code == console_api.CLOSE_TICKET_FOREIGN_IP
+    assert code != bridge_service.CLOSE_FORBIDDEN
+
+
+def test_refused_foreign_ticket_is_still_consumed(client, settings, fake_connection):
+    """One attempt only: the refusal must not leave the ticket replayable."""
+    _c, user, _s = _login(client, settings)
+    item = _make_router(settings)
+    ticket = _ticket(item, user, ip="203.0.113.7")
+
+    _expect_refusal(client, _ws_url(item, ticket))
+    # Same url, same address as the ticket now: it must not resolve any more.
+    with session_scope():
+        assert console_service.TICKETS.consume(ticket) is None
+
+
+def test_ticket_bound_to_the_real_peer_opens_the_console(client, settings, fake_connection):
+    """The matching case must still connect, or the check would break the console."""
+    _c, user, _s = _login(client, settings)
+    item = _make_router(settings)
+    ticket = _ticket(item, user)
+
+    with client.websocket_connect(_ws_url(item, ticket)) as ws:
+        greeting = ws.receive_json()
+        assert greeting["type"] == "status", greeting
+        assert greeting["state"] == "ready", greeting
+        ws.send_json({"type": "close"})
+
+
+def test_ticket_without_a_bound_address_is_not_pinned(client, settings, fake_connection):
+    """An empty stored ip means "unknown", which must not be treated as a mismatch."""
+    _c, user, _s = _login(client, settings)
+    item = _make_router(settings)
+    ticket = _ticket(item, user, ip="")
+
+    with client.websocket_connect(_ws_url(item, ticket)) as ws:
+        greeting = ws.receive_json()
+        assert greeting["type"] == "status", greeting
+        assert greeting["state"] == "ready", greeting
+        ws.send_json({"type": "close"})
+
+
+def test_ipv4_mapped_ticket_address_still_matches(client, settings, fake_connection):
+    """::ffff:127.0.0.1 and 127.0.0.1 are the same peer; normalization must not split them."""
+    from app import forwarded
+    from app.api import console_ws as console_api
+
+    assert forwarded.normalize_ip("::ffff:127.0.0.1") == "127.0.0.1"
+    assert console_api._ticket_ip_matches("::ffff:10.0.0.9", "10.0.0.9") is True
+    assert console_api._ticket_ip_matches("10.0.0.9", "10.0.0.10") is False
+    assert console_api._ticket_ip_matches("", "10.0.0.9") is True
+    assert console_api._ticket_ip_matches("unknown", "10.0.0.9") is True
+
+
+def test_forwarded_header_from_an_untrusted_peer_is_ignored(client, settings):
+    """F1 in the console path: a spoofed X-Forwarded-For must not move the bound address."""
+    from app import forwarded
+
+    # An arbitrary peer is not one of our proxies, so whatever it claims is its own assertion.
+    assert forwarded.is_trusted_proxy("203.0.113.50", settings) is False
+    assert (
+        forwarded.client_ip(_FakeRequest(client_ip="203.0.113.50", xff="1.2.3.4"), settings)
+        == "203.0.113.50"
+    )
+
+    # A trusted peer IS believed, and the client is the hop our own proxy appended: rightmost.
+    spoofed = _FakeRequest(client_ip="127.0.0.1", xff="1.2.3.4, 198.51.100.9")
+    assert forwarded.client_ip(spoofed, settings) == "198.51.100.9"
+
+    # Rotating the attacker-supplied leftmost entries changes nothing.
+    rotated = _FakeRequest(client_ip="127.0.0.1", xff="9.9.9.9, 198.51.100.9")
+    assert forwarded.client_ip(rotated, settings) == "198.51.100.9"
+
+
+def test_non_ip_peer_still_binds_the_console_ticket(client, settings, fake_connection):
+    """A transport whose peer is not an IP must not silently disable the binding.
+
+    forwarded.client_ip answers "unknown" for a non-IP peer; the console path then falls back to
+    the literal peer string so two different transports still cannot share a ticket.
+    """
+    from app.api import console_ws as console_api
+
+    assert console_api._ticket_ip_matches("testclient", "othertransport") is False
+    assert console_api._ticket_ip_matches("testclient", "testclient") is True

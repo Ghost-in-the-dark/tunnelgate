@@ -106,6 +106,11 @@ console.panel.example.com {
 #           header_up X-Real-IP {remote_host}
 #           header_up X-Forwarded-Proto {scheme}
 #           header_up X-Tg-Router <router-id>
+#           # The panel session cookie must never reach a router: whoever owns one
+#           # router would otherwise hold a live panel session. Same rule as
+#           #   proxy_set_header Cookie "";
+#           # in the nginx router template.
+#           header_up -Cookie
 #           transport http {
 #               read_timeout 300s
 #           }
@@ -122,4 +127,13 @@ console.panel.example.com {
 # * A 401 from the gate becomes a 302 to the panel login in both drivers, but
 #   Caddy expresses it as handle_response inside the generated JSON route, not in
 #   this file.
+# * Cookie stripping on the router hop (header_up -Cookie above) is emitted in three
+#   places and they must agree: this reference file, deploy/nginx/router-vhost.conf.template
+#   ("proxy_set_header Cookie \"\";"), and the live renderers in app/services/proxy.py -
+#   render_nginx() emits the same nginx line and render_caddy_route() emits
+#   "headers": {"request": {"delete": ["Cookie"]}} for the router upstream. So both
+#   drivers do strip it at runtime; a hand-written vhost of your own inherits none of
+#   this. Keep TUNNELGATE_COOKIE_DOMAIN unset anyway: with the default host-only cookie
+#   the browser never sends tg_session to a router host in the first place, which is the
+#   structural fix and the reason one forgotten line is survivable.
 # =============================================================================

@@ -219,6 +219,30 @@ class ConsoleSession(Base):
     bytes_out: Mapped[int] = mapped_column(Integer, default=0)
 
 
+class PanelSetting(Base):
+    """Typed key/value store for panel settings an admin can change from the UI.
+
+    Deliberately not a wide "settings" row with one column per knob: the set of editable
+    settings is small, each one has its own validation and audit story, and a key/value table
+    means adding the next one never needs a migration. "value" holds JSON so a setting can grow
+    a shape later without another schema change; the caller validates on the way out.
+
+    Why this exists at all: TUNNELGATE_PANEL_URL is what the installer tells a router to dial,
+    and an operator who moves the panel (new hostname, TLS terminating in front, a different
+    port) cannot re-run env vars on already-installed routers. A database-backed override, with
+    the environment value as the fallback, is the smallest thing that makes that fixable from
+    the UI while keeping "env wins on a fresh install" understandable.
+    """
+
+    __tablename__ = "panel_settings"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_by_id: Mapped[int | None] = mapped_column(Integer, default=None)
+    updated_by_username: Mapped[str | None] = mapped_column(String(64), default=None)
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
     __table_args__ = (Index("ix_audit_ts", "ts"),)

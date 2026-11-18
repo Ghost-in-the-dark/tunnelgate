@@ -20,6 +20,11 @@ log = logging.getLogger("tunnelgate")
 
 MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
+# Explicit CORS allow-lists. A wildcard here would mirror the caller's request back at them,
+# which is exactly the combination the credentialed-request check exists to prevent.
+CORS_ALLOW_METHODS = ("GET", "POST", "PATCH", "DELETE", "OPTIONS")
+CORS_ALLOW_HEADERS = ("Accept", "Content-Type", "X-Requested-With")
+
 
 def _seed_admin() -> None:
     """Create the first admin only when the users table is empty and a password is configured."""
@@ -90,12 +95,24 @@ def create_app(settings: Settings | None = None, *, use_monitor: bool = True) ->
         set_settings_override(settings)
     s = get_settings()
 
+    # The OpenAPI schema and the interactive docs describe every route, every field and every
+    # auth scheme in the panel, unauthenticated. That is a gift to reconnaissance on a public
+    # deployment and useless to the SPA, which talks to the typed client in web/src/lib/api.ts.
+    # Settings.docs_visible resolves TUNNELGATE_DOCS_ENABLED (when set) against the environment,
+    # so production closes the hole by default while development keeps the schema. The fallback
+    # keeps this module importable against a config.py that predates the property.
+    docs_enabled = getattr(s, "docs_visible", None)
+    if docs_enabled is None:
+        docs_enabled = (s.env or "").strip().lower() not in ("prod", "production")
+    if not docs_enabled:
+        log.info("api docs and OpenAPI schema are disabled (env=%s)", s.env)
+
     app = FastAPI(
         title="TunnelGate",
         version=__version__,
         description="Centralised LuCI access for OpenWrt routers over SSH reverse tunnels.",
-        docs_url="/api/docs",
-        openapi_url="/api/openapi.json",
+        docs_url="/api/docs" if docs_enabled else None,
+        openapi_url="/api/openapi.json" if docs_enabled else None,
         redoc_url=None,
         lifespan=lifespan,
     )
@@ -114,19 +131,47 @@ def create_app(settings: Settings | None = None, *, use_monitor: bool = True) ->
             h.setdefault("Cache-Control", "no-store")
         return response
 
-    if s.cors_origins:
+    cors_origins = [origin.strip() for origin in s.cors_origins if origin.strip()]
+    if cors_origins:
+        # allow_credentials=True plus any wildcard is the classic CORS foot-gun: with
+        # allow_headers=["*"] the browser accepts a *preflight* for any header, and with a "*"
+        # origin starlette reflects the caller's Origin back, so every site on the internet
+        # could read authenticated responses. Neither wildcard buys anything here: the panel
+        # is same-origin (Vite proxies /api in development), so this list only exists for
+        # explicitly configured third-party front-ends. Fail fast instead of shipping it.
+        #
+        # The check runs on the *normalized* list, not the raw setting: matching the setting
+        # would let `" * "` through to CORSMiddleware as `"*"` after stripping, which is the
+        # exact combination this guard exists to reject.
+        if "*" in cors_origins:
+            raise ValueError(
+                "TUNNELGATE_CORS_ORIGINS must list explicit origins: allow_credentials=True "
+                "cannot be combined with a wildcard origin"
+            )
         from fastapi.middleware.cors import CORSMiddleware
 
         app.add_middleware(
             CORSMiddleware,
-            allow_origins=s.cors_origins,
+            allow_origins=cors_origins,
             allow_credentials=True,
-            allow_methods=["*"],
-            allow_headers=["*"],
+            allow_methods=list(CORS_ALLOW_METHODS),
+            allow_headers=[*CORS_ALLOW_HEADERS, s.csrf_header],
         )
+        log.info("cors: allowing credentialed requests from %s", ", ".join(cors_origins))
 
-    from .api import audit, auth, bootstrap, console, console_ws, gate, heartbeat, meta, users
+    from .api import (
+        audit,
+        auth,
+        bootstrap,
+        console,
+        console_ws,
+        gate,
+        heartbeat,
+        meta,
+        users,
+    )
     from .api import routers as routers_api
+    from .api import settings as settings_api
 
     for mod in (
         auth,
@@ -137,6 +182,7 @@ def create_app(settings: Settings | None = None, *, use_monitor: bool = True) ->
         console_ws,
         audit,
         users,
+        settings_api,
         meta,
         gate,
     ):

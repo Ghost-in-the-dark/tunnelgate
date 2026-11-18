@@ -231,7 +231,11 @@ def cmd_seed_admin(args: argparse.Namespace) -> int:
         db.flush()
         _say("{} user {!r} (id={})".format("created" if created else "updated", username, user.id))
         if created:
-            _say("log in at " + settings.panel_url.rstrip("/") + "/login")
+            # The agent-facing address is the one an operator can reach from their laptop;
+            # panel_url is what the reverse proxy forwards to and is often loopback-only.
+            from .services import agent_endpoint
+
+            _say("log in at " + agent_endpoint.agent_url(db, settings).rstrip("/") + "/login")
     return 0
 
 
@@ -853,8 +857,9 @@ def cmd_render_proxy(args: argparse.Namespace) -> int:
             )
         )
         _say(
-            "changed: {} (a reload {} needed)".format(
-                "yes" if changed else "no", "" if changed else "is not"
+            "changed: {} ({})".format(
+                "yes" if changed else "no",
+                "nginx must be reloaded" if changed else "no reload needed",
             )
         )
         return changed

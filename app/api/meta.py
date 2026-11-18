@@ -13,7 +13,7 @@ from sqlalchemy import func, select
 from ..config import utcnow
 from ..deps import CurrentUser, DbSession, SettingsDep
 from ..models import STATUS_OFFLINE, STATUS_ONLINE, STATUS_PENDING, ConsoleSession, Router, User
-from ..schemas import ConfigOut, StatsOut, iso
+from ..schemas import AgentEndpointOut, ConfigOut, StatsOut, iso
 from ..services import ports as ports_service
 
 router = APIRouter(prefix="/api/v1", tags=["meta"])
@@ -31,10 +31,17 @@ async def health() -> dict:
 
 
 @router.get("/config", response_model=ConfigOut)
-async def panel_config(user: CurrentUser, settings: SettingsDep) -> ConfigOut:
-    """Everything the SPA needs to render hostnames and the install instructions."""
-    from .. import __version__
+async def panel_config(db: DbSession, user: CurrentUser, settings: SettingsDep) -> ConfigOut:
+    """Everything the SPA needs to render hostnames and the install instructions.
 
+    agent_url is what routers dial and can be overridden from the UI; panel_url stays the
+    panel's own internal address (what the reverse proxy forwards to). They are usually the
+    same string on a flat deployment and are allowed to differ behind a TLS terminator.
+    """
+    from .. import __version__
+    from ..services import agent_endpoint
+
+    endpoint = agent_endpoint.effective(db, settings)
     return ConfigOut(
         panel_url=settings.panel_url,
         subdomain_suffix=settings.host_suffix,
@@ -42,6 +49,9 @@ async def panel_config(user: CurrentUser, settings: SettingsDep) -> ConfigOut:
         poll_interval_seconds=WIZARD_POLL_SECONDS,
         proxy_driver=settings.proxy_driver,
         version=__version__,
+        agent_url=endpoint.url if endpoint else agent_endpoint.agent_url(db, settings),
+        agent_endpoint=(AgentEndpointOut(**endpoint.as_dict()) if endpoint is not None else None),
+        agent_endpoint_testable=endpoint is not None,
     )
 
 

@@ -173,8 +173,38 @@ CSV export writes the rows currently on screen.
 repeat, with a strength meter and match validation), and an appearance picker.
 **Users** (admin only) - table with role, status, last sign-in, per-row menu to
 edit, disable or delete; your own row cannot disable or delete itself, and the
-menu says why. **Panel** - read-only configuration from the server, capacity
-numbers, and a note that these come from `TUNNELGATE_*` environment variables.
+menu says why.
+
+**Panel** opens with the agent endpoint card: the protocol, host and port a
+router dials. Every install command, the installer's heartbeat URL and the URLs
+baked into a fetched script use this address, while the proxy keeps using the
+internal panel URL - so the two are shown separately and never conflated.
+
+- The card is a form for an admin and a read-only description list for everyone
+  else ("Only an admin can change where routers dial").
+- A source badge says where the value comes from: "set in panel" once an
+  override is stored, "from environment" while `TUNNELGATE_PANEL_URL` is in
+  force. Only a stored override offers "Use environment default", behind a
+  confirmation that names the URL that will replace it.
+- Validation runs on both sides. The client rejects an empty host, a scheme
+  instead of a host, spaces/paths/credentials, unusable IPv4 or IPv6 octets and
+  an out-of-range port before the request leaves the page; the server stays
+  authoritative and its per-field messages land on the matching input. Save
+  stays disabled while the form is pristine or invalid, and the live "Routers
+  will dial:" preview is suppressed rather than shown for a rejected address.
+- "Test connection" probes the panel's own `/api/v1/health` through the
+  candidate address and reports inline, in a polite live region (never a toast):
+  "Reachable: HTTP 200 in 42 ms" or "Not reachable: <error>", followed by the
+  URL that was checked. The button is disabled when the panel has no address it
+  could probe from.
+- When the panel has no usable endpoint at all (`TUNNELGATE_PANEL_URL` is not a
+  valid http(s) URL and nothing is stored) the card explains that no install
+  command can point anywhere and, for an admin, still renders the empty form so
+  the value can be set here instead of by redeploying.
+- Below the card, the remaining rows (internal panel URL, subdomain suffix,
+  bootstrap TTL, poll interval, proxy driver, version) stay read-only with the
+  reason: these come from `TUNNELGATE_*` variables, because a panel compromise
+  must not change how the proxy reaches the panel.
 
 ## 6. States every screen must have
 

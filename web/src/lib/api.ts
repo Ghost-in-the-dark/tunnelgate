@@ -9,6 +9,9 @@
  *  - a 401 anywhere flips the auth store to "logged out", which unmounts the shell.
  */
 import type {
+  AgentEndpointInput,
+  AgentEndpointResult,
+  AgentEndpointTest,
   AuditListResponse,
   ConsoleInfo,
   ConsoleSessionList,
@@ -259,6 +262,18 @@ export const api = {
   config: (signal?: AbortSignal) => request<PanelConfig>('/api/v1/config', { signal }),
 
   stats: (signal?: AbortSignal) => request<Stats>('/api/v1/stats', { signal }),
+
+  // agent endpoint (admin only; the CSRF header is added by request()) ----
+  // Names mirror the operations rather than the HTTP verbs so the page reads
+  // as intent; each still goes through the one request() transport.
+  agentEndpointSave: (input: AgentEndpointInput) =>
+    request<AgentEndpointResult>('/api/v1/settings/agent-endpoint', { method: 'PUT', body: input }),
+
+  agentEndpointReset: () =>
+    request<AgentEndpointResult>('/api/v1/settings/agent-endpoint', { method: 'DELETE' }),
+
+  agentEndpointTest: (input: AgentEndpointInput) =>
+    request<AgentEndpointTest>('/api/v1/settings/agent-endpoint/test', { method: 'POST', body: input }),
 }
 
 export type { Role }

@@ -25,6 +25,48 @@ def test_login_returns_session_and_sets_cookie(client):
     assert r.cookies["tg_session"] not in r.text
 
 
+def _set_cookie_header(response) -> str:
+    return response.headers.get("set-cookie", "")
+
+
+def test_login_cookie_is_not_secure_over_plain_http(client):
+    """The dev/loopback layout stays usable: no Secure flag without TLS."""
+    assert "secure" not in _set_cookie_header(_login(client)).lower()
+
+
+def _login_from(app, peer: str, headers: dict[str, str] | None = None):
+    """Log in with a chosen socket peer, so the trust list can be exercised for real."""
+    from starlette.testclient import TestClient
+
+    with TestClient(app, client=(peer, 44000)) as c:
+        return c.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": ADMIN_PASSWORD},
+            headers=headers or {},
+        )
+
+
+def test_login_cookie_is_secure_when_the_request_came_over_https(app, settings):
+    """A panel published over https must not hand out a non-Secure session cookie.
+
+    TUNNELGATE_COOKIE_SECURE stays the explicit switch; this is the safety net for an operator
+    who terminates TLS at a proxy in front of the panel and never set it.
+    """
+    from app.config import set_settings_override
+
+    set_settings_override(settings.model_copy(update={"cookie_secure": False}))
+    r = _login_from(app, "127.0.0.1", {"X-Forwarded-Proto": "https"})
+    assert r.status_code == 200, r.text
+    assert "secure" in _set_cookie_header(r).lower()
+
+
+def test_the_https_cookie_rule_only_listens_to_a_trusted_peer(app):
+    """An untrusted client cannot talk the panel into marking its own cookie Secure."""
+    r = _login_from(app, "203.0.113.9", {"X-Forwarded-Proto": "https"})
+    assert r.status_code == 200, r.text
+    assert "secure" not in _set_cookie_header(r).lower()
+
+
 def test_login_accepts_display_name_absence(client):
     r = _login(client)
     assert r.json()["user"]["display_name"] == "Administrator"
@@ -222,3 +264,66 @@ def test_login_rate_limits_per_username_too(client, settings):
     assert r.status_code in (401, 429)
     if r.status_code == 401:  # pragma: no cover - depends on ip bucketing
         assert hash_password("x") != "x"
+
+
+# --------------------------------------------------------------------------- timing oracle (F5)
+def test_login_spends_a_full_hash_even_when_the_user_does_not_exist(client, monkeypatch):
+    """An unknown username must cost the same scrypt work as a known one.
+
+    Counting the calls is a far steadier signal than wall-clock timing in CI: the old code
+    returned before verify_password ran at all for a missing row, which is the entire oracle.
+    """
+    from app.api import auth as auth_api
+
+    calls: list[str | None] = []
+    real_verify = auth_api.verify_password
+
+    def counting_verify(password, encoded):
+        calls.append(encoded)
+        return real_verify(password, encoded)
+
+    monkeypatch.setattr(auth_api, "verify_password", counting_verify)
+
+    known = _login(client, password="definitely-wrong")
+    unknown = _login(client, username="ghost", password="definitely-wrong")
+
+    assert known.status_code == unknown.status_code == 401
+    assert len(calls) == 2, calls
+    # Both paths hashed something: the unknown-user path used the dummy hash, not None.
+    assert all(encoded for encoded in calls), calls
+
+
+def test_dummy_hash_is_a_real_scrypt_hash():
+    """The dummy must be the same shape as a stored hash, or it does not cost the same."""
+    from app.api import auth as auth_api
+    from app.security import hash_password, verify_password
+
+    assert auth_api.DUMMY_PASSWORD_HASH.startswith("scrypt$")
+    assert verify_password("whatever", auth_api.DUMMY_PASSWORD_HASH) is False
+    assert hash_password("whatever") != auth_api.DUMMY_PASSWORD_HASH
+
+
+def test_blank_password_hash_still_verifies_against_the_dummy(client, db, monkeypatch):
+    """A row whose hash is missing or corrupt must not short-circuit either.
+
+    The column is NOT NULL, so an empty string stands in for the damaged-row case the `or`
+    fallback exists for; without it verify_password would be skipped and the timing oracle
+    would come back through a different door.
+    """
+    from app.api import auth as auth_api
+
+    user = db.query(User).filter_by(username="admin").one()
+    user.password_hash = ""
+    db.commit()
+
+    used: list[str | None] = []
+    real_verify = auth_api.verify_password
+
+    def counting_verify(password, encoded):
+        used.append(encoded)
+        return real_verify(password, encoded)
+
+    monkeypatch.setattr(auth_api, "verify_password", counting_verify)
+    r = _login(client)
+    assert r.status_code == 401
+    assert used and used[0] == auth_api.DUMMY_PASSWORD_HASH

@@ -27,7 +27,8 @@ from ..schemas import (
     TunnelSpec,
     iso,
 )
-from ..security import RateLimiter, key_fingerprint
+from ..security import RateLimiter, hash_token, key_fingerprint
+from ..services import agent_endpoint
 from ..services import bootstrap as bootstrap_service
 from ..services import keys as keys_service
 from ..services.audit import record as audit_record
@@ -45,7 +46,29 @@ EXCHANGE_LIMIT = 60
 EXCHANGE_WINDOW_SECONDS = 60
 EXCHANGE_LIMITER = RateLimiter(limit=EXCHANGE_LIMIT, window_seconds=EXCHANGE_WINDOW_SECONDS)
 
+# GET /install re-renders on every call for the whole life of the token, and each render echoes
+# the live single-use credential into a response body. The per-ip limiter above is not enough: a
+# caller who rotates source addresses can keep pulling the same token for its full TTL. Cap the
+# renders *per token* as well, keyed by the digest so nothing secret sits in the limiter.
+SCRIPT_LIMIT = 5
+SCRIPT_WINDOW_SECONDS = 15 * 60
+SCRIPT_LIMITER = RateLimiter(limit=SCRIPT_LIMIT, window_seconds=SCRIPT_WINDOW_SECONDS)
+
 SCRIPT_MEDIA_TYPE = "text/x-shellscript"
+
+
+def _throttle_token(token_hash: str) -> None:
+    """Cap re-renders of the install script per token, independent of the caller's address."""
+    allowed, retry_after = SCRIPT_LIMITER.check(f"script:{token_hash}")
+    if not allowed:
+        raise ApiError(
+            429,
+            "rate_limited",
+            "This bootstrap token has been fetched too many times; wait or mint a new one",
+            {"retry_after_seconds": retry_after},
+            headers={"Retry-After": str(retry_after)},
+        )
+    SCRIPT_LIMITER.hit(f"script:{token_hash}")
 
 
 def _throttle(ip: str, scope: str) -> None:
@@ -105,7 +128,10 @@ def install_script(
     router_row = bootstrap_service.resolve_router_for_script(db, x_bootstrap_token)
     if os not in ("linux", "freebsd", "windows"):
         raise ApiError(400, "validation_error", "os must be one of linux, freebsd, windows")
-    body = bootstrap_service.render_install_script(x_bootstrap_token or "", os, settings)
+    # Only after the token proved usable: an unknown token must not burn quota that belongs to
+    # a real one, and the digest never leaves this process.
+    _throttle_token(hash_token((x_bootstrap_token or "").strip()))
+    body = bootstrap_service.render_install_script(x_bootstrap_token or "", os, settings, db=db)
     db.commit()
     log.info("served install script for router %s to %s", router_row.slug, ip)
     return PlainTextResponse(
@@ -158,7 +184,7 @@ async def exchange(
     )
     db.commit()
     db.refresh(router_row)
-    base = settings.panel_url.rstrip("/")
+    base = agent_endpoint.agent_url(db, settings)
     return BootstrapExchangeOut(
         router_id=router_row.id,
         router_name=router_row.name,

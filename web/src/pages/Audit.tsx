@@ -14,6 +14,20 @@ import { useToast } from '../components/Toast'
 
 const PAGE_SIZE = 50
 
+// Spreadsheets treat a cell whose first character is = + - @ TAB or CR as a formula
+// and evaluate it on open. Audit values are attacker-controlled (a failed sign-in
+// stores the untrusted X-Forwarded-For header in `ip`, so "=1+1" becomes a live
+// formula, the classic DDE / command-injection vector). Prefixing such a cell with a
+// single quote keeps Excel and LibreOffice treating it as literal text.
+const FORMULA_PREFIX = /^[=+\-@\t\r]/
+
+/** One CSV field: neutralise a formula prefix first, then apply quote-escaping. */
+export function csvCell(v: unknown): string {
+  const s = v === null || v === undefined ? '' : String(v)
+  const safe = FORMULA_PREFIX.test(s) ? `'${s}` : s
+  return /[",\n\r]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe
+}
+
 export function AuditPage() {
   const navigate = useNavigate()
   const toast = useToast()
@@ -67,15 +81,11 @@ export function AuditPage() {
       return
     }
     const header = ['ts', 'actor', 'action', 'outcome', 'router', 'ip', 'detail']
-    const escape = (v: unknown) => {
-      const s = v === null || v === undefined ? '' : String(v)
-      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
-    }
     const csv = [
       header.join(','),
       ...items.map((e) =>
         [e.ts, e.actor_username, e.action, e.outcome, e.router_name ?? e.router_id, e.ip, e.detail]
-          .map(escape)
+          .map(csvCell)
           .join(','),
       ),
     ].join('\n')

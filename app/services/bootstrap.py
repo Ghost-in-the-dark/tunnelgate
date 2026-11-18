@@ -19,6 +19,7 @@ from ..config import Settings, get_settings, utcnow
 from ..errors import ApiError
 from ..models import STATUS_AWAITING, BootstrapToken, Router, User
 from ..security import hash_token, new_token
+from . import agent_endpoint
 from . import keys as keys_service
 from . import ports as ports_service
 
@@ -160,21 +161,28 @@ def exchange_token(
     return router, keypair.private_openssh
 
 
-def build_install_command(token: str, settings: Settings | None = None) -> str:
+def _agent_base(db=None, settings: Settings | None = None) -> str:
+    """The base URL a router is told to dial.
+
+    Not settings.panel_url directly: the panel's own address (what nginx proxy_passes to) and
+    the address a router on a customer network reaches are allowed to differ, and an admin can
+    change the latter from the UI. See app/services/agent_endpoint.py.
+    """
+    return agent_endpoint.agent_url(db, settings or get_settings())
+
+
+def build_install_command(token: str, settings: Settings | None = None, *, db=None) -> str:
     """The one-liner an operator pastes on the router.
 
     The token travels in a header, never in the URL: a URL ends up in access logs, in shell
     history and in ps output, and this token is a one-shot credential to become a router.
     """
-    s = settings or get_settings()
-    base = s.panel_url.rstrip("/")
-    url = f"{base}/api/v1/routers/install?os=linux"
+    url = f"{_agent_base(db, settings)}/api/v1/routers/install?os=linux"
     return f"curl -fsSL -H 'X-Bootstrap-Token: {token}' '{url}' | sh"
 
 
-def install_script_url(settings: Settings | None = None) -> str:
-    s = settings or get_settings()
-    return f"{s.panel_url.rstrip('/')}/api/v1/routers/install?os=linux"
+def install_script_url(settings: Settings | None = None, *, db=None) -> str:
+    return f"{_agent_base(db, settings)}/api/v1/routers/install?os=linux"
 
 
 def load_install_script() -> str:
@@ -195,7 +203,7 @@ def load_install_script() -> str:
 
 
 def render_install_script(
-    token: str, os_type: str = "linux", settings: Settings | None = None
+    token: str, os_type: str = "linux", settings: Settings | None = None, *, db=None
 ) -> str:
     """Substitute the panel URL and the token into the installer body.
 
@@ -203,9 +211,8 @@ def render_install_script(
     a shell command line. Values are injected as shell assignments rather than string-spliced
     into commands, so a token containing quotes cannot break out of its context.
     """
-    s = settings or get_settings()
     body = load_install_script()
-    base = s.panel_url.rstrip("/")
+    base = _agent_base(db, settings)
     header = "\n".join(
         [
             "# --- injected by the panel ---",

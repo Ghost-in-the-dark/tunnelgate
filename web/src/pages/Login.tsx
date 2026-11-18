@@ -11,6 +11,17 @@ interface LocationState {
   from?: { pathname: string; search?: string }
 }
 
+/**
+ * Accept only a same-origin absolute path as a post-sign-in destination: one leading
+ * slash and not two. Rejects protocol-relative '//evil.example' and the backslash
+ * variant '/\evil.example' that browsers normalise to the same thing, so a crafted
+ * ?next= cannot turn the login page into an open redirect.
+ */
+function safeNext(raw: string | null): string | null {
+  if (!raw || !raw.startsWith('/') || raw.startsWith('//') || raw.startsWith('/\\')) return null
+  return raw
+}
+
 export function LoginPage() {
   const { bootState, user } = useAuth()
   const navigate = useNavigate()
@@ -40,7 +51,11 @@ export function LoginPage() {
   }, [])
 
   const state = location.state as LocationState | null
-  const from = state?.from ? `${state.from.pathname}${state.from.search ?? ''}` : '/hosts'
+  const fromState = state?.from ? `${state.from.pathname}${state.from.search ?? ''}` : null
+  // The nginx auth gate redirects to /login?router=<slug>&next=<original URI> when a
+  // router vhost rejects an anonymous request. RequireAuth records the destination in
+  // history state instead, so fall back to ?next= to keep the operator's original page.
+  const from = fromState ?? safeNext(new URLSearchParams(location.search).get('next')) ?? '/hosts'
 
   if (bootState === 'authenticated' && user) {
     return <Navigate to={from} replace />
@@ -64,6 +79,8 @@ export function LoginPage() {
     try {
       const session = await api.login(username.trim(), password)
       setSession(session)
+      // `from` is history state recorded by RequireAuth or a same-origin path vetted by
+      // safeNext(), so this navigation cannot leave the panel.
       navigate(from, { replace: true })
     } catch (err) {
       if (err instanceof ApiError && err.status === 429) {

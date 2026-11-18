@@ -292,3 +292,81 @@ def test_install_returns_503_when_the_agent_script_is_missing(api, client, monke
     )
     assert r.status_code == 503
     assert r.json()["error"]["code"] == "install_script_missing"
+
+
+# --------------------------------------------------------------------------- per-token limit (F6)
+def _fetch_script(client, token, os_name="linux"):
+    return client.get(
+        "/api/v1/routers/install?os=" + os_name,
+        headers={"X-Bootstrap-Token": token},
+    )
+
+
+def test_install_script_renders_are_capped_per_token(api, client):
+    """A token may be rendered a handful of times, then it is throttled.
+
+    The per-address limiter is not enough: the install endpoint re-renders for the whole life of
+    the token and every render echoes the live single-use credential, so an attacker rotating
+    source addresses could keep pulling it.
+    """
+    from app.api import bootstrap as bootstrap_api
+
+    bootstrap_api.SCRIPT_LIMITER.clear()
+    created = api.create_router("Renderable")
+    token = created["bootstrap_token"]
+
+    for attempt in range(bootstrap_api.SCRIPT_LIMIT):
+        r = _fetch_script(client, token)
+        assert r.status_code == 200, (attempt, r.text)
+
+    blocked = _fetch_script(client, token)
+    assert blocked.status_code == 429
+    assert blocked.json()["error"]["code"] == "rate_limited"
+    assert int(blocked.headers["Retry-After"]) > 0
+    assert blocked.json()["error"]["details"]["retry_after_seconds"] > 0
+
+
+def test_install_script_limit_is_per_token_not_global(api, client):
+    """Burning one token quota must not lock out a different router token."""
+    from app.api import bootstrap as bootstrap_api
+
+    bootstrap_api.SCRIPT_LIMITER.clear()
+    first = api.create_router("First")
+    second = api.create_router("Second")
+
+    for _ in range(bootstrap_api.SCRIPT_LIMIT):
+        assert _fetch_script(client, first["bootstrap_token"]).status_code == 200
+    assert _fetch_script(client, first["bootstrap_token"]).status_code == 429
+
+    other = _fetch_script(client, second["bootstrap_token"])
+    assert other.status_code == 200, other.text
+
+
+def test_unknown_token_does_not_burn_a_real_token_budget(api, client):
+    """The limiter is keyed by the token, so a bogus one can only throttle itself."""
+    from app.api import bootstrap as bootstrap_api
+
+    bootstrap_api.SCRIPT_LIMITER.clear()
+    created = api.create_router("Untouched")
+    token = created["bootstrap_token"]
+
+    for _ in range(bootstrap_api.SCRIPT_LIMIT + 2):
+        assert _fetch_script(client, "not-a-real-token").status_code == 401
+
+    assert _fetch_script(client, token).status_code == 200
+
+
+def test_exchange_is_not_affected_by_the_script_limiter(api, client):
+    """The two limiters are separate; exhausting renders must not block the exchange."""
+    from app.api import bootstrap as bootstrap_api
+
+    bootstrap_api.SCRIPT_LIMITER.clear()
+    created = api.create_router("Exchanger")
+    token = created["bootstrap_token"]
+
+    for _ in range(bootstrap_api.SCRIPT_LIMIT):
+        assert _fetch_script(client, token).status_code == 200
+    assert _fetch_script(client, token).status_code == 429
+
+    r = _exchange(client, token)
+    assert r.status_code == 200, r.text

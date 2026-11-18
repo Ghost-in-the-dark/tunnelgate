@@ -117,8 +117,47 @@ export interface AuditListResponse {
   total: number
 }
 
+export type AgentScheme = 'http' | 'https'
+
+/** Where the panel lives from its own point of view, and where it came from. */
+export interface AgentEndpoint {
+  scheme: AgentScheme
+  host: string
+  /** null means "the scheme default" (80 for http, 443 for https). */
+  port: number | null
+  source: 'environment' | 'database'
+}
+
+/** Body of PUT/DELETE/POST /api/v1/settings/agent-endpoint. */
+export interface AgentEndpointInput {
+  scheme: AgentScheme
+  host: string
+  port: number | null
+}
+
+/** 200 body of the save and the reset. */
+export interface AgentEndpointResult {
+  agent_url: string
+  agent_endpoint: AgentEndpoint
+}
+
+/** 200 body of the reachability probe. */
+export interface AgentEndpointTest {
+  ok: boolean
+  checked_url: string
+  status_code: number | null
+  latency_ms: number | null
+  error: string | null
+}
+
 export interface PanelConfig {
   panel_url: string
+  /** Effective base URL routers dial. May differ from panel_url when overridden. */
+  agent_url: string
+  /** Null when the panel has no usable endpoint at all (an unparsable panel_url, nothing stored). */
+  agent_endpoint: AgentEndpoint | null
+  /** False when the panel has no hostname to probe, so "Test connection" cannot work. */
+  agent_endpoint_testable: boolean
   subdomain_suffix: string
   bootstrap_ttl_minutes: number
   poll_interval_seconds: number

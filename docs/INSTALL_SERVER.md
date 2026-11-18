@@ -1048,6 +1048,45 @@ heartbeat delivers it, so wait one heartbeat interval (60 s) or restart the tunn
 
 ## 9. Upgrades
 
+One command, on the panel host:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Ghost-in-the-dark/tunnelgate/main/scripts/update.sh \
+  | sudo sh -s -- --ref v1.1.0
+```
+
+Drop `--ref` to take the latest GitHub release. `--check-only` prints the installed and the
+available version and exits without writing; `--dry-run` prints the whole plan.
+`scripts/update.sh --help` lists every flag and the exit codes.
+
+What it does, in this order, for a reason:
+
+| step | why in that position |
+| --- | --- |
+| backup into `/var/backups/tunnelgate/update-<UTC stamp>/` (0700) | a backup taken after the first write records the damage instead of preventing it. It holds `sqlite3 .backup` of the database, `/etc/tunnelgate.env`, `authorized_keys`, both routes files, `pip freeze` and a `code.tar.gz` for an offline rollback |
+| install the new dependencies into the existing venv | |
+| run `check-schema` with the **new** code against a **snapshot** of the database | `check-schema` calls `init-db`, so pointing it at the live file would create tables in production while you are still deciding whether to continue. On drift the update stops **before** the swap, prints the `ALTER TABLE` statements, restores `pip freeze`, and leaves the running panel on the old version |
+| build `web/dist` | it is not in the repository, so a code-only update serves a stale SPA |
+| `rsync -a --delete` the staged code into place (keeps `.venv`, `data`, `web/node_modules`, `.git`) | only after dependencies, schema and SPA have all passed |
+| `systemctl restart` and poll `/api/v1/health` for the reported version | `systemctl` returning 0 is not proof: a panel that dies on its first bind is briefly **active** and then in auto-restart. If the version never answers, it rolls the code and the freeze back and says whether the previous version is serving again |
+
+It discovers the installation from systemd (`FragmentPath`, `ExecStart`, `User`,
+`EnvironmentFiles`), so it works for the `quick-install.sh`, `setup-server.sh` and Docker-less
+manual layouts alike; `--install-dir`, `--data-dir` and `--env-file` override the discovery.
+It never rewrites your unit file - if the shipped unit has drifted from yours it prints the
+`diff` command and leaves the decision to you.
+
+It refuses, rather than half-applying: a dirty git checkout (`--force` overrides), the same
+version as installed unless `--force`, a non-SQLite database for the schema check, and a
+release whose schema needs hand work (`--skip-schema-check` is the documented way past a check
+you know is fine).
+
+Restart is safe for the fleet: the forwards are owned by sshd, not by the panel, so LuCI keeps
+working while the panel is down and routers reconnect on their own. Only the *status* view goes
+stale (it is reconciled on startup).
+
+### Manual upgrade (if you have to)
+
 ```bash
 cd /opt/tunnelgate
 git fetch --tags && git checkout v1.1.0

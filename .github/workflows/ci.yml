@@ -81,7 +81,8 @@ jobs:
 
       - name: busybox ash syntax check
         run: |
-          for f in agent/install.sh agent/uninstall.sh agent/tunnelgate.init scripts/quick-install.sh; do
+          for f in agent/install.sh agent/uninstall.sh agent/tunnelgate.init \
+                   scripts/quick-install.sh scripts/update.sh; do
             busybox sh -n "$f" && echo "ok $f"
           done
 
@@ -92,6 +93,13 @@ jobs:
       - name: quick install script (shellcheck)
         run: |
           shellcheck -s sh -e SC1091,SC3043,SC2039 scripts/quick-install.sh
+
+      # scripts/update.sh runs as root on a host that is already serving traffic, so a
+      # syntax error there is worse than on a fresh install: it fails halfway through an
+      # upgrade. Same rules as the installer; its own assertions live in tests/test_update.py.
+      - name: update script (shellcheck)
+        run: |
+          shellcheck -s sh -e SC1091,SC3043,SC2039 scripts/update.sh
 
       - name: installer test suite
         run: |

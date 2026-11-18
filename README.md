@@ -97,6 +97,21 @@ read [docs/INSTALL_SERVER.md](docs/INSTALL_SERVER.md#quick-install-tls-terminate
 for what it does and the traps it handles. Merged layout shares the panel's origin with every
 router - read [docs/SECURITY.md §6.1](docs/SECURITY.md) before adding routers you do not control.
 
+### Upgrading an installed panel
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Ghost-in-the-dark/tunnelgate/main/scripts/update.sh \
+  | sudo sh -s -- --ref v1.1.0
+```
+
+Omit `--ref` for the latest release; `--check-only` prints installed vs available and changes
+nothing. It backs up the database, the env file, `authorized_keys`, the routes files and the
+code first, checks the schema with the new build against a *snapshot* (never the live file),
+rebuilds the SPA, swaps the code only after all three pass, then verifies the version over
+`/api/v1/health` - and rolls back by itself if the new build does not come up. Live tunnels
+stay up throughout: their forwards belong to sshd, not to the panel. Details in
+[docs/INSTALL_SERVER.md §9](docs/INSTALL_SERVER.md).
+
 Manual install, for a host that terminates TLS itself:
 
 ```bash
@@ -151,7 +166,8 @@ app/                  FastAPI application
   config.py db.py models.py schemas.py security.py deps.py errors.py main.py cli.py
 agent/                OpenWrt installer, procd init script, uninstaller (POSIX sh / dropbear)
 deploy/               nginx + Caddy configs, sshd drop-in, systemd units, docker-compose
-scripts/              quick-install.sh (behind your own proxy), setup-server.sh (full TLS host), dev.sh
+scripts/              quick-install.sh (behind your own proxy), setup-server.sh (full TLS host),
+                      update.sh (in-place upgrade with backup and rollback), dev.sh
 web/                  React + TypeScript + Vite SPA (list, wizard, router page, console)
 tests/                pytest suite
 docs/                 the documents above
@@ -163,7 +179,8 @@ docs/                 the documents above
   exchanged for an ed25519 key that exists only inside the exchange response. Only the public
   half is ever stored server-side.
 * **The key can do one thing.** `permitlisten="127.0.0.1:<tunnel_port>",permitlisten="127.0.0.1:<console_port>"`
-  plus `no-pty,command="/bin/false",permitopen="none"` - rendered by
+  plus `no-pty,command="/bin/false",permitopen="127.0.0.1:1"` (`none` is an sshd_config-only
+  keyword and sshd rejects the whole key line over it) - rendered by
   `app/services/keys.py`, with an sshd `Match` block as the second layer. (Note: the obvious
   `restrict` prefix **breaks** `permitlisten`; see docs/SECURITY.md §3.)
 * **Auth at the edge.** Each router is its own nginx `server` block with

@@ -71,7 +71,7 @@ is worthless 15 minutes later, and a machine credential that is never typed by a
 Every router gets exactly one line, rendered by `app/security.py:authorized_key_line()`:
 
 ```
-no-pty,no-agent-forwarding,no-X11-forwarding,no-user-rc,command="/bin/false",permitopen="none",
+no-pty,no-agent-forwarding,no-X11-forwarding,no-user-rc,command="/bin/false",permitopen="127.0.0.1:1",
 permitlisten="127.0.0.1:20001",permitlisten="127.0.0.1:25001" ssh-ed25519 AAAA... tunnelgate:office-ap:1
 ```
 
@@ -82,8 +82,26 @@ The obvious-looking line starts with `restrict`. It does **not** work. `restrict
 evaluates `permitlisten` **after** the blanket `no-port-forwarding` denial, so every `ssh -R`
 fails with `remote port forwarding failed for listen port N`. Verified against OpenSSH 10.2 with
 a throwaway sshd during development. The renderer therefore spells the restrictions out and
-adds `permitopen="none"` explicitly; a unit test (`tests/test_keys.py`) asserts that
-`restrict` never appears in the output.
+adds `permitopen="127.0.0.1:1"` explicitly; a unit test (`tests/test_keys.py`) asserts
+that `restrict` never appears in the output.
+
+### The `permitopen="none"` trap (the second one, and the more expensive)
+
+`PermitOpen none` is valid in `sshd_config` and blocks `-L` there. It is **not** valid as a
+key option: sshd parses key options through a different table, and the literal `none` fails with
+`authorized_keys:1: bad key options: invalid permission port`, after which **the whole line is
+discarded**. The only symptom is `Permission denied (publickey)` for every router - the fleet
+stops working silently, and the panel's own logs say nothing, because the rejection never reaches
+it (sshd logs it to `auth.log` / `journalctl -u ssh` at `LogLevel INFO`).
+
+This project shipped that bug in 1.0.0 and it was caught only by a real sshd, never by the test
+suite. The line now pins local forwarding to a dead loopback endpoint (`127.0.0.1:1`) instead:
+it parses, `-L` still cannot reach anything real, and `tests/test_keys.py` proves both halves
+behaviourally - a real throwaway sshd must accept the rendered line and open the `-R` listener,
+and the same key must fail when the line says `none`.
+
+If you tighten this yourself, verify with an actual sshd (one `ssh -R`), not by reading the
+file: a rejected line and a working line look identical until a connection is tried.
 
 What the key **cannot** do: run a command, allocate a pty, forward the agent, forward X11, run
 `~/.ssh/rc`, open any local forward, or listen on any port except its own.

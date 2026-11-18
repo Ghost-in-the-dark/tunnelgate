@@ -176,8 +176,25 @@ cp /var/lib/tunnelgate/.ssh/authorized_keys /var/backups/tg.keys
 Restore: stop the panel → copy DB + authorized_keys → start → `app.cli doctor` → check
 `/api/v1/stats`. Routers reconnect on their own; nothing needs to be touched on the router side.
 
-Upgrade: see `docs/INSTALL_SERVER.md` §9. There is no migration engine: model changes are
-additive and `app.cli check-schema` prints the DDL you must apply by hand.
+Upgrade: `sudo sh scripts/update.sh` (or the pipe form in `docs/INSTALL_SERVER.md`
+§9). It backs up first, checks the schema against a snapshot with the new code, rebuilds the SPA,
+restarts, verifies the version over `/api/v1/health` and rolls itself back if the new build does
+not come up. `scripts/update.sh --check-only` tells you whether you are behind without touching
+anything; `--dry-run` prints the plan.
+
+There is no migration engine: model changes are additive and `app.cli check-schema` prints the
+DDL you must apply by hand. The updater treats that as a stop sign, not a warning - it will not
+install a release whose schema needs hand work until you have applied it and re-run with
+`--skip-schema-check`.
+
+Backups taken by the updater live in `/var/backups/tunnelgate/update-<stamp>/` (mode 0700) and
+contain enough to roll back offline: `code.tar.gz`, `pip-freeze.txt`, the database snapshot,
+the env file, `authorized_keys` and both routes files. **The updater never deletes an old
+backup** - each update adds one, so prune them yourself once you are confident in a version:
+
+```bash
+ls -dt /var/backups/tunnelgate/update-* | tail -n +6 | xargs -r rm -rf   # keep the newest five
+```
 
 ## 6. Scaling and capacity
 

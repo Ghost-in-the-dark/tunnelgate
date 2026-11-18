@@ -139,8 +139,13 @@ against OpenSSH 10.2 with a throwaway sshd before this contract was amended. The
 spells the restrictions out and keeps `permitlisten` effective:
 
 ```
-no-pty,no-agent-forwarding,no-X11-forwarding,no-user-rc,command="/bin/false",permitopen="none",permitlisten="127.0.0.1:20001",permitlisten="127.0.0.1:25001" ssh-ed25519 AAAA... tunnelgate:<slug>:1
+no-pty,no-agent-forwarding,no-X11-forwarding,no-user-rc,command="/bin/false",permitopen="127.0.0.1:1",permitlisten="127.0.0.1:20001",permitlisten="127.0.0.1:25001" ssh-ed25519 AAAA... tunnelgate:<slug>:1
 ```
+
+Local forwarding is pinned to `permitopen="127.0.0.1:1"`, not to `none`: `PermitOpen none`
+is an `sshd_config` keyword, and as a key option sshd rejects it and discards the whole line
+("bad key options: invalid permission port"), locking every router out with nothing but
+"Permission denied (publickey)". Frozen by `tests/test_keys.py` against a real sshd.
 
 ## Console lifecycle (what every owner must implement against)
 1. `status=online` and `console_port` allocated. Keys are created **lazily** the first time

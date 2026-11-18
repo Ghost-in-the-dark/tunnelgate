@@ -143,7 +143,8 @@ keys in the file survive, and the uninstaller removes only that comment tag.
 * The panel's host key is pinned on first install and verified against the fingerprint the
   panel reports; the installer refuses to write it otherwise.
 * The public key installed on the panel is restricted with `permitlisten` for exactly the two
-  reverse ports, plus `no-pty`, `command="/bin/false"` and `permitopen="none"`.
+  reverse ports, plus `no-pty`, `command="/bin/false"` and `permitopen="127.0.0.1:1"` (`none` is
+  an sshd_config-only keyword: as a key option sshd rejects the entire line).
 * The console key the heartbeat installs is restricted with `from="127.0.0.1"` plus
   `no-port-forwarding`, `no-agent-forwarding` and `no-X11-forwarding`; it keeps a pty
   because an interactive shell is the point.

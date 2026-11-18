@@ -433,6 +433,11 @@ Recent `ConsoleSession` rows. Operators see their own; admins see all. Filters: 
  "total": 1}
 ```
 
+### `GET /api/v1/routers/{id}/console/sessions`
+
+The same rows scoped to one router, same filters and shape. It is what the router detail page
+asks for; `404 router_not_found` if the router does not exist.
+
 ---
 
 ## Audit

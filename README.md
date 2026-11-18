@@ -4,12 +4,12 @@
 reverse tunnels - plus an in-browser console.**
 
 ```
-        router (behind NAT, no public IP)                 VPS (public IP)
-  ┌──────────────────────────────────┐        ┌──────────────────────────────────────────┐
+    router (behind NAT, no public IP)                        VPS (public IP)
+  ┌────────────────────────────────────┐       ┌──────────────────────────────────────────┐
   │ ssh -R 127.0.0.1:20001:localhost:80│──────▶│ sshd  ──▶ 127.0.0.1:20001  (LuCI)        │
-  │ ssh -R 127.0.0.1:25001:localhost:22│──────▶│        ──▶ 127.0.0.1:25001  (console)     │
-  │ procd keeps it alive, retries      │        │ nginx ──▶ auth_request ──▶ proxy_pass    │
-  └──────────────────────────────────┘        │ panel ──▶ FastAPI + SQLite + React SPA    │
+  │ ssh -R 127.0.0.1:25001:localhost:22│──────▶│        ──▶ 127.0.0.1:25001  (console)    │
+  │ procd keeps it alive, retries      │       │ nginx ──▶ auth_request ──▶ proxy_pass    │
+  └────────────────────────────────────┘       │ panel ──▶ FastAPI + SQLite + React SPA   │
                                                └──────────────────────────────────────────┘
 ```
 

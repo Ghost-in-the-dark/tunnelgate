@@ -17,6 +17,7 @@ from app.cli import (
     OK,
     WARN,
     Report,
+    _check_agent_endpoint,
     _check_launch,
     _check_proxy,
     _check_routes_include,
@@ -593,3 +594,26 @@ def test_subdomain_mode_never_checks_the_namespace(settings):
     report = Report()
     _check_slug_namespace(settings, report)
     assert [c for c in report.checks if c.name == "slug namespace"] == []
+
+
+# ------------------------------------------------------- agent endpoint (behind a proxy)
+def test_a_loopback_agent_endpoint_is_warned_about(settings) -> None:
+    """The install command is unrunnable and the panel's own logs say nothing."""
+    settings.panel_url = "http://127.0.0.1:8080"
+    settings.public_url = None
+    report = Report()
+    _check_agent_endpoint(settings, report)
+    check = next(c for c in report.checks if c.name == "agent endpoint")
+    assert check.status == WARN
+    assert "127.0.0.1" in check.detail
+    assert "TUNNELGATE_PUBLIC_URL" in check.fix
+
+
+def test_a_public_agent_endpoint_passes(settings) -> None:
+    settings.panel_url = "http://127.0.0.1:8080"
+    settings.public_url = "https://panel.example.com"
+    report = Report()
+    _check_agent_endpoint(settings, report)
+    check = next(c for c in report.checks if c.name == "agent endpoint")
+    assert check.status == OK
+    assert "https://panel.example.com" in check.detail

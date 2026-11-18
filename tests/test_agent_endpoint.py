@@ -230,3 +230,54 @@ def test_probe_accepts_a_healthy_panel(monkeypatch) -> None:
     assert result["ok"] is True
     assert result["checked_url"] == "https://panel.test/api/v1/health"
     assert result["latency_ms"] is not None
+
+
+# --------------------------------------------------- a loopback panel_url is not a router's address
+def test_a_loopback_panel_url_falls_back_to_the_public_origin() -> None:
+    """The documented install shape: nginx on the panel host forwards to 127.0.0.1.
+
+    A router on a customer network cannot dial 127.0.0.1, so the agent URL has to be the public
+    origin the operator named - otherwise a fresh install hands out an install command that only
+    works on the panel host itself.
+    """
+    settings = make_settings(
+        panel_url="http://127.0.0.1:8080", public_url="https://panel.example.com"
+    )
+    endpoint = agent_endpoint.environment_endpoint(settings)
+    assert endpoint.url == "https://panel.example.com"
+    assert agent_endpoint.agent_url(None, settings) == "https://panel.example.com"
+
+
+def test_a_public_panel_url_wins_over_the_public_origin() -> None:
+    """A flat install (panel_url already public) keeps behaving exactly as before."""
+    settings = make_settings(
+        panel_url="https://direct.example.com", public_url="https://panel.example.com"
+    )
+    assert agent_endpoint.environment_endpoint(settings).url == "https://direct.example.com"
+
+
+def test_the_public_fallback_keeps_a_non_default_port() -> None:
+    settings = make_settings(
+        panel_url="http://127.0.0.1:8080", public_url="http://panel.example.com:8095"
+    )
+    assert agent_endpoint.environment_endpoint(settings).url == "http://panel.example.com:8095"
+
+
+def test_a_loopback_public_origin_is_not_an_improvement() -> None:
+    """Nothing usable means the loopback value is still reported, so doctor can explain it."""
+    settings = make_settings(panel_url="http://127.0.0.1:8080", public_url="http://127.0.0.1:8080")
+    endpoint = agent_endpoint.environment_endpoint(settings)
+    assert endpoint.host == "127.0.0.1"
+    assert agent_endpoint.agent_url(None, settings) == "http://127.0.0.1:8080"
+
+
+def test_a_stored_override_still_beats_the_public_fallback() -> None:
+    with session_scope() as db:
+        agent_endpoint.save(db, "https", "moved.example.com", None)
+        db.commit()
+        settings = make_settings(
+            panel_url="http://127.0.0.1:8080", public_url="https://panel.example.com"
+        )
+        endpoint = agent_endpoint.effective(db, settings)
+        assert endpoint.url == "https://moved.example.com"
+        assert endpoint.source == agent_endpoint.SOURCE_DATABASE

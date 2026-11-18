@@ -370,6 +370,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     _check_ports(settings, report)
     _check_proxy(settings, report)
     _check_launch(settings, report)
+    _check_agent_endpoint(settings, report)
     _check_slug_namespace(settings, report)
     _check_console(settings, report)
     _check_frontend(settings, report)
@@ -1077,8 +1078,14 @@ def _check_launch(settings: Settings, report: Report) -> None:
 
     header = cookie_header_name(settings.router_cookie_name)
     routes_text = _read_text(routes_path)
+    # An empty fleet renders no /__tg/enter anywhere, because the hand-off is emitted once
+    # per router. That is not a stale config - it is a panel nobody has onboarded yet - so
+    # the absence only means something when the renderer did NOT say the fleet is empty.
+    # (Treating it as stale made doctor FAIL on every fresh install, which is the one moment
+    # an operator is guaranteed to run it.)
+    empty_fleet = "No routers currently have an allocated tunnel port." in routes_text
     stale = []
-    if "/__tg/enter" not in routes_text:
+    if "/__tg/enter" not in routes_text and not empty_fleet:
         stale.append("the router vhosts have no /__tg/enter, so Public route loops via /login")
     if settings.path_routing:
         # Path mode has no per-router vhost and no shared snippet: the auth location is part
@@ -1098,8 +1105,47 @@ def _check_launch(settings: Settings, report: Report) -> None:
             "; ".join(stale),
             "python -m app.cli render-proxy   # then reload nginx (the .path unit does it)",
         )
+    elif empty_fleet:
+        # Passing here is correct - there is nothing that could loop - but saying
+        # "/__tg/enter is served" would be false: the gate exists, no router does.
+        report.ok(
+            "launch config",
+            "no routers yet; each hand-off appears when its router gets a port",
+        )
     else:
         report.ok("launch config", "/__tg/enter is served and the gate sees the router cookie")
+
+
+def _check_agent_endpoint(settings: Settings, report: Report) -> None:
+    """The address a router is told to dial - the one value an install cannot recover from.
+
+    A router on a customer network has no route to the panel host's loopback. If the endpoint
+    comes out loopback, every install command the panel renders is unrunnable and the router
+    simply never appears; nothing in the panel's own logs says so, because from the panel's
+    point of view nothing failed. Readers of this report are usually holding exactly that
+    symptom, so name the value and the fix.
+    """
+    from .services import agent_endpoint as endpoints
+
+    try:
+        with session_scope() as db:
+            endpoint = endpoints.effective(db, settings)
+            url = endpoints.agent_url(db, settings)
+    except Exception as exc:  # a broken database is reported by _check_storage already
+        report.warn("agent endpoint", f"could not be read: {exc}")
+        return
+
+    host = (endpoint.host if endpoint is not None else "").strip("[]").lower()
+    if host in {"127.0.0.1", "::1", "localhost"}:
+        report.warn(
+            "agent endpoint",
+            f"routers are told to dial {url}, which is this host's loopback",
+            "a router cannot reach that: set TUNNELGATE_PUBLIC_URL to the address routers can "
+            "dial (it is used automatically while TUNNELGATE_PANEL_URL stays loopback), or set "
+            "the endpoint in Settings -> Panel. See docs/INSTALL_SERVER.md section 7",
+        )
+    else:
+        report.ok("agent endpoint", f"{url} ({endpoint.source})")
 
 
 def _gateway_problem(host: str) -> str:

@@ -269,9 +269,16 @@ class Settings(BaseSettings):
         return "/" + str(slug).strip().strip("/")
 
     def router_url(self, slug: str) -> str:
-        if self.path_routing:
-            return f"https://{self.gateway}{self.router_prefix(slug)}/"
-        return f"https://{slug}.{self.host_suffix}"
+        """The public address of a router's LuCI.
+
+        Delegated on purpose: the scheme depends on TUNNELGATE_PUBLIC_URL and the merged
+        layout's port, and two copies of that decision is exactly how the panel ended up
+        advertising https URLs on an install that only answers http. app.services.proxy owns
+        the rendering; this is here because callers hold a Settings and nothing else.
+        """
+        from .services.proxy import router_url as _router_url
+
+        return _router_url(self, slug)
 
     @property
     def console_bind_address(self) -> str:

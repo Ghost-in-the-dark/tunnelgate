@@ -205,9 +205,33 @@ def _load_row(db: Session) -> AgentEndpoint | None:
     return AgentEndpoint(endpoint.scheme, endpoint.host, endpoint.port, SOURCE_DATABASE)
 
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def _is_loopback(host: str | None) -> bool:
+    return (host or "").strip("[]").lower() in _LOOPBACK_HOSTS
+
+
 def environment_endpoint(settings: Settings | None = None) -> AgentEndpoint | None:
+    """What TUNNELGATE_* says routers should dial.
+
+    TUNNELGATE_PANEL_URL is authoritative when it names something a router can reach. It is
+    loopback on the documented install shape (nginx on the same host proxy_passes to it), and a
+    router on a customer network can never dial 127.0.0.1 - so a loopback value falls through
+    to TUNNELGATE_PUBLIC_URL, which is the same origin by definition and is what the operator
+    typed when they set the install up. Without that fallback a fresh install handed out
+    "http://127.0.0.1:8080" as the agent URL and the install command could only work on the
+    panel host itself. The loopback value is still returned when nothing better exists, so
+    doctor can report it instead of claiming there is no setting at all.
+    """
     s = settings or get_settings()
-    return from_panel_url(s.panel_url)
+    endpoint = from_panel_url(s.panel_url)
+    if endpoint is not None and not _is_loopback(endpoint.host):
+        return endpoint
+    public = from_panel_url(str(getattr(s, "public_url", None) or ""))
+    if public is not None and not _is_loopback(public.host):
+        return public
+    return endpoint
 
 
 def effective(db: Session | None = None, settings: Settings | None = None) -> AgentEndpoint | None:

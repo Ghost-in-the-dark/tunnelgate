@@ -174,6 +174,11 @@ Two URL fields, and they are not interchangeable:
 | `url` | `https://<slug>.<suffix>` | the router's real public address - display it, copy it, poll it |
 | `launch_url` | `https://<slug>.<suffix>/__tg/enter` | what a click must follow: it installs a cookie scoped to that router host |
 
+The scheme is `https` unless `TUNNELGATE_PUBLIC_URL` is explicitly an `http` origin, in which
+case both fields use `http` - an install that only answers plain HTTP must not advertise links
+nothing listens on. In path mode on the panel's own host (the merged layout) the URLs also carry
+`TUNNELGATE_PUBLIC_URL`'s port. See `docs/INSTALL_SERVER.md` §7.
+
 `null` for both while the router has no proxy route yet. Opening `url` in a browser that has
 never been through the hand-off bounces through `/login`; see
 [the launch hand-off](#internal-the-router-launch-hand-off).
@@ -463,8 +468,9 @@ panel still binds loopback, while routers dial the public address. Pointing `pan
 public name to fix that would break the panel's own routing, which is why the override lives in
 the database and not in the env file.
 
-Source is reported honestly in every response: `environment` (from `TUNNELGATE_PANEL_URL`) or
-`database` (the admin stored an override).
+Source is reported honestly in every response: `environment` (from `TUNNELGATE_PANEL_URL`, or
+from `TUNNELGATE_PUBLIC_URL` when the former is loopback and therefore unreachable from a router)
+or `database` (the admin stored an override).
 
 ### `GET /api/v1/settings/agent-endpoint`
 
@@ -599,7 +605,12 @@ The two URLs answer different questions and are deliberately not the same field:
 | `agent_endpoint_testable` | `false` exactly when `agent_endpoint` is `null` - there is nothing well-formed to probe. |
 
 `agent_url` is always populated: it falls back to the raw `TUNNELGATE_PANEL_URL` string even when
-that string does not parse, so the SPA can show an operator what routers are being told. Setting
+that string does not parse, so the SPA can show an operator what routers are being told.
+
+When `TUNNELGATE_PANEL_URL` is loopback (the documented shape: nginx on the panel host forwards
+to it) the endpoint comes from `TUNNELGATE_PUBLIC_URL` instead, because no router on a customer
+network can dial `127.0.0.1` - and an install command naming loopback only works on the panel
+host itself. A loopback origin in both places is still reported, so `doctor` can explain it. Setting
 the override is `PUT /api/v1/settings/agent-endpoint` (see [Settings](#settings-admin-only-csrf)).
 
 ### `GET /api/v1/stats`

@@ -81,9 +81,17 @@ jobs:
 
       - name: busybox ash syntax check
         run: |
-          for f in agent/install.sh agent/uninstall.sh agent/tunnelgate.init; do
+          for f in agent/install.sh agent/uninstall.sh agent/tunnelgate.init scripts/quick-install.sh; do
             busybox sh -n "$f" && echo "ok $f"
           done
+
+      # scripts/quick-install.sh runs as root on somebody's server before anything else
+      # exists there, so a syntax error or an undefined variable is not recoverable by a
+      # later redeploy. It is checked here with the same rules as the router installer; the
+      # installer's own assertions live in tests/test_quick_install.py (backend job).
+      - name: quick install script (shellcheck)
+        run: |
+          shellcheck -s sh -e SC1091,SC3043,SC2039 scripts/quick-install.sh
 
       - name: installer test suite
         run: |

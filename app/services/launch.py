@@ -89,14 +89,12 @@ def launch_url(settings, slug: str, ticket: str | None = None) -> str:
     panel login, which mints a ticket once the operator is signed in and finishes the trip -
     that is what keeps a bookmarked or pasted public URL working instead of looping.
     """
-    if settings.path_routing:
-        # https://<gateway>/<slug>/__tg/enter - the gateway host is shared by the whole fleet,
-        # so the slug has to be in the path. This is the only form that works without DNS for
-        # *.<suffix> or a wildcard certificate (and the only one that works when the suffix is
-        # a bare IP, which a browser refuses to parse as a subdomain).
-        base = f"https://{settings.gateway}{settings.router_prefix(slug)}{ENTER_PATH}"
-    else:
-        base = f"https://{slug}.{settings.host_suffix}{ENTER_PATH}"
+    # Built on router_url so the scheme (https, or http on an install that states a plain-HTTP
+    # public origin) and, in the merged path layout, the public port are decided in one place:
+    # a launch URL that names a different scheme from the router URL is a broken click.
+    from .proxy import router_url
+
+    base = router_url(settings, slug).rstrip("/") + ENTER_PATH
     return f"{base}?t={ticket}" if ticket else base
 
 

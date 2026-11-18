@@ -57,7 +57,7 @@ router side; the panel dials **in** through the console listener for its shell.
 ## Quick start (development)
 
 ```bash
-git clone https://github.com/your-org/tunnelgate.git && cd tunnelgate
+git clone https://github.com/Ghost-in-the-dark/tunnelgate.git && cd tunnelgate
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt -r requirements-dev.txt
 (cd web && npm ci && npm run build)     # or: npm run dev (see below)
@@ -76,6 +76,26 @@ cd web && npm run typecheck && npm run build
 ```
 
 ## Production deployment
+
+If your TLS is terminated by **your own reverse proxy** (nginx, Caddy, Traefik, a load
+balancer), one command installs everything up to that point - no certificate, no DNS record, no
+ACME client:
+
+```bash
+git clone https://github.com/Ghost-in-the-dark/tunnelgate.git /opt/tunnelgate-src
+cd /opt/tunnelgate-src
+sudo ./scripts/quick-install.sh --host gate.example.com
+```
+
+It serves plain HTTP on one port and uses path routing in the merged layout, so every router is
+`<your-public-url>/<slug>/` on the panel's own name - one ordinary name (a free dynamic-DNS one
+included) and no wildcard certificate are enough. It then prints the `proxy_set_header` lines
+your edge has to replicate. Run with `--help` for the flags, `--dry-run` to see the plan, and
+read [docs/INSTALL_SERVER.md](docs/INSTALL_SERVER.md#quick-install-tls-terminated-by-your-own-proxy)
+for what it does and the traps it handles. Merged layout shares the panel's origin with every
+router - read [docs/SECURITY.md §6.1](docs/SECURITY.md) before adding routers you do not control.
+
+Manual install, for a host that terminates TLS itself:
 
 ```bash
 # VPS, Ubuntu/Debian - full walkthrough in docs/INSTALL_SERVER.md
@@ -129,6 +149,7 @@ app/                  FastAPI application
   config.py db.py models.py schemas.py security.py deps.py errors.py main.py cli.py
 agent/                OpenWrt installer, procd init script, uninstaller (POSIX sh / dropbear)
 deploy/               nginx + Caddy configs, sshd drop-in, systemd units, docker-compose
+scripts/              quick-install.sh (behind your own proxy), setup-server.sh (full TLS host), dev.sh
 web/                  React + TypeScript + Vite SPA (list, wizard, router page, console)
 tests/                pytest suite
 docs/                 the documents above

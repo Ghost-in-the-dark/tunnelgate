@@ -9,6 +9,8 @@ of the same server block, and it silently rots unless a test keeps the two in st
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import httpx
@@ -23,7 +25,7 @@ from app.models import (
     Router,
 )
 from app.services import proxy as proxy_module
-from app.services.launch import cookie_header_name
+from app.services.launch import cookie_header_name, launch_url
 from app.services.proxy import (
     CADDY_ROUTE_PREFIX,
     ProxyError,
@@ -1056,3 +1058,217 @@ def test_caddy_refuses_path_mode_instead_of_half_implementing_it(db, settings, e
     message = str(excinfo.value)
     assert "nginx" in message
     assert "path" in message
+
+
+# ---------------------------------------------- real nginx: what a fresh install parses
+# The generated file is only useful if nginx accepts it BEFORE the first router exists.
+# These tests run a real nginx binary when the host has one; the string tests elsewhere
+# cannot catch a parse failure like 'unknown "tg_router" variable'.
+NGINX = shutil.which("nginx") or ("/usr/sbin/nginx" if Path("/usr/sbin/nginx").exists() else None)
+requires_nginx = pytest.mark.skipif(NGINX is None, reason="needs a real nginx binary")
+
+
+def _self_signed_cert(directory: Path) -> tuple[Path, Path]:
+    """A throwaway certificate, so a TLS server block can be parsed offline."""
+    directory.mkdir(parents=True, exist_ok=True)
+    cert = directory / "cert.pem"
+    key = directory / "key.pem"
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            str(key),
+            "-out",
+            str(cert),
+            "-days",
+            "1",
+            "-subj",
+            "/CN=panel.test",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return cert, key
+
+
+def _nginx_accepts(
+    tmp_path: Path,
+    include_text: str,
+    *,
+    inside_server: bool,
+    cert: Path | None = None,
+    key: Path | None = None,
+) -> tuple[int, str]:
+    """Run 'nginx -t' over a config that pulls include_text in from the layout's context."""
+    prefix = tmp_path / "prefix"
+    (prefix / "logs").mkdir(parents=True, exist_ok=True)
+    included = prefix / "routes.conf"
+    included.write_text(include_text)
+    if inside_server:
+        # Merged layout: locations only, included inside the panel server block, which is
+        # the operator's block in production - this driver stands in for it.
+        if cert is None or key is None:
+            cert, key = _self_signed_cert(prefix / "tls")
+        body = (
+            "events {}\n"
+            "http {\n"
+            "    map $http_upgrade $connection_upgrade { default upgrade; '' close; }\n"
+            "    server {\n"
+            "        listen 127.0.0.1:8443 ssl;\n"
+            f"        ssl_certificate {cert};\n"
+            f"        ssl_certificate_key {key};\n"
+            "        server_name panel.test;\n"
+            f"        include {included};\n"
+            '        location / { return 200 "panel"; }\n'
+            "    }\n"
+            "}\n"
+        )
+    else:
+        # Separate layout: the file declares its own server{} block.
+        body = f"events {{}}\nhttp {{\n    include {included};\n}}\n"
+    conf = prefix / "nginx.conf"
+    conf.write_text(body)
+    proc = subprocess.run(
+        [NGINX, "-t", "-c", str(conf), "-p", str(prefix)], capture_output=True, text=True
+    )
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+def _tls_for_render(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
+    """Point the renderer at a throwaway certificate.
+
+    The separate-layout render hardcodes ssl_certificate, and Settings rejects unknown
+    attribute assignment (pydantic), so the override has to come from the environment that
+    _tls_cert_path() / _tls_key_path() consult.
+    """
+    cert, key = _self_signed_cert(tmp_path / "tls")
+    monkeypatch.setenv("TUNNELGATE_TLS_CERT", str(cert))
+    monkeypatch.setenv("TUNNELGATE_TLS_KEY", str(key))
+    return cert, key
+
+
+@pytest.mark.parametrize("merged", [False, True], ids=["separate", "merged"])
+@requires_nginx
+def test_a_zero_router_path_mode_config_is_accepted_by_nginx(
+    tmp_path, settings, merged, monkeypatch
+):
+    """A fresh install has no routers yet, and nginx must still load its gateway.
+
+    The first version of this renderer emitted the /__tg/auth and @tg_login locations and
+    nothing else, and both USE $tg_router / $tg_slug while only the (absent) per-router
+    locations declared them. nginx therefore refused the whole config with
+    'unknown "tg_router" variable' - and because the installer validates before reloading,
+    the panel could not be brought up at all until an operator added a router by hand.
+    """
+    _path_settings(settings)
+    if merged:
+        _merged_path_settings(settings)
+    cert, key = _tls_for_render(tmp_path, monkeypatch)
+    rendered = render_nginx([], settings)
+    assert "/__tg/enter" not in rendered, "this really is the empty fleet"
+    code, output = _nginx_accepts(tmp_path, rendered, inside_server=merged, cert=cert, key=key)
+    assert code == 0, output
+
+
+@requires_nginx
+def test_a_one_router_path_mode_config_is_accepted_by_nginx(
+    tmp_path, settings, edge, db, monkeypatch
+):
+    """The populated case keeps parsing, so the fix did not merely move the failure."""
+    _path_settings(settings)
+    cert, key = _tls_for_render(tmp_path, monkeypatch)
+    rendered = render_nginx(load_routes(db), settings)
+    code, output = _nginx_accepts(tmp_path, rendered, inside_server=False, cert=cert, key=key)
+    assert code == 0, output
+
+
+def test_path_mode_declares_the_gate_variables_for_an_empty_fleet(settings):
+    """The declaration must be a location, not a server-level set.
+
+    A 'set' directly in the server block silences the parser too, but nginx re-evaluates it
+    when the 401 is internally redirected to @tg_login, so the login bounce loses the slug
+    ('/login?router=&next=...') and the hand-off to the router breaks. A 'map' cannot be
+    used either: it is illegal inside a server block, and this file lives inside one.
+    """
+    _path_settings(settings)
+    lines = _directives(render_nginx([], settings))
+    declared = [
+        line.strip() for line in lines if line.strip() in {"set $tg_router '';", "set $tg_slug '';"}
+    ]
+    assert declared == ["set $tg_router '';", "set $tg_slug '';"], "exactly one declaration each"
+    marker = next(i for i, line in enumerate(lines) if "location = /__tg/vars {" in line)
+    assert lines[marker + 1].strip() == "internal;"
+    auth = next(i for i, line in enumerate(lines) if "location = /__tg/auth {" in line)
+    assert marker < auth, "the declaration has to precede the locations that use it"
+    for offset, line in enumerate(lines):
+        if line.strip() in {"set $tg_router '';", "set $tg_slug '';"}:
+            assert marker < offset < auth, line
+
+
+# ------------------------------------------- the scheme a published URL must name
+def test_public_scheme_stays_https_without_an_explicit_origin(settings):
+    """A panel behind a TLS terminator that forgot PUBLIC_URL must not downgrade itself."""
+    settings.public_url = None
+    settings.panel_url = "http://127.0.0.1:8080"
+    assert proxy_module.public_scheme(settings) == "https"
+
+
+def test_public_scheme_follows_an_http_public_origin(settings):
+    settings.public_url = "http://panel.example.com"
+    assert proxy_module.public_scheme(settings) == "http"
+
+
+def test_router_url_uses_the_public_scheme(settings):
+    """An install that only answers http must not advertise https links.
+
+    quick-install.sh publishes the panel on plain HTTP and leaves TLS to the operator's own
+    proxy; with the scheme hardcoded every "Open LuCI" click and every provisioned
+    launch_url named https://<host>/<slug>/ and could not connect.
+    """
+    settings.route_mode = "path"
+    settings.gateway_host = "panel.example.com"
+    settings.panel_host = "panel.example.com"
+    settings.public_url = "http://panel.example.com"
+    assert proxy_module.router_url(settings, "edge-one") == "http://panel.example.com/edge-one/"
+    assert launch_url(settings, "edge-one") == "http://panel.example.com/edge-one/__tg/enter"
+
+
+def test_subdomain_router_url_also_follows_the_public_scheme(settings):
+    settings.public_url = "http://routers.example.com"
+    settings.subdomain_suffix = "routers.example.com"
+    assert proxy_module.router_url(settings, "edge-one") == "http://edge-one.routers.example.com"
+
+
+def test_a_merged_gateway_keeps_the_public_port(settings):
+    """The merged layout shares the panel origin, so the port browsers use is also the router's."""
+    settings.route_mode = "path"
+    settings.panel_host = "panel.example.com"
+    settings.gateway_host = "panel.example.com"
+    settings.panel_url = "http://127.0.0.1:8080"
+    settings.public_url = "http://panel.example.com:8095"
+    assert (
+        proxy_module.router_url(settings, "edge-one") == "http://panel.example.com:8095/edge-one/"
+    )
+
+
+def test_a_separate_gateway_never_borrows_the_panel_port(settings):
+    """A gateway on its own name is not on the panel's port; nothing names one, so use the default."""
+    settings.route_mode = "path"
+    settings.panel_host = "panel.example.com"
+    settings.gateway_host = "gate.example.com"
+    settings.public_url = "https://panel.example.com:8443"
+    assert proxy_module.router_url(settings, "edge-one") == "https://gate.example.com/edge-one/"
+
+
+def test_the_settings_copy_of_router_url_agrees_with_the_renderer(settings):
+    """Two implementations used to exist and they drifted; there is now one decision."""
+    settings.route_mode = "path"
+    settings.panel_host = "panel.example.com"
+    settings.gateway_host = "panel.example.com"
+    settings.public_url = "http://panel.example.com:8095"
+    assert settings.router_url("edge-one") == proxy_module.router_url(settings, "edge-one")

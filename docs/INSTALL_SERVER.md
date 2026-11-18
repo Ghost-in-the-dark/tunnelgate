@@ -17,6 +17,78 @@ The router vhosts are `<slug>.<host_suffix>`, so with the values above a router 
 
 ---
 
+## Quick install (TLS terminated by your own proxy)
+
+If you already run a reverse proxy - nginx, Caddy, Traefik, a cloud load balancer - and this
+host needs **no certificate, no DNS record and no ACME client**, there is a one-command install
+for exactly that shape:
+
+```bash
+git clone https://github.com/Ghost-in-the-dark/tunnelgate.git /opt/tunnelgate-src
+cd /opt/tunnelgate-src
+sudo ./scripts/quick-install.sh --host gate.example.com
+```
+
+It installs `deploy/nginx/tunnelgate-behind-proxy.conf`: plain HTTP on one port, **path routing
+in the merged layout**, so every router is `<your-public-url>/<slug>/` on the panel's own name.
+That is what makes a single ordinary name - including a free dynamic-DNS one - enough: no
+wildcard DNS, no wildcard certificate, no per-router DNS step. It stops after nginx answers on
+that port and prints the forwarding snippet your proxy has to replicate.
+
+```bash
+sudo ./scripts/quick-install.sh --host 192.168.1.10 --public-scheme http   # IP / LAN
+sudo ./scripts/quick-install.sh --host gate.example.com --proxy-hops 2    # proxy in front of a proxy
+sudo ./scripts/quick-install.sh --host gate.example.com --dry-run         # print, change nothing
+```
+
+`--proxy-hops` is how many proxies append `X-Forwarded-For`; set it and
+`TUNNELGATE_TRUSTED_PROXIES` to the addresses the panel actually sees (see
+[Behind a reverse proxy](#behind-a-reverse-proxy-or-load-balancer)).
+
+The merged layout costs origin isolation - a router page shares the panel's origin and can use
+the operator's session. That is a documented, deliberate trade, not a side effect: read
+[docs/SECURITY.md §6.1](SECURITY.md) before adding routers you do not physically control. If
+you can spare a second name, prefer the separate layout and the manual walkthrough below.
+
+What the script deliberately does **not** do: certificates, DNS, ACME, your edge proxy's config,
+or opening the router ports. Section by section it mirrors steps 1-9 below, and `--help` lists
+every flag.
+
+### After the quick install
+
+1. Point your proxy at `http://<this host>:<port>` (default port 80), forwarding `Host`,
+   `X-Real-IP`, `X-Forwarded-For` and `X-Forwarded-Proto`. The summary block the script prints
+   has the exact `proxy_set_header` lines.
+2. Log in as `admin`; the generated password is in `TUNNELGATE_ADMIN_PASSWORD` in the
+   environment file (mode 0600).
+3. Create one router and open it end to end before adding the rest.
+
+### Traps this script exists to get right
+
+| Trap | What happens without the fix |
+|---|---|
+| the tunnel account's password field starts as `!` | `ssh` refuses the router key with "account is locked", indistinguishable from a bad key |
+| `authorized_keys` under `/tmp` or another world-writable dir | sshd refuses it outright ("bad ownership or modes") even with `StrictModes no` |
+| an empty router fleet renders a `routes.conf` that references `$tg_router` | `nginx -t` fails with `unknown "tg_router" variable` and nothing reloads |
+| `TUNNELGATE_TRUSTED_PROXIES=[...]` unquoted in the env file | systemd strips the inner quotes, pydantic-settings fails to parse it, the panel never starts |
+| `TUNNELGATE_PROXY_RELOAD_COMMAND` set | the unit runs `NoNewPrivileges=yes`, so the panel cannot reload nginx; the shipped `.path`/`.service` pair does it as root instead |
+| `sshd -t` passes but the reload loses the listener | new logins are refused while the install reports success - the script checks `:22` after every reload and escalates to a restart only if it is gone |
+| `app.cli doctor` run as `tunnelgate` | a false FAIL on the routes include (it cannot read the private key or the pid file) - run it as `root` |
+| a `web/dist` that was never built | the API works and every page 404s - the script builds it and warns when it cannot |
+| `systemctl restart` returning while the panel is still failing | the unit is "active" for a moment even when the panel cannot bind, so an install looking only at the unit exits 0 into a panel that never serves - the script polls `/api/v1/health` and stops with the journal when it does not answer |
+| a plain-HTTP origin with the default settings | every router link and install command says `https://`, and no router can complete the handshake - the script writes `TUNNELGATE_PUBLIC_URL` with the scheme you asked for, which sets the scheme of router URLs and is also the agent address routers dial when `PANEL_URL` is loopback |
+
+If demo routers are present in the database from a trial run, drop them before going live:
+
+```bash
+cd /opt/tunnelgate && .venv/bin/python -m app.cli seed-demo --purge
+```
+
+The rest of this document is the manual walkthrough. It is what the script automates, and the
+reference when you need to do one step by hand.
+
+---
+
 ## 0. Decide the DNS layout first
 
 Three options; pick one before requesting certificates.
@@ -322,7 +394,7 @@ If you changed the port or file and cannot log in, use the provider's console to
 ## 5. Panel installation
 
 ```bash
-git clone https://github.com/your-org/tunnelgate.git /opt/tunnelgate
+git clone https://github.com/Ghost-in-the-dark/tunnelgate.git /opt/tunnelgate
 cd /opt/tunnelgate
 python3 -m venv .venv
 .venv/bin/pip install --upgrade pip
@@ -578,7 +650,7 @@ There are two separate questions here and they are easy to conflate:
 |---|---|
 | Where does the panel listen for its **own** proxy? | `TUNNELGATE_PANEL_URL` (usually `http://127.0.0.1:8080`) |
 | Where do **browsers** reach the panel? | `TUNNELGATE_PUBLIC_URL` |
-| Where do **routers** dial the panel? | the **agent endpoint** - `TUNNELGATE_PANEL_URL` by default, overridable from the UI |
+| Where do **routers** dial the panel? | the **agent endpoint** - `TUNNELGATE_PANEL_URL` when it is reachable, else `TUNNELGATE_PUBLIC_URL`, overridable from the UI |
 
 On a flat install the first two are the same string and nothing needs doing. They diverge as soon
 as a TLS terminator, a load balancer or a non-default port sits in front: the panel still binds
@@ -592,6 +664,15 @@ bounce from a router vhost, and the one-time router launch hand-off. Unset, it i
 install. **Set it explicitly whenever `TUNNELGATE_PANEL_URL` is loopback** - otherwise a browser
 that follows "Open LuCI" is redirected to `http://127.0.0.1:8080`, which cannot work.
 `python -m app.cli doctor` warns about exactly that combination.
+
+It also decides two things that used to be hardcoded:
+
+* **the scheme of the router URLs.** `https`, unless this value is explicitly `http://...` - an
+  install that only answers plain HTTP (TLS terminated by your own proxy in front, the shape
+  `scripts/quick-install.sh` sets up) must not advertise `https` links that nothing listens on.
+* **the agent endpoint.** Routers dial the origin in this value whenever `TUNNELGATE_PANEL_URL`
+  is loopback, because a router cannot dial `127.0.0.1`. Without it a fresh install hands out an
+  install command that only works on the panel host itself.
 
 ### Moving the panel without re-installing routers
 
@@ -949,7 +1030,7 @@ are most likely to touch:
 |---|---|---|
 | `TUNNELGATE_PANEL_URL` | `http://127.0.0.1:8080` | Where the panel listens for its own proxy - **not** necessarily what routers dial. Fallback for the agent endpoint; override it from the UI instead. See §7 |
 | `TUNNELGATE_PANEL_HOST` | `panel.example.com` | nginx `server_name` for the panel |
-| `TUNNELGATE_PUBLIC_URL` | derived from `PANEL_URL` + `PANEL_HOST` | Origin **browsers** use: every redirect the panel writes (login bounce, router launch) names it. Required when `PANEL_URL` is loopback - see §7 |
+| `TUNNELGATE_PUBLIC_URL` | derived from `PANEL_URL` + `PANEL_HOST` | Origin **browsers and routers** use: every redirect the panel writes (login bounce, router launch) names it, it sets the scheme of the advertised router URLs, and it is the agent endpoint when `PANEL_URL` is loopback. Required when `PANEL_URL` is loopback - see §7 |
 | `TUNNELGATE_ROUTE_MODE` | `subdomain` | How routers are published: `subdomain` (`<slug>.<suffix>`, needs a wildcard certificate) or `path` (one gateway host, `<gateway>/<slug>/`, needs one ordinary certificate and **nginx**). Unknown values fall back to `subdomain` so a typo cannot stop the panel from booting; `app.cli doctor` reports it |
 | `TUNNELGATE_SUBDOMAIN_SUFFIX` | =`panel_host` | Suffix for router vhosts - `subdomain` mode only |
 | `TUNNELGATE_GATEWAY_HOST` | =`gate.<suffix>` | The single host routers are published under in `path` mode. Must be a DNS name, not an IP: a CA cannot issue for an IP. Equal to `TUNNELGATE_PANEL_HOST` selects the *merged* layout (shared origin; include `routes.conf` inside the panel `server` block), different gives *separate*, the recommended one. Checked by `app.cli doctor`, which warns on merged and fails an IP, empty or dotless value |

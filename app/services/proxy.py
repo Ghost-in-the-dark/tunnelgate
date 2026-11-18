@@ -195,16 +195,53 @@ def auth_snippet_path(routes_path: str | Path) -> Path:
     return path.with_name(path.stem + ".auth" + path.suffix)
 
 
+def public_scheme(settings) -> str:
+    """The URL scheme a browser must use for a published router.
+
+    https everywhere, except an install that explicitly states a plain-HTTP public origin
+    (TUNNELGATE_PUBLIC_URL=http://... - the shape scripts/quick-install.sh produces when the
+    operator puts their own TLS proxy in front). Only an EXPLICIT http origin lowers this: with
+    no TUNNELGATE_PUBLIC_URL the historic https is kept, because a panel behind a TLS
+    terminator that forgot the variable must not start advertising plain-HTTP router URLs.
+    """
+    raw = str(getattr(settings, "public_url", None) or "").strip()
+    if raw and urlsplit(raw).scheme == "http":
+        return "http"
+    return "https"
+
+
+def _public_port_for(settings, host: str) -> str:
+    """ ":port" when the public origin names this host on a non-default port, else "".
+
+    Only meaningful where the router shares the panel's origin (the merged path layout): there
+    the port browsers use is the port routers are reached on. A separate gateway host or a
+    subdomain keeps the default port, because nothing in the config names another one.
+    """
+    try:
+        parts = urlsplit(public_origin(settings))
+    except ProxyError:
+        return ""
+    same_host = (parts.hostname or "").strip("[]").lower() == host.strip("[]").lower()
+    return f":{parts.port}" if same_host and parts.port else ""
+
+
 def router_url(settings, slug: str) -> str:
     """The plain public address of a router's LuCI (what a bookmark should hold).
 
     Subdomain mode gives every router its own host; path mode gives the whole fleet one host
-    and a per-router prefix. The single place that decision is made - the API, the CLI and the
-    installer all call this instead of building the URL themselves.
+    and a per-router prefix. The single place that decision is made - the API, the CLI, the
+    installer and app/config.py all call this instead of building the URL themselves.
+
+    The scheme comes from public_scheme(), so a deployment published over plain HTTP (or with
+    the panel behind the operator's own TLS proxy) advertises URLs that actually answer:
+    hardcoding https here made every router link unreachable on an HTTP-only install.
     """
+    scheme = public_scheme(settings)
     if settings.path_routing:
-        return f"https://{settings.gateway}{settings.router_prefix(slug)}/"
-    return f"https://{slug}.{settings.host_suffix}"
+        host = settings.gateway
+        port = _public_port_for(settings, host) if settings.gateway_merged else ""
+        return f"{scheme}://{host}{port}{settings.router_prefix(slug)}/"
+    return f"{scheme}://{slug}.{settings.host_suffix}"
 
 
 # --------------------------------------------------------------------------- nginx render
@@ -472,6 +509,33 @@ def _path_auth_locations(settings, indent: str) -> list[str]:
     inner = indent + "    "
 
     return [
+        indent + "# Declares $tg_router and $tg_slug to nginx's parser without touching them.",
+        indent + "#",
+        indent + "# Both are assigned per router location further down, and nginx refuses a config",
+        indent
+        + "# that USES a variable no directive ever declares - so on a fresh install, before",
+        indent + "# the first router exists, a file that only had the two locations below failed",
+        indent + "# 'nginx -t' with: unknown \"tg_router\" variable. The installer then refused to",
+        indent + "# reload, i.e. the panel could not be brought up at all until someone added a",
+        indent + "# router. Declaring them here makes the empty fleet load.",
+        indent + "#",
+        indent + "# 'set' at SERVER level would also silence the parser and is what an operator",
+        indent + "# reaches for first, but it is wrong: the value is re-evaluated when the 401 is",
+        indent
+        + "# internally redirected to @tg_login below, so the login bounce would come out as",
+        indent + "# /login?router=&next=... and the hand-off to the router would be lost. A 'map'",
+        indent + "# would work and cannot be used either: a map is illegal inside a server block,",
+        indent + "# and this file is included inside one. Keeping the declaration inside a",
+        indent + "# location nobody calls leaves the per-router values intact (verified against",
+        indent + "# nginx 1.26.3: /login?router=demo-lab with the locations only, /login?router=",
+        indent + "# with a server-level set).",
+        indent + "location = /__tg/vars {",
+        inner + "internal;",
+        inner + "set $tg_router '';",
+        inner + "set $tg_slug '';",
+        inner + "return 204;",
+        indent + "}",
+        "",
         indent + "# The gate subrequest. auth_request cannot carry arguments and one shared",
         indent + "# location serves every router, so each router location below sets",
         indent + "# $tg_router and this builds the URL from it. Exactly one cookie is",

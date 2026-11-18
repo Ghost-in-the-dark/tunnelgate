@@ -168,9 +168,16 @@ router has multiple interfaces and you want to be stricter, add `command=` with 
 | Router-side audit gap | The console connects as a real (usually `root`) user; the router's own `logread` records the dropbear login. Rotating the console key is the way to cut off a stolen one |
 
 **Recommended production posture:** create a dedicated `tunnelgate` user on the router with
-shell `/bin/ash` and no password, and set `console.ssh_user` to it. That user still needs
-write access to `/etc/config` and `ubus` to be useful; the installer documents the trade-off
+shell `/bin/ash` and no password, then set `TUNNELGATE_CONSOLE_SSH_USER` to it on the panel (and
+re-register the router, or let the heartbeat deliver the new key). That user still needs write
+access to `/etc/config` and `ubus` to be useful; the installer documents the trade-off
 (root = full capability, dedicated user = least privilege but limited UCI access).
+
+The account name is deliberately **one panel-side setting**, not a per-router field: the value
+that is written into the router's `authorized_keys` by the key registration is the same value the
+panel dials. Two sources could disagree - the panel dialling the tunnel login's name
+(`tunnelgate`, an account that only exists on the VPS) was a real bug, and every console failed
+while the UI still reported "ready".
 
 ## 6. Panel authentication
 

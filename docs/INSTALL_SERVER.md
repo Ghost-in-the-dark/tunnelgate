@@ -769,3 +769,4 @@ are most likely to touch:
 | `TUNNELGATE_CONSOLE_ENABLED` | `true` | Master switch for the web console |
 | `TUNNELGATE_CONSOLE_IDLE_TIMEOUT_SECONDS` | 900 | Idle shell timeout |
 | `TUNNELGATE_CONSOLE_MAX_SESSION_SECONDS` | 7200 | Hard shell duration cap |
+| `TUNNELGATE_CONSOLE_SSH_USER` | `root` | Account the console logs in as **on the router**. It is the same value used to install the console key, so the dial and the key cannot drift. Change it only after creating that account on the device (docs/SECURITY.md §5) |

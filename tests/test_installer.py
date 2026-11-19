@@ -113,6 +113,11 @@ def agent_env(tmp: Path, **extra) -> dict:
             "TG_HB_BIN": str(tmp / "usr/bin/tunnelgate-heartbeat"),
             "TG_UNINSTALL_BIN": str(tmp / "usr/bin/tunnelgate-uninstall"),
             "TG_KEYS": str(tmp / "dropbear/authorized_keys"),
+            # The two once-per-boot TLS markers default to fixed /tmp names, so on a host where
+            # an earlier run already wrote one, a warning test would pass or fail depending on
+            # history. Redirect both into the test tree: same code, no shared state.
+            "TG_TLS_WARN_FILE": str(tmp / "tls-verify-warning"),
+            "TG_TLS_CAP_WARN_FILE": str(tmp / "tls-capability-warning"),
         }
     )
     env.pop("TG_TLS_VERIFY", None)
@@ -571,7 +576,9 @@ def _embedded(script_text: str, marker: str) -> str:
     """Extract the body of the heredoc whose delimiter is <marker>."""
     lines = script_text.splitlines()
     for i, line in enumerate(lines):
-        if line.strip() == "cat >" or line.rstrip().endswith("<<'" + marker + "'"):
+        # The opener may carry a trailing "|| err \"cannot write ...\"" guard, so match the
+        # delimiter anywhere on the line instead of requiring it to end the line.
+        if line.strip() == "cat >" or ("<<'" + marker + "'") in line:
             body = []
             for follow in lines[i + 1 :]:
                 if follow.strip() == marker:
@@ -1387,3 +1394,1109 @@ def test_a_rendered_body_without_the_sentinel_is_still_refused(settings, tmp_pat
     assert result.returncode == 1, combined
     assert "does not look like the TunnelGate installer" in combined, combined
     assert "cannot reach the panel" not in combined, "must refuse before touching the panel"
+
+
+# ---------------------------------------------------------------------------------------
+# Regression tests for the hardening pass (task-18 / the audit amber list).
+#
+# Each test below is written to FAIL on the pre-fix code: every defect here was found by reading
+# the shipped scripts, so a test that cannot tell the two versions apart is worth nothing.
+# ---------------------------------------------------------------------------------------
+
+
+def _payload_lib(tmp_path: Path) -> Path:
+    """install.sh with the final main call removed: every function defined, nothing executed."""
+    body = [line for line in INSTALL.read_text().splitlines() if line.strip() != 'main "$@"']
+    lib = tmp_path / "install-lib.sh"
+    lib.write_text("\n".join(body) + "\n")
+    return lib
+
+
+def _source(tmp_path: Path, snippet: str) -> subprocess.CompletedProcess:
+    """Run a shell snippet with the installer's functions in scope (no panel, no init system)."""
+    lib = _payload_lib(tmp_path)
+    driver = tmp_path / "driver.sh"
+    driver.write_text('set -u\n. "$1"\nshift\n' + snippet + "\n")
+    return run(shell_argv(DASH, driver, str(lib)), env=agent_env(tmp_path))
+
+
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+def test_every_stage_helper_is_defined_before_it_is_called(tmp_path: Path) -> None:
+    """A function nested inside another is defined only once the outer one runs.
+
+    write_uninstall_bin once ended up inside write_heartbeat_bin, so it did not exist in the
+    namespace sourcing the script produces: --dry-run printed "write_uninstall_bin: not found"
+    and carried on (there is no set -e), and a real install shipped no uninstaller while the
+    install itself looked successful. The invariant that catches it - every stage helper is
+    defined the moment the script is sourced - is what this asserts. Verified to bite by
+    renaming write_uninstall_bin's definition.
+    """
+    names = (
+        "write_json_lib write_loop_bin write_heartbeat_bin write_uninstall_bin write_init_script"
+    )
+    result = _source(
+        tmp_path,
+        f'for _fn in {names}; do command -v "$_fn" >/dev/null || {{ echo "MISSING $_fn"; }}; done'
+        "; echo ALL_DEFINED",
+    )
+    combined = result.stdout + result.stderr
+    assert "MISSING" not in combined, combined
+    assert result.returncode == 0
+    assert "ALL_DEFINED" in combined, combined
+
+
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+def test_dry_run_preview_shows_the_marker_and_never_writes_the_token(tmp_path: Path) -> None:
+    """A dry run is the first thing an operator runs, and its output ends up in bug reports.
+
+    The token must be replaced by a marker BEFORE the report is written, not redacted out of a
+    file that already holds it: a sed-based redaction left the file on disk with the secret in
+    it, and died outright on a base64 token containing "/" ("unknown option to s").
+    """
+    token = "bootstrap-token-with/slash+and=padding-0123456789"
+    script = stage_installer(tmp_path, "http://127.0.0.1:9/api/v1/routers/install", token)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+
+    result = run([DASH, str(script), "--dry-run"], env=agent_env(tmp_path, TMPDIR=str(runtime)))
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+
+    # The preview is still useful: it shows the shape of the report with the secret removed.
+    assert '"bootstrap_token":"***"' in combined, combined
+    assert token not in combined, "the dry-run preview must never echo the token"
+
+    leftovers = sorted(p.name for p in runtime.iterdir())
+    assert leftovers == [], f"a dry run must leave nothing behind: {leftovers}"
+    for path in runtime.rglob("*"):
+        if path.is_file():
+            assert token not in path.read_text(errors="replace"), path
+
+
+def _hanging_fetcher(tmp_path: Path, name: str = "curl") -> Path:
+    """A fetcher that blocks, so a test can look (or signal) while the exchange is in flight."""
+    bindir = tmp_path / "slow-bin"
+    bindir.mkdir()
+    slow = bindir / name
+    slow.write_text("#!/bin/sh\nsleep 30\nexit 0\n")
+    slow.chmod(0o755)
+    return bindir
+
+
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+def test_the_exchange_keeps_a_credential_private_while_it_is_in_flight(tmp_path: Path) -> None:
+    """The body file holds the bootstrap token, so its directory must be 0700 and the file 0600.
+
+    The old paths were "/tmp/tunnelgate-exchange.$$": world-readable and pid-predictable, which
+    is both a disclosure and a symlink race for a process that runs as root.
+    """
+    token = "bootstrap-token-midflight-0123456789"
+    script = stage_installer(tmp_path, "http://127.0.0.1:9/api/v1/routers/install", token)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    bindir = _hanging_fetcher(tmp_path)
+
+    env = agent_env(tmp_path, TMPDIR=str(runtime), PATH=f"{bindir}:{os.environ['PATH']}")
+    proc = subprocess.Popen(
+        [DASH, str(script)],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        private_dir = None
+        bodies: list = []
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            dirs = [p for p in runtime.iterdir() if p.is_dir()]
+            # Wait for the BODY, not just the directory: make_tmp_dir runs a moment before
+            # build_report writes the token into it, and the interesting state is the one with
+            # the credential on disk. The fetcher blocks right after that.
+            if dirs:
+                private_dir = dirs[0]
+                bodies = list(private_dir.glob("*.json"))
+                if bodies:
+                    break
+            time.sleep(0.05)
+        assert private_dir is not None, "the installer never created its private directory"
+        assert bodies, "the exchange never wrote its body file"
+
+        mode = private_dir.stat().st_mode & 0o777
+        assert mode == 0o700, f"the private directory is {oct(mode)}, must be 0700"
+        for body in bodies:
+            bmode = body.stat().st_mode & 0o777
+            assert bmode & 0o077 == 0, f"{body.name} is {oct(bmode)}, must be 0600 or stricter"
+
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        out, _ = proc.communicate(timeout=30)
+    finally:
+        if proc.poll() is None:  # pragma: no cover
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            proc.wait(timeout=10)
+
+    assert proc.returncode == 130, f"a trapped signal must exit 130, got {proc.returncode}: {out}"
+    assert sorted(p.name for p in runtime.iterdir()) == [], "the private directory must be gone"
+    assert token not in out
+
+
+# --- the heartbeat's own temporary directory (the same defect, in the 60-second process) ----
+
+
+def _fake_token_panel(tmp_path: Path, token: str) -> str:
+    """A URL that answers 401 immediately: enough to prove what the heartbeat leaves behind."""
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _RefusingHandler)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    _FAKE_SERVERS.append(srv)
+    return f"http://127.0.0.1:{srv.server_address[1]}"
+
+
+_FAKE_SERVERS: list = []
+
+
+class _RefusingHandler(http.server.BaseHTTPRequestHandler):
+    """Answers every request 401 with an empty body - what a stale token really gets."""
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+        self.send_response(401)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+@pytest.fixture()
+def heartbeat_tree(tmp_path: Path):
+    """A minimal installed layout: just the config the heartbeat reads, plus its own TMPDIR."""
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    return runtime
+
+
+def _heartbeat_config(tmp: Path, url: str, token: str = "tok_test") -> Path:
+    config = tmp / "etc/config/tunnelgate"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(
+        "\n".join(
+            [
+                "config tunnelgate 'main'",
+                f"\toption heartbeat_url '{url}'",
+                f"\toption api_token '{token}'",
+                "\toption console_enabled '0'",
+            ]
+        )
+        + "\n"
+    )
+    config.chmod(0o600)
+    return config
+
+
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+def test_heartbeat_keeps_its_credential_in_a_private_directory(tmp_path: Path) -> None:
+    """The heartbeat writes the API token to a body file every 60 seconds, as root.
+
+    "/tmp/tunnelgate-heartbeat-body.$$" made that world-readable, and its predictable name let
+    any local user pre-create it as a symlink. A credential must never be written to a path this
+    process did not create itself.
+    """
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    url = _fake_token_panel(tmp_path, "tok_test")
+    config = _heartbeat_config(tmp_path, url)
+
+    env = agent_env(tmp_path, TMPDIR=str(runtime), TG_CONFIG=str(config))
+    result = run([DASH, str(HEARTBEAT)], env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    # Nothing is left behind, under any name.
+    assert sorted(p.name for p in runtime.iterdir()) == [], "the heartbeat left files behind"
+
+    # And no code path falls back to a fixed /tmp name. The comments NAME the old paths on
+    # purpose (they explain why the directory exists), so only executable lines count.
+    for lineno, line in enumerate(HEARTBEAT.read_text().splitlines(), 1):
+        code = line.split("#", 1)[0]
+        for stale in ("/tmp/tunnelgate-heartbeat-body", "/tmp/tunnelgate-heartbeat-response"):
+            assert stale not in code, f"heartbeat.sh:{lineno} still writes {stale}: {line}"
+
+
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+def test_a_signal_mid_heartbeat_leaves_no_directory(tmp_path: Path) -> None:
+    """procd stops the heartbeat with a signal, so the exit path has to run on SIGTERM too."""
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    url = _fake_token_panel(tmp_path, "tok_test")
+    config = _heartbeat_config(tmp_path, url)
+    bindir = _hanging_fetcher(tmp_path, "curl")
+
+    env = agent_env(tmp_path, TMPDIR=str(runtime), TG_CONFIG=str(config))
+    env["PATH"] = f"{bindir}:{os.environ['PATH']}"
+    proc = subprocess.Popen(
+        [DASH, str(HEARTBEAT)],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        deadline = time.time() + 20
+        made = []
+        while time.time() < deadline:
+            made = [p for p in runtime.iterdir() if p.is_dir()]
+            if made:
+                break
+            time.sleep(0.05)
+        assert made, "the heartbeat never created its private directory"
+        assert (made[0].stat().st_mode & 0o777) == 0o700
+
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        out, _ = proc.communicate(timeout=30)
+    finally:
+        if proc.poll() is None:  # pragma: no cover
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            proc.wait(timeout=10)
+
+    assert proc.returncode == 143, f"SIGTERM must exit 143, got {proc.returncode}: {out}"
+    assert sorted(p.name for p in runtime.iterdir()) == [], "the private directory must be gone"
+
+
+# --- item 1: no credential in argv (it is readable by every local user) --------------------
+
+
+def _argv_lines(log: Path) -> list:
+    if not log.exists():
+        return []
+    return [line for line in log.read_text().splitlines() if line.strip()]
+
+
+@needs_sshd
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+def test_no_credential_reaches_a_command_line(
+    panel, tmp_path: Path, fake_fetchers, stock_image: Path
+) -> None:
+    """A token in argv is public: /proc/PID/cmdline is world-readable, and this repeats hourly.
+
+    Both scripts therefore send the credential in the JSON body only - which is also the only
+    channel a pre-24.10 uclient-fetch has. This asserts the negative for BOTH fetchers and for
+    the installer AND the heartbeat, because they carry separate copies of post().
+    """
+    script = stage_installer(tmp_path, panel.url, panel.token)
+    for fetcher in ("curl", "wget"):
+        log = fake_fetchers["log"]
+        if log.exists():
+            log.unlink()
+        # Bootstrap tokens are single use, so a second install needs a second token. Re-arming
+        # the mock is the honest way to say "a fresh command was minted in the panel"; reusing
+        # one token would test the refusal path instead of the fetch path.
+        panel.token_used = False
+        env = _router_env(tmp_path, fake_fetchers, stock_image, fetcher)
+        result = run([DASH, str(script)], env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+
+        argv = _argv_lines(log)
+        assert argv, "the fetcher was never called"
+        for line in argv:
+            assert panel.token not in line, f"the bootstrap token is on a command line: {line}"
+            assert "X-Bootstrap-Token" not in line, line
+            assert "--user" not in line and "-u " not in line, line
+
+
+@needs_sshd
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+def test_the_heartbeat_keeps_the_api_token_out_of_argv(
+    installed, fake_fetchers, stock_image: Path
+) -> None:
+    """The heartbeat runs every 60 s forever, so its argv matters more than the installer's."""
+    tmp = installed["tmp"]
+    for fetcher in ("curl", "wget"):
+        log = fake_fetchers["log"]
+        if log.exists():
+            log.unlink()
+        env = _router_env(tmp, fake_fetchers, stock_image, fetcher)
+        result = run([DASH, str(tmp / "usr/bin/tunnelgate-heartbeat")], env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        for line in _argv_lines(log):
+            assert "tok_test" not in line, f"the API token is on a command line: {line}"
+            assert "X-Api-Token" not in line, line
+            assert "-u " not in line and "--user" not in line, line
+
+
+# --- item 2: both uninstallers remove the same packages, and neither deletes a foreign user --
+
+
+def _openssh_pkgs(script: Path) -> list:
+    match = re.search(r'^OPENSSH_PKGS="([^"]+)"', script.read_text(), re.MULTILINE)
+    assert match, f"{script.name} does not define OPENSSH_PKGS"
+    return match.group(1).split()
+
+
+def test_both_uninstallers_remove_the_same_packages() -> None:
+    """The installer adds three packages; removing one of them leaves a broken ssh-keygen.
+
+    On 24.10 a leftover openssh-keygen shadows dropbear's own, and the agent then writes keys
+    it cannot read - so this is a functional bug, not tidiness.
+    """
+    installer = _openssh_pkgs(INSTALL)
+    standalone = _openssh_pkgs(UNINSTALL)
+    assert set(installer) == set(standalone), (installer, standalone)
+    assert set(installer) == {"openssh-client", "openssh-keygen", "openssh-client-utils"}
+
+
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+def test_purge_never_removes_a_console_account_the_installer_did_not_create(
+    tmp_path: Path,
+) -> None:
+    """--purge deletes an account only when UCI says WE created it.
+
+    Deleting somebody's login because it is mentioned in a config file is unrecoverable, so the
+    installer records the fact and both uninstallers honour it.
+    """
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    called = tmp_path / "called.log"
+    for name in ("apk", "opkg", "deluser"):
+        path = shim / name
+        path.write_text(f'#!/bin/sh\nprintf "%s %s\\n" "{name}" "$*" >> "{called}"\nexit 0\n')
+        path.chmod(0o755)
+    ident = shim / "id"
+    ident.write_text("#!/bin/sh\necho 0\nexit 0\n")
+    ident.chmod(0o755)
+
+    for created, expect_removal in (("0", False), ("1", True)):
+        config = tmp_path / "etc/config/tunnelgate"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(
+            "\n".join(
+                [
+                    "config tunnelgate 'main'",
+                    "\toption console_user 'tg-operator'",
+                    f"\toption console_user_created '{created}'",
+                ]
+            )
+            + "\n"
+        )
+        if called.exists():
+            called.unlink()
+        env = agent_env(tmp_path, PATH=f"{shim}:{os.environ['PATH']}")
+        result = run([DASH, str(UNINSTALL), "--purge"], env=env)
+        combined = result.stdout + result.stderr
+        assert result.returncode == 0, combined
+        log = called.read_text() if called.exists() else ""
+        if expect_removal:
+            assert "deluser tg-operator" in log, log
+        else:
+            assert "deluser" not in log, log
+            assert "keeping console user tg-operator" in combined, combined
+        # Either way the three packages are gone: that part is not conditional.
+        assert log.count("opkg") + log.count("apk") >= 1, log
+
+
+# --- item 3: pin the ONE key the panel named, and say which failure it was ----------------
+
+
+def _keyscan_with_two_ed25519_keys(tmp_path: Path) -> tuple:
+    """A fake ssh-keyscan that offers TWO ed25519 keys, so the pinning filter is observable.
+
+    This has to be faked rather than produced with a real sshd: sshd publishes at most ONE host
+    key per algorithm (measured - two HostKey lines of the same type yield one keyscan line), so
+    a real host cannot present the case. The defect being guarded against is in how the scan
+    OUTPUT is filtered, which is exactly what this reproduces without pretending sshd can.
+    """
+    d = tmp_path / "twokeys"
+    bindir = d / "bin"
+    bindir.mkdir(parents=True)
+    fps = {}
+    lines = []
+    for name in ("k1", "k2"):
+        path = d / name
+        run(["ssh-keygen", "-t", "ed25519", "-f", str(path), "-N", "", "-q"])
+        fps[name] = run(["ssh-keygen", "-lf", str(path) + ".pub"]).stdout.split()[1]
+        lines.append(f"[127.0.0.1]:2222 {path.with_suffix('.pub').read_text().strip()}")
+    # A real ssh-keyscan prefixes each block with a banner comment; include one so the filter's
+    # comment-skipping is exercised too (it used to accumulate one line per run in known_hosts).
+    payload = "# 127.0.0.1:2222 SSH-2.0-OpenSSH_9.9\n" + "\n".join(lines) + "\n"
+    scan = bindir / "ssh-keyscan"
+    scan.write_text(f'#!/bin/sh\ncat <<"EOF"\n{payload}EOF\n')
+    scan.chmod(0o755)
+    return bindir, fps
+
+
+@needs_sshd
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+def test_only_the_fingerprint_the_panel_named_is_pinned(panel, tmp_path: Path) -> None:
+    """Pinning every key a host publishes keeps accepting one after it is revoked.
+
+    The old code appended the whole ssh-keyscan pool for the type. With two ed25519 keys the
+    known_hosts file grew to two lines and the second stayed trusted forever - so a key rotated
+    out of service was still accepted.
+    """
+    bindir, fps = _keyscan_with_two_ed25519_keys(tmp_path)
+    known = tmp_path / "ssh/known_hosts"
+    script = stage_installer(tmp_path, panel.url, panel.token)
+    panel.response["ssh"]["host_key_fingerprint"] = fps["k2"]
+
+    env = agent_env(tmp_path, TG_KNOWN_HOSTS=str(known), PATH=f"{bindir}:{os.environ['PATH']}")
+    result = run([DASH, str(script)], env=env)
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+
+    lines = [line for line in known.read_text().splitlines() if line.strip()]
+    assert len(lines) == 1, f"exactly one key must be pinned, got {lines}"
+    nonce = tmp_path / "pinned.pub"
+    nonce.write_text(lines[0].split(" ", 1)[1] + "\n")
+    pinned = run(["ssh-keygen", "-lf", str(nonce)]).stdout.split()[1]
+    assert pinned == fps["k2"], f"pinned {pinned}, the panel named {fps['k2']}"
+
+
+@needs_sshd
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+def test_the_pin_filters_the_scan_comment_lines(panel, tmp_path: Path) -> None:
+    """The banner comment carries no key; pinning it would grow known_hosts by a line per run."""
+    bindir, _fps = _keyscan_with_two_ed25519_keys(tmp_path)
+    known = tmp_path / "ssh/known_hosts"
+    script = stage_installer(tmp_path, panel.url, panel.token)
+    panel.response["ssh"]["host_key_fingerprint"] = _fps["k1"]
+
+    env = agent_env(tmp_path, TG_KNOWN_HOSTS=str(known), PATH=f"{bindir}:{os.environ['PATH']}")
+    assert run([DASH, str(script)], env=env).returncode == 0
+    pinned = [line for line in known.read_text().splitlines() if line.strip()]
+    assert not any(line.startswith("#") for line in pinned), pinned
+
+
+@needs_sshd
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+def test_a_wrong_fingerprint_is_reported_as_a_mismatch(panel, tmp_path: Path) -> None:
+    """The host DID answer and nothing matches, which is the alarming case."""
+    bindir, _fps = _keyscan_with_two_ed25519_keys(tmp_path)
+    script = stage_installer(tmp_path, panel.url, panel.token)
+    panel.response["ssh"]["host_key_fingerprint"] = "SHA256:" + "A" * 43
+
+    env = agent_env(tmp_path, PATH=f"{bindir}:{os.environ['PATH']}")
+    result = run([DASH, str(script)], env=env)
+    combined = result.stdout + result.stderr
+    assert result.returncode == 1, combined
+    assert "HOST KEY MISMATCH" in combined, combined
+    assert "the host answered" in combined, combined
+    assert "no answer at all" not in combined, combined
+
+
+def test_an_unreachable_host_is_not_reported_as_a_key_mismatch(
+    panel, tmp_path: Path, test_sshd: SshdFixture
+) -> None:
+    """A firewall and a MITM produce the same empty ssh-keyscan output; the messages differ.
+
+    Sending an operator hunting a man in the middle when the truth is a blocked port wastes an
+    hour and teaches them to ignore the warning that matters.
+    """
+    script = stage_installer(tmp_path, panel.url, panel.token)
+    panel.response["ssh"]["port"] = free_port()  # nothing listens there
+
+    env = agent_env(tmp_path)
+    result = run([DASH, str(script)], env=env)
+    combined = result.stdout + result.stderr
+    assert result.returncode == 1, combined
+    assert "ssh-keyscan got no answer at all" in combined, combined
+    assert "NOT a key mismatch" in combined, combined
+    assert "HOST KEY MISMATCH" not in combined, combined
+
+
+# --- item 5: cfg_set must not treat a value as a sed program -----------------------------
+
+
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+def _function_body(script: Path, name: str) -> str:
+    """Extract one shell function's text from a script that runs top-level code when sourced.
+
+    agent/lib/heartbeat.sh does its work at the top level, so it cannot simply be sourced in a
+    test; its cfg_set can, and must, be exercised as the shipped bytes rather than a copy.
+    """
+    text = script.read_text().splitlines(keepends=True)
+    start = next(i for i, line in enumerate(text) if line.rstrip() == f"{name}() {{")
+    end = next(i for i in range(start + 1, len(text)) if text[i].rstrip() == "}")
+    return "".join(text[start : end + 1])
+
+
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+def test_cfg_set_survives_a_value_full_of_shell_metacharacters(tmp_path: Path) -> None:
+    """Every character that is special in a sed replacement, in one URL.
+
+    A panel behind a path prefix and a query string is not exotic, and the sed-based rewrite
+    silently corrupted the config on exactly the hosts that have no uci to fall back on - which
+    is the only path that fallback exists for.
+
+    cfg_set lives in the heartbeat, not the installer: it is the process that persists
+    console_serial and an adopted heartbeat_url. The function is extracted from the shipped file
+    rather than retyped, so the test cannot drift away from the code it is about.
+    """
+    nasty = "https://panel.example.com/hb?a=1&b=2|c&d=e=f\\g%20h"
+    config = tmp_path / "etc/config/tunnelgate"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text("config tunnelgate 'main'\n\toption heartbeat_url 'old'\n")
+    config.chmod(0o600)
+
+    funcs = tmp_path / "cfg.sh"
+    funcs.write_text(_function_body(HEARTBEAT, "cfg_set") + "\n")
+    driver = tmp_path / "set.sh"
+    driver.write_text(
+        'set -u\n. "$1"\nshift\n'
+        'CONFIG_FILE="$1"\n'
+        "export CONFIG_FILE\n"
+        'cfg_set heartbeat_url "$2" || { echo SET_FAILED; exit 3; }\n'
+        "echo SET_OK\n",
+    )
+    env = agent_env(tmp_path)
+    # No uci anywhere, so the awk fallback is the branch under test.
+    env["PATH"] = "/usr/bin:/bin"
+    result = run(shell_argv(DASH, driver, str(funcs), str(config), nasty), env=env)
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert "SET_OK" in combined, combined
+    assert uci_options(config)["heartbeat_url"] == nasty
+    # And the file is still a valid single section: a rewrite must not duplicate the option.
+    assert config.read_text().count("heartbeat_url") == 1, config.read_text()
+
+
+# --- item 6: a write that fails must stop the install, not continue with no file ----------
+
+
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+def test_a_failed_heredoc_write_is_reported(tmp_path: Path) -> None:
+    """A full or read-only filesystem used to produce a "successful" install with no scripts.
+
+    err() exits, so "the write failed" is observed as a non-zero exit carrying the message - not
+    as a returned status. A driver that continues past the call would be testing a shell that
+    does not exist.
+    """
+    lib = _payload_lib(tmp_path)
+    for target, marker in (
+        ("LOOP_BIN", "write_loop_bin"),
+        ("HB_BIN", "write_heartbeat_bin"),
+        ("UNINSTALL_BIN", "write_uninstall_bin"),
+    ):
+        driver = tmp_path / f"broken-{marker}.sh"
+        # /proc is read-only on every Linux: the write must fail there.
+        driver.write_text(
+            'set -u\n. "$1"\nshift\n'
+            f"{target}=/proc/tunnelgate-cannot-write\n"
+            f"{marker}\n"
+            "echo WROTE_ANYWAY\n"
+        )
+        result = run(shell_argv(DASH, driver, str(lib)), env=agent_env(tmp_path))
+        combined = result.stdout + result.stderr
+        assert result.returncode != 0, f"{marker} continued after a failed write: {combined}"
+        assert "WROTE_ANYWAY" not in combined, (
+            f"{marker} continued after a failed write: {combined}"
+        )
+        assert "cannot write" in combined, f"{marker} failed without saying why: {combined}"
+
+
+# --- the status command must read the config it claims to describe -------------------------
+
+
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+def test_status_reads_the_config_instead_of_reporting_a_default(tmp_path: Path) -> None:
+    """--status called cfg_get, which existed only inside heredocs, so it printed "not found".
+
+    The failure was quiet and misleading: the shell error went to stderr while the command
+    carried on, and every option it could not read was reported at its default. An operator
+    debugging a broken tunnel was told "verify (default)" and "plain http" for a panel that is
+    https with verification on - the opposite of what the config said. Nothing failed, so only a
+    positive assertion on the printed value catches it.
+    """
+    config = tmp_path / "etc/config/tunnelgate"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(
+        "\n".join(
+            [
+                "config tunnelgate 'main'",
+                "\toption panel_url 'https://panel.example.com:8443'",
+                "\toption tls_verify '0'",
+                "",
+            ]
+        )
+    )
+    config.chmod(0o600)
+
+    lib = _payload_lib(tmp_path)
+    driver = tmp_path / "status.sh"
+    driver.write_text('set -u\n. "$1"\nshift\ndo_status\n')
+    env = agent_env(tmp_path, TG_CONFIG=str(config))
+    result = run(shell_argv(DASH, driver, str(lib)), env=env)
+    combined = result.stdout + result.stderr
+
+    # The defect's signature: a shell error the operator is expected to ignore, followed by a
+    # confident report of the wrong thing.
+    assert "not found" not in combined, combined
+    # Both of these are only printed when the option could be READ back. Without a working
+    # cfg_get the command reported "verify (default)" and "plain http" - so asserting the values
+    # it should have found, rather than the absence of a failure, is what proves it read them.
+    assert "NOT verified" in combined, combined
+    assert "plain http" not in combined, combined
+    assert "checks the certificate chain" in combined, combined
+
+
+# --- item 7 + 9: a TLS stack that cannot verify must fail CLOSED, not open -----------------
+
+
+def _fake_tls_lib(tmp_path: Path) -> Path:
+    """A directory that looks like /lib with a TLS-capable libustream in it."""
+    libdir = tmp_path / "fakelib"
+    libdir.mkdir(exist_ok=True)
+    (libdir / "libustream-ssl.so").write_text("")
+    return libdir
+
+
+def _fake_release(tmp_path: Path, release: str) -> Path:
+    """An /etc/openwrt_release lookalike, so the version gate can be exercised off-device."""
+    path = tmp_path / "openwrt_release"
+    path.write_text(f"DISTRIB_ID='OpenWrt'\nDISTRIB_RELEASE='{release}'\nDISTRIB_TARGET='x86/64'\n")
+    return path
+
+
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+@pytest.mark.parametrize("release", ["19.07.10", "19.07", "19", "18.06.9", "19.07-beta"])
+def test_a_fetcher_that_cannot_verify_is_detected(tmp_path: Path, release: str) -> None:
+    """curl validates through its own TLS stack; a uclient-fetch this old does not (measured)."""
+    lib = _payload_lib(tmp_path)
+    driver = tmp_path / "cap.sh"
+    driver.write_text(
+        'set -u\n. "$1"\nFETCHER=wget\nif tls_stack_cannot_verify; then echo CANNOT; else echo CAN; fi\n'
+    )
+    env = agent_env(tmp_path, TG_OPENWRT_RELEASE=str(_fake_release(tmp_path, release)))
+    combined = run(shell_argv(DASH, driver, str(lib)), env=env)
+    assert "CANNOT" in combined.stdout + combined.stderr, combined.stdout + combined.stderr
+
+
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+@pytest.mark.parametrize("release", ["21.02.7", "22.03.7", "23.05.5", "24.10.1"])
+def test_a_modern_fetcher_is_not_accused_of_being_unverifiable(
+    tmp_path: Path, release: str
+) -> None:
+    """The gate must not fire on releases that do verify, or the refusal becomes noise."""
+    lib = _payload_lib(tmp_path)
+    driver = tmp_path / "cap.sh"
+    driver.write_text(
+        'set -u\n. "$1"\nFETCHER=wget\nif tls_stack_cannot_verify; then echo CANNOT; else echo CAN; fi\n'
+    )
+    env = agent_env(tmp_path, TG_OPENWRT_RELEASE=str(_fake_release(tmp_path, release)))
+    combined = run(shell_argv(DASH, driver, str(lib)), env=env)
+    assert "CAN" in combined.stdout, combined.stdout + combined.stderr
+    assert "CANNOT" not in combined.stdout, combined.stdout
+
+
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+@pytest.mark.parametrize("release", ["19x", "abc", "", "2O.02.1", "unknown"])
+def test_an_unparsable_release_fails_closed(tmp_path: Path, release: str) -> None:
+    """'[0-9]*' matched "19x", the numeric compare then returned 2, and 2 read as "safe".
+
+    Treating an unknown release as modern is the wrong direction: the only thing known about it
+    is that it is not PROVEN to verify, and the cost of being wrong is a private key.
+    """
+    lib = _payload_lib(tmp_path)
+    driver = tmp_path / "cap.sh"
+    driver.write_text(
+        'set -u\n. "$1"\nFETCHER=wget\nTLS_UNPARSED_RELEASE=0\nif tls_stack_cannot_verify; then echo CANNOT; else echo CAN; fi\necho "unparsed=$TLS_UNPARSED_RELEASE"\n'
+    )
+    env = agent_env(tmp_path, TG_OPENWRT_RELEASE=str(_fake_release(tmp_path, release)))
+    combined = run(shell_argv(DASH, driver, str(lib)), env=env)
+    assert "CANNOT" in combined.stdout, combined.stdout + combined.stderr
+    assert "unparsed=1" in combined.stdout, combined.stdout
+
+
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+def test_curl_is_never_treated_as_unverifiable(tmp_path: Path) -> None:
+    """curl links its own TLS and does validate; the 19.07 finding is about uclient-fetch only."""
+    lib = _payload_lib(tmp_path)
+    driver = tmp_path / "cap.sh"
+    driver.write_text(
+        'set -u\n. "$1"\nFETCHER=curl\nif tls_stack_cannot_verify; then echo CANNOT; else echo CAN; fi\n'
+    )
+    env = agent_env(tmp_path, TG_OPENWRT_RELEASE=str(_fake_release(tmp_path, "19.07.10")))
+    combined = run(shell_argv(DASH, driver, str(lib)), env=env)
+    assert "CAN" in combined.stdout, combined.stdout
+
+
+@needs_sshd
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+def test_an_unverifiable_stack_refuses_to_send_the_key(
+    panel, tmp_path: Path, fake_fetchers, stock_image: Path
+) -> None:
+    """The refusal must happen BEFORE the exchange, so no private key and no API token move.
+
+    A warning in a log is not consent: the host key fingerprint arrives in the same response as
+    the private key, so a MITM substitutes the key, the fingerprint and the pin together and
+    pin_host_key cannot tell. This is the one place the installer can still say no.
+    """
+    script = stage_installer(tmp_path, panel.url.replace("http://", "https://"), panel.token)
+    env = _router_env(tmp_path, fake_fetchers, stock_image, "wget")
+    env["TG_OPENWRT_RELEASE"] = str(_fake_release(tmp_path, "19.07.10"))
+    # Pretend the image already carries a TLS-capable libustream: that is the state on 19.07 once
+    # the package is installed, and it is what makes this test about the DECISION, not about a
+    # missing package (ensure_tls_lib would otherwise stop the run for a different reason).
+    env["TG_TLS_LIB_DIRS"] = str(_fake_tls_lib(tmp_path))
+    result = run([DASH, str(script)], env=env)
+    combined = result.stdout + result.stderr
+
+    assert result.returncode == 1, combined
+    assert "cannot check a certificate" in combined, combined
+    assert "Nothing has been sent" in combined, combined
+    # Two concrete ways out, named. A refusal that does not say what to do next gets bypassed by
+    # whatever the operator finds first.
+    assert "21.02" in combined, combined
+    assert "Agent endpoint" in combined, combined
+    # The properties that matter: nothing was POSTed and no key was written.
+    assert not panel.calls, f"the panel was contacted anyway: {panel.calls}"
+    assert not (tmp_path / "ssh/tunnelgate_ed25519").exists()
+
+
+@needs_sshd
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+def test_the_consent_path_warns_instead_of_refusing(
+    panel, tmp_path: Path, fake_fetchers, stock_image: Path
+) -> None:
+    """tls_verify=0 is the audited acknowledgement, so it is warned about and then honoured.
+
+    Refusing here would make a self-signed panel un-installable on such a router; the point of
+    the split is that turning verification off is a recorded DECISION, not a silent default.
+    """
+    script = stage_installer(tmp_path, panel.url.replace("http://", "https://"), panel.token)
+    env = _router_env(tmp_path, fake_fetchers, stock_image, "wget", TG_TLS_VERIFY="0")
+    env["TG_OPENWRT_RELEASE"] = str(_fake_release(tmp_path, "19.07.10"))
+    env["TG_TLS_LIB_DIRS"] = str(_fake_tls_lib(tmp_path))
+    result = run([DASH, str(script)], env=env)
+    combined = result.stdout + result.stderr
+
+    assert "WARNING:" in combined, combined
+    assert "unauthenticated" in combined, combined
+    assert "Nothing has been sent" not in combined, combined
+
+
+# --- item 8: the heartbeat must nag too, or a 19.07 router is silently unauthenticated forever
+
+
+def _openwrt_fetcher_env(tmp_path: Path, fake_fetchers, stock_image: Path, **extra) -> dict:
+    """A PATH and environment that look like a stock router running the given fetcher.
+
+    The distinction is the whole point of the capability check: curl validates a chain through its
+    own TLS (never "unverifiable"), while on OpenWrt wget IS uclient-fetch. Keeping the host's curl
+    on PATH would silently select the branch that cannot fail and hide the defect.
+    """
+    bindir = fake_fetchers["dirs"]["wget"]
+    env = agent_env(tmp_path, TMPDIR=str(tmp_path / "runtime"), **extra)
+    env["PATH"] = f"{bindir}:{stock_image}"
+    return env
+
+
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+def test_the_heartbeat_warns_when_the_stack_cannot_verify(
+    tmp_path: Path, fake_fetchers, stock_image: Path
+) -> None:
+    """The installer's warning is scrolled away by the next boot; the left-behind process nags."""
+    (tmp_path / "runtime").mkdir()
+    url = _fake_token_panel(tmp_path, "tok_test")
+    config = _heartbeat_config(tmp_path, url)
+    marker = tmp_path / "cap-warning"
+
+    env = _openwrt_fetcher_env(
+        tmp_path,
+        fake_fetchers,
+        stock_image,
+        TG_CONFIG=str(config),
+        TG_OPENWRT_RELEASE=str(_fake_release(tmp_path, "19.07.10")),
+        TG_TLS_CAP_WARN_FILE=str(marker),
+    )
+    result = run([DASH, str(HEARTBEAT)], env=env)
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert "WARNING:" in combined, combined
+    assert "cannot check a certificate chain" in combined, combined
+    assert marker.exists(), "the once-per-boot marker was not written"
+
+
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+def test_the_heartbeat_nag_is_once_per_boot(
+    tmp_path: Path, fake_fetchers, stock_image: Path
+) -> None:
+    """This process restarts every 60 s; a warning every minute is a warning nobody reads."""
+    (tmp_path / "runtime").mkdir()
+    url = _fake_token_panel(tmp_path, "tok_test")
+    config = _heartbeat_config(tmp_path, url)
+    marker = tmp_path / "cap-warning"
+    env = _openwrt_fetcher_env(
+        tmp_path,
+        fake_fetchers,
+        stock_image,
+        TG_CONFIG=str(config),
+        TG_OPENWRT_RELEASE=str(_fake_release(tmp_path, "19.07.10")),
+        TG_TLS_CAP_WARN_FILE=str(marker),
+    )
+
+    first = run([DASH, str(HEARTBEAT)], env=env)
+    assert "cannot check a certificate chain" in first.stdout + first.stderr
+    second = run([DASH, str(HEARTBEAT)], env=env)
+    assert "cannot check a certificate chain" not in second.stdout + second.stderr
+
+
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+def test_the_two_tls_warnings_do_not_suppress_each_other(
+    tmp_path: Path, fake_fetchers, stock_image: Path
+) -> None:
+    """The markers are separate files because the two facts are independent, not ranked.
+
+    A router can be told to stop verifying (tls_verify=0) and later be put back on (tls_verify=1)
+    while the fetcher still cannot check a chain. One marker file for both would silence the
+    second warning forever after the first, which is exactly how a stale acknowledgement becomes
+    a permanent hole.
+    """
+    (tmp_path / "runtime").mkdir()
+    url = _fake_token_panel(tmp_path, "tok_test")
+    config = _heartbeat_config(tmp_path, url)
+    config.write_text(config.read_text() + "\toption tls_verify '0'\n")
+    env = _openwrt_fetcher_env(
+        tmp_path,
+        fake_fetchers,
+        stock_image,
+        TG_CONFIG=str(config),
+        TG_OPENWRT_RELEASE=str(_fake_release(tmp_path, "19.07.10")),
+    )
+
+    # Step 1: verification is off, so the consent warning is due.
+    result = run([DASH, str(HEARTBEAT)], env=env)
+    combined = result.stdout + result.stderr
+    assert "certificate verification is OFF" in combined, combined
+
+    # Step 2: the operator turns it back on, and the stack still cannot verify. The marker the
+    # first warning wrote must not stand in for this one.
+    config.write_text(config.read_text().replace("tls_verify '0'", "tls_verify '1'"))
+    result = run([DASH, str(HEARTBEAT)], env=env)
+    combined = result.stdout + result.stderr
+    assert "cannot check a certificate chain" in combined, combined
+
+
+# --- item D: the console account the config names must be the account that can log in -----
+
+
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+def test_a_console_user_that_cannot_be_created_is_recorded_as_root(tmp_path: Path) -> None:
+    """adduser -D -H gave no HOME and the key went to root's file, so the named user could not log in.
+
+    Worse, when adduser FAILED the code logged "console will connect as root" while UCI still
+    named the requested user, so the panel asked dropbear for an account that did not exist.
+    """
+    lib = _payload_lib(tmp_path)
+    # A shim that refuses: this is the firmware without adduser, or a full filesystem.
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    for name in ("adduser", "passwd"):
+        path = bindir / name
+        path.write_text("#!/bin/sh\nexit 1\n")
+        path.chmod(0o755)
+    driver = tmp_path / "console.sh"
+    driver.write_text(
+        'set -u\n. "$1"\n'
+        # get() reads the panel response through the JSON library; stub the two lookups instead so
+        # this test is about the account decision, not about JSON parsing.
+        'get() { case "$1" in console.ssh_user) echo tg-operator ;; '
+        "console.shell) echo /bin/ash ;; console.authorized_keys_path) echo /etc/dropbear/authorized_keys ;; "
+        '*) echo "" ;; esac; }\n'
+        'log() { printf "%s\\n" "$*"; }\n'
+        'err() { echo "ERR $*"; exit 1; }\n'
+        "ensure_console_user\n"
+        'echo "effective=$CONSOLE_USER_EFFECTIVE created=$CONSOLE_USER_CREATED keys=$CONSOLE_KEYS_EFFECTIVE"\n'
+    )
+    env = agent_env(tmp_path)
+    env["PATH"] = f"{bindir}:{os.environ['PATH']}"
+    env["TG_PASSWD"] = str(tmp_path / "passwd")
+    (tmp_path / "passwd").write_text("root:x:0:0:root:/root:/bin/ash\n")
+
+    combined = run(shell_argv(DASH, driver, str(lib)), env=env)
+    text = combined.stdout + combined.stderr
+    # The account really in use is recorded, so the panel and the router cannot disagree.
+    assert "effective=root" in text, text
+    assert "created=0" in text, text
+    # And the operator is told loudly, not in a line that says "console will connect as root"
+    # while the config says otherwise.
+    assert "WARNING" in text, text
+
+
+# --- item 4: a state field nobody writes is worse than no field ---------------------------
+
+
+def test_the_dead_tunnel_pid_is_gone_from_both_scripts() -> None:
+    """Nothing ever wrote tunnel_pid, so both readers reported a value that could not exist.
+
+    The panel derives it from its own monitor (app/services/monitor.py), which is the only value
+    that can be correct; a router-supplied pid would also be about the wrong process, since the
+    ssh process is respawned by procd and its pid is not stable across a reconnect.
+    """
+    for path in (INSTALL, HEARTBEAT):
+        text = path.read_text()
+        for lineno, line in enumerate(text.splitlines(), 1):
+            code = line.split("#", 1)[0]
+            assert "tunnel_pid" not in code, (
+                f"{path.name}:{lineno} still mentions tunnel_pid: {line}"
+            )
+
+
+def test_the_heartbeat_payload_still_carries_the_fields_the_panel_reads() -> None:
+    """Removing a dead field must not remove a live one: the panel parses these by name.
+
+    The list is the heartbeat's, not the exchange's: app/api/heartbeat.py:86 maps hostname, model,
+    openwrt_version, mac and client_version onto the router row, and uptime_seconds is read
+    separately at :91. mac is carried by the EXCHANGE only (app/api/bootstrap.py:168) - it is an
+    identity fact the router reports once, not something that changes per minute - so asserting it
+    here would demand a field the heartbeat never had.
+    """
+    text = HEARTBEAT.read_text()
+    for field in ("hostname", "model", "openwrt_version", "uptime_seconds", "client_version"):
+        assert f'"{field}"' in text, f"heartbeat no longer reports {field}"
+
+
+def test_the_console_key_path_prefers_the_routers_own_configuration() -> None:
+    """The panel always sends /etc/dropbear/authorized_keys; a non-root console needs its own file.
+
+    app/services/keys.py console_key_registration() returns ROUTER_AUTHORIZED_KEYS_PATH
+    unconditionally, so taking that field at face value would undo the layout the installer chose
+    for a non-root console account and the key would land where that account's dropbear never
+    looks.
+    """
+    text = HEARTBEAT.read_text()
+    assert "console_authorized_keys_path" in text
+    # The UCI read must come FIRST and the response field only as a fallback.
+    uci_at = text.index("cfg_get console_authorized_keys_path")
+    fallback_at = text.index("authorized_keys_path")
+    assert uci_at < fallback_at or "reg_keys_path" in text[: fallback_at + 400]
+
+
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+def test_a_console_user_that_can_be_created_gets_its_own_key_file(tmp_path: Path) -> None:
+    """The non-root console happy path: the DECISION is what was broken, so stub the primitives.
+
+    A real account cannot be created portably inside the suite (no adduser on the test host, and
+    creating one would be a side effect no test may leave behind). But nothing that was wrong
+    here is a syscall: the bug was that the installer decided "console user = tg-operator" for the
+    panel while pointing the key at /etc/dropbear/authorized_keys, which dropbear reads for ROOT
+    only - so the named account could never authenticate. That is a decision about three values
+    (effective user, effective key path, console_user_created), and all three are computed here
+    with adduser and id stubbed.
+
+    What is NOT reached without a live account: the actual account creation (adduser's own
+    work) and dropbear's actual read of the file at login. Both are named in docs/INSTALL_ROUTER.md
+    as the operator's step; everything the installer decides is asserted below.
+    """
+    home = tmp_path / "home" / "tg-operator"
+    home.mkdir(parents=True)
+    passwd = tmp_path / "passwd"
+    # The passwd entry must name the home THIS test owns, because that is the path the installer
+    # resolves from /etc/passwd (field 6) and the path prepare_console will actually create.
+    passwd.write_text(
+        f"root:x:0:0:root:/root:/bin/ash\ntg-operator:x:1000:65534::{home}:/bin/ash\n"
+    )
+
+    # id says the account does NOT exist yet (so the creation branch runs) and adduser succeeds.
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "id").write_text("#!/bin/sh\nexit 1\n")
+    (bindir / "adduser").write_text("#!/bin/sh\nexit 0\n")
+    for name in ("id", "adduser"):
+        (bindir / name).chmod(0o755)
+
+    lib = _payload_lib(tmp_path)
+    driver = tmp_path / "console-ok.sh"
+    driver.write_text(
+        'set -u\n. "$1"\n'
+        # get() is the panel response; stub it so this test is about the account decision only.
+        'get() { case "$1" in console.ssh_user) echo tg-operator ;; '
+        "console.shell) echo /bin/ash ;; console.enabled) echo true ;; "
+        "console.authorized_keys_path) echo /etc/dropbear/authorized_keys ;; "
+        '*) echo "" ;; esac; }\n'
+        'log() { printf "%s\\n" "$*"; }\n'
+        'err() { echo "ERR $*"; exit 1; }\n'
+        # require_field() reads through get() too, so the response fields the config needs are
+        # stubbed here rather than parsed out of a JSON fixture: this test is about the account.
+        'require_field() { case "$1" in router_id) echo r-test001 ;; api_token) echo tok_test ;; '
+        "heartbeat_url) echo https://panel.test/hb ;; ssh.host) echo 127.0.0.1 ;; "
+        "ssh.port) echo 22 ;; ssh.username) echo tunnelgate ;; tunnel.remote_port) echo 20001 ;; "
+        '*) echo "" ;; esac; }\n'
+        "ensure_console_user\n"
+        "prepare_console\n"
+        "write_config\n"
+        'echo "effective=$CONSOLE_USER_EFFECTIVE created=$CONSOLE_USER_CREATED '
+        'keys=$CONSOLE_KEYS_EFFECTIVE"\n'
+    )
+    env = agent_env(tmp_path)
+    env["PATH"] = f"{bindir}:{os.environ['PATH']}"
+    env["TG_PASSWD"] = str(passwd)
+    env["TG_PANEL_URL"] = "https://panel.test"
+
+    combined = run(shell_argv(DASH, driver, str(lib)), env=env)
+    text = combined.stdout + combined.stderr
+
+    # (a) the account actually in use is the requested one, NOT root
+    assert "effective=tg-operator" in text, text
+    # (b) the key path is that account's own file, never root's dropbear file
+    assert f"keys={home}/.ssh/authorized_keys" in text, text
+    assert "/etc/dropbear/authorized_keys" not in text.split("effective=")[-1], text
+    # (d) recorded as created by US, so a later --purge is allowed to remove it
+    assert "created=1" in text, text
+    # ... and the file the console will read really was prepared with the right modes
+    keys_file = home / ".ssh" / "authorized_keys"
+    assert keys_file.is_file(), list(home.rglob("*"))
+    assert keys_file.stat().st_mode & 0o777 == 0o600
+    assert (home / ".ssh").stat().st_mode & 0o777 == 0o700
+
+    # (c) the persisted configuration names the same account and the same file
+    options = uci_options(Path(env["TG_CONFIG"]))
+    assert options["console_user"] == "tg-operator", options
+    assert options["console_authorized_keys_path"] == f"{home}/.ssh/authorized_keys", options
+    assert options["console_user_created"] == "1", options
+
+
+@pytest.mark.skipif(DASH is None, reason="needs dash")
+def test_an_existing_console_user_is_used_but_never_claimed_as_created(tmp_path: Path) -> None:
+    """The other half of the same decision: id says the account is already there.
+
+    Then the installer must NOT record console_user_created=1, because the uninstaller is only
+    allowed to delete an account this installer made. Getting this wrong destroys somebody's
+    pre-existing login on --purge.
+    """
+    home = tmp_path / "home" / "tg-operator"
+    home.mkdir(parents=True)
+    passwd = tmp_path / "passwd"
+    passwd.write_text("root:x:0:0:root:/root:/bin/ash\ntg-operator:x:1000:65534::/tmp/x:/bin/ash\n")
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "id").write_text("#!/bin/sh\nexit 0\n")
+    (bindir / "adduser").write_text("#!/bin/sh\necho ADDUSER_MUST_NOT_RUN\nexit 0\n")
+    for name in ("id", "adduser"):
+        (bindir / name).chmod(0o755)
+
+    lib = _payload_lib(tmp_path)
+    driver = tmp_path / "console-exists.sh"
+    driver.write_text(
+        'set -u\n. "$1"\n'
+        'get() { case "$1" in console.ssh_user) echo tg-operator ;; '
+        "console.shell) echo /bin/ash ;; console.enabled) echo true ;; "
+        "console.authorized_keys_path) echo /etc/dropbear/authorized_keys ;; "
+        '*) echo "" ;; esac; }\n'
+        'log() { printf "%s\\n" "$*"; }\n'
+        'err() { echo "ERR $*"; exit 1; }\n'
+        "ensure_console_user\n"
+        'echo "effective=$CONSOLE_USER_EFFECTIVE created=$CONSOLE_USER_CREATED"\n'
+    )
+    env = agent_env(tmp_path)
+    env["PATH"] = f"{bindir}:{os.environ['PATH']}"
+    env["TG_PASSWD"] = str(passwd)
+
+    combined = run(shell_argv(DASH, driver, str(lib)), env=env)
+    text = combined.stdout + combined.stderr
+    assert "effective=tg-operator" in text, text
+    assert "created=0" in text, text
+    assert "ADDUSER_MUST_NOT_RUN" not in text, text

@@ -711,8 +711,12 @@ def test_the_served_script_is_executable_directly_not_just_under_sh(
     assert "does not look like the TunnelGate installer" not in combined, (
         f"the installer rejected its own served copy: {combined!r}"
     )
-    assert "not look like OpenWrt" in combined, (
-        f"expected the OpenWrt guard to be the first objection, got: {combined!r}"
+    # Which guard speaks first depends on who is running: check_root precedes check_openwrt, so
+    # a CI runner (non-root) gets the root objection and a root shell gets the OpenWrt one. Both
+    # prove the same thing - the kernel found the interpreter and the script ran - so accept
+    # either rather than pinning the order of two independent guards.
+    assert "not look like OpenWrt" in combined or "must run as root" in combined, (
+        f"executing the served file directly never reached a TunnelGate guard: {combined!r}"
     )
 
 

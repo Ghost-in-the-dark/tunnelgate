@@ -16,14 +16,25 @@
 # console, so the installer cannot know the public half - this loop is the delivery channel.
 
 CONFIG_FILE=${TG_CONFIG:-/etc/config/tunnelgate}
+# The release file the capability check reads (overridable so a test can say "pretend 19.07").
+OPENWRT_RELEASE_FILE=${TG_OPENWRT_RELEASE:-/etc/openwrt_release}
 # The JSON reader is installed next to the other agent files; the installer writes
 # its exact path into UCI (TG_LIB_DIR overrides it, for tests and odd layouts).
 LIB_DIR=${TG_LIB_DIR:-}
 CLIENT_VERSION="1.0"
 DEFAULT_KEYS=${TG_KEYS:-/etc/dropbear/authorized_keys}
-TMP_BODY=/tmp/tunnelgate-heartbeat-body.$$
-RESPONSE=/tmp/tunnelgate-heartbeat-response.$$
 CONSOLE_MARK=tunnelgate-console
+
+# Private working directory for this run. It is created LAZILY (only when something is actually
+# written) with umask 077 and mode 0700, and removed on exit and on SIGTERM.
+#
+# Why not "/tmp/tunnelgate-heartbeat-body.$$": that file carries the API token in clear, and the
+# name is predictable, so any local user can pre-create it as a symlink to a file they can read -
+# or to one root can overwrite - and win the race. This process runs as root every 60 seconds, so
+# it is the perfect target for exactly that. The pid in the old name made the race easy, not safe.
+TMP_DIR=""
+TMP_BODY=""
+RESPONSE=""
 
 # The fetcher is probed once, for the same reason as in install.sh: stock OpenWrt has no curl,
 # and its uclient-fetch has no --header before 24.10.
@@ -35,7 +46,41 @@ elif command -v wget >/dev/null 2>&1; then
 fi
 
 umask 077
-trap 'rm -f "$TMP_BODY" "$RESPONSE"' EXIT INT TERM
+
+# make_tmp_dir: create the private directory on first use. mktemp -d refuses a path that already
+# exists, which is what closes the symlink race; 0700 means another user cannot even list it.
+make_tmp_dir() {
+    [ -n "$TMP_DIR" ] && return 0
+    TMP_DIR=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/tunnelgate-hb.$$.XXXXXX" 2>/dev/null) || {
+        TMP_DIR=""
+        return 1
+    }
+    chmod 0700 "$TMP_DIR" 2>/dev/null
+    TMP_BODY="$TMP_DIR/heartbeat.json"
+    RESPONSE="$TMP_DIR/response.json"
+}
+
+# shellcheck disable=SC2329  # invoked from the traps below
+cleanup() {
+    if [ -n "$TMP_DIR" ]; then
+        rm -rf "$TMP_DIR" 2>/dev/null
+    fi
+    TMP_DIR=""
+    TMP_BODY=""
+    RESPONSE=""
+}
+
+# SIGTERM is how the init script stops this instance, so the exit path that removes the directory
+# has to run on a signal too. Exit 143 = killed by SIGTERM, the conventional value.
+# shellcheck disable=SC2329  # invoked from the traps below
+on_signal() {
+    cleanup
+    trap - EXIT INT TERM
+    exit 143
+}
+
+trap cleanup EXIT
+trap on_signal INT TERM
 
 
 log() {
@@ -91,22 +136,60 @@ if [ "$_tls_value" = "0" ]; then
     TLS_VERIFY=0
 fi
 
+# Same capability question as in install.sh, and the same honest answer: MEASURED for the
+# 19.07 generation (uclient-fetch there accepts a self-signed certificate; a wrong hostname is
+# still caught), NOT proven safe for every 21.02+ point release, and unparsable versions are
+# treated as unverified rather than as modern. Returns 0 when the chain probably is not checked.
+# Do NOT use it to refuse the heartbeat: the installer already refuses a fresh install on such a
+# stack, and a router installed before that check must not silently lose its liveness signal.
+# This process only NAGS, once per boot.
+tls_stack_cannot_verify() {
+    [ "$FETCHER" = "wget" ] || return 1 # curl links its own SSL and does validate
+    _rel=""
+    if [ -r "$OPENWRT_RELEASE_FILE" ]; then
+        _rel=$(sed -n "s/^DISTRIB_RELEASE='\(.*\)'/\1/p" "$OPENWRT_RELEASE_FILE" | head -n 1)
+    fi
+    _major=${_rel%%.*}
+    # "[0-9]*" also matches "19x" and the numeric test then returns 2, which reads as "safe".
+    case "$_major" in
+    "" | *[!0-9]*) return 0 ;;
+    esac
+    [ "$_major" -lt 21 ]
+}
+
 cfg_set() {
     if command -v uci >/dev/null 2>&1; then
         uci -q set "tunnelgate.main.$1=$2" && uci -q commit tunnelgate
         return $?
     fi
-    # Fallback for a host without uci (test suite, or a stripped image): rewrite the option
-    # in place so the serial really is persisted and the next heartbeat does not reinstall
-    # the same console key forever.
+    # Fallback for a host without uci (test suite, or a stripped image): rewrite the option in
+    # place so the serial really is persisted and the next heartbeat does not reinstall the same
+    # console key forever.
+    #
+    # NO sed here. The value goes into a sed REPLACEMENT, where & means "the whole match",
+    # \1 is a backreference and the delimiter (whatever it is) terminates the expression - so a
+    # URL with a query string (&) or a value containing | or \ corrupted or broke the rewrite,
+    # silently, on the one path that exists precisely for hosts where nothing else works. awk
+    # takes the value as DATA, so nothing in it is special.
     [ -r "$CONFIG_FILE" ] || return 1
     _tmp="$CONFIG_FILE.tg-new.$$"
-    if grep -q "^[[:space:]]*option[[:space:]]*$1[[:space:]]" "$CONFIG_FILE" 2>/dev/null; then
-        sed "s|^[[:space:]]*option[[:space:]]*$1[[:space:]].*|\toption $1 '$2'|"             "$CONFIG_FILE" >"$_tmp" 2>/dev/null || { rm -f "$_tmp"; return 1; }
-    else
-        { cat "$CONFIG_FILE"; printf "\toption %s '%s'\n" "$1" "$2"; } >"$_tmp" 2>/dev/null ||
-            { rm -f "$_tmp"; return 1; }
-    fi
+    TG_OPT_NAME=$1 TG_OPT_VALUE=$2 awk '
+        BEGIN { name = ENVIRON["TG_OPT_NAME"]; value = ENVIRON["TG_OPT_VALUE"]; done = 0 }
+        {
+            # Match the option line by its second field, so a value that looks like an option is
+            # not mistaken for one.
+            if (!done && $1 == "option" && $2 == name) {
+                printf "\toption %s \047%s\047\n", name, value
+                done = 1
+                next
+            }
+            print
+        }
+        END { if (!done) printf "\toption %s \047%s\047\n", name, value }
+    ' "$CONFIG_FILE" >"$_tmp" 2>/dev/null || {
+        rm -f "$_tmp"
+        return 1
+    }
     chmod 0600 "$_tmp" && mv "$_tmp" "$CONFIG_FILE"
 }
 
@@ -131,10 +214,13 @@ post() {
         if [ "$TLS_VERIFY" = "0" ]; then
             _tg_k="-k"
         fi
+        # NO credential on the command line: -H and -u both expose the API token in
+        # /proc/PID/cmdline to every local user, and this process starts again every 60 s. The
+        # body already carries api_token, and the panel accepts it there (which is also the only
+        # channel a pre-24.10 uclient-fetch has). Verified against the live panel with a
+        # body-only POST.
         _tg_code=$(curl -q -sS ${_tg_k:+"$_tg_k"} -o "$_tg_out" -w '%{http_code}' --max-time 30 -X POST \
             -H "Content-Type: application/json" \
-            -H "X-Api-Token: $_tg_token" \
-            -u "$_tg_token:" \
             --data-binary "@$_tg_body" \
             "$_tg_url" 2>/dev/null)
         case "$_tg_code" in
@@ -176,20 +262,23 @@ send_heartbeat() {
     _model=""
     [ -r /tmp/sysinfo/model ] && _model=$(head -n 1 /tmp/sysinfo/model)
     _openwrt=""
-    if [ -r /etc/openwrt_release ]; then
-        _openwrt=$(sed -n "s/^DISTRIB_RELEASE='\(.*\)'/\1/p" /etc/openwrt_release | head -n 1)
+    if [ -r "$OPENWRT_RELEASE_FILE" ]; then
+        _openwrt=$(sed -n "s/^DISTRIB_RELEASE='\(.*\)'/\1/p" "$OPENWRT_RELEASE_FILE" | head -n 1)
     fi
     _uptime=$(cut -d. -f1 /proc/uptime 2>/dev/null)
     [ -n "$_uptime" ] || _uptime=0
-    _tunnel_pid=$(cfg_get tunnel_pid)
-
+    # Nothing below can work without the private directory, and a credential must never be
+    # written to a path this process did not create itself.
+    make_tmp_dir || {
+        log "cannot create a private temporary directory under ${TMPDIR:-/tmp}; refusing to write the API token to a predictable path"
+        return 2
+    }
     {
         printf '{"hostname":%s' "$(json_quote "$_hostname")"
         printf ',"model":%s' "$(json_quote "$_model")"
         printf ',"openwrt_version":%s' "$(json_quote "$_openwrt")"
         printf ',"uptime_seconds":%s' "$_uptime"
         printf ',"client_version":%s' "$(json_quote "$CLIENT_VERSION")"
-        [ -n "$_tunnel_pid" ] && printf ',"tunnel_pid":%s' "$_tunnel_pid"
         [ "$1" = "1" ] && printf ',"console_installed":true'
         # The credential in the body: the only channel a pre-24.10 uclient-fetch can use.
         printf ',"api_token":%s' "$(json_quote "$api_token")"
@@ -218,11 +307,33 @@ fi
 # One warning per boot, not one per minute: this process is restarted every 60 s and a warning
 # that shouts every minute is a warning nobody reads.
 if [ "$TLS_VERIFY" = "0" ]; then
+    # The marker file is EMPTY and its name is the whole message: it carries no URL, no token and
+    # nothing else that would be worth keeping private, which is why these two stay in /tmp while
+    # everything that held a credential moved into the private directory.
     _tls_warned=${TG_TLS_WARN_FILE:-/tmp/.tunnelgate-tls-warning}
     if [ ! -e "$_tls_warned" ]; then
         log "WARNING: TLS certificate verification is OFF for $heartbeat_url (tunnelgate.main.tls_verify=0). Anyone who can answer for that host receives the API token. Restore it with: uci set tunnelgate.main.tls_verify=1 && uci commit tunnelgate && /etc/init.d/tunnelgate restart"
         : >"$_tls_warned" 2>/dev/null
     fi
+fi
+
+# The 19.07-generation nag. Separate marker file from the tls_verify=0 warning: they describe
+# different situations and one must not suppress the other.
+if [ "$TLS_VERIFY" = "1" ] && tls_stack_cannot_verify; then
+    _cap_warned=${TG_TLS_CAP_WARN_FILE:-/tmp/.tunnelgate-tls-capability-warning}
+    if [ ! -e "$_cap_warned" ]; then
+        log "WARNING: this router's OpenWrt release cannot check a certificate chain (measured on the 19.07 generation: such a fetcher accepts a self-signed certificate), so the panel at $heartbeat_url is not authenticated even though tls_verify=1. The API token is only as safe as the path to the panel. OpenWrt 21.02 or newer verifies a chain; if the panel uses a self-signed certificate, turn the check off in Settings > Agent endpoint so the acknowledgement is recorded"
+        : >"$_cap_warned" 2>/dev/null
+    fi
+fi
+
+# Create the directory in THIS shell, not inside send_heartbeat: that runs in a $(...) subshell,
+# so a directory created only there would leave RESPONSE empty in the parent and every
+# json_get "$RESPONSE" below would read nothing. make_tmp_dir is idempotent, so the guard inside
+# send_heartbeat still covers a direct call.
+if ! make_tmp_dir; then
+    log "cannot create a private temporary directory under ${TMPDIR:-/tmp}; refusing to write the API token to a predictable path"
+    exit 1
 fi
 
 http_code=$(send_heartbeat 0)
@@ -272,7 +383,14 @@ console_user=$(json_get console.user "$RESPONSE")
 [ -n "$console_user" ] || console_user=root
 allowed_from=$(json_get console.allowed_from "$RESPONSE")
 [ -n "$allowed_from" ] || allowed_from=127.0.0.1
-reg_keys_path=$(json_get console.authorized_keys_path "$RESPONSE")
+# The panel always sends /etc/dropbear/authorized_keys, which dropbear only reads for root. A
+# NON-root console account needs its own ~/.ssh/authorized_keys, so that file wins over the one
+# in the response whenever UCI names a non-root user: the installer decided this at install time
+# and wrote the effective path into UCI, and the panel's constant must not undo it.
+reg_keys_path=$(cfg_get console_authorized_keys_path)
+if [ -z "$reg_keys_path" ]; then
+    reg_keys_path=$(json_get console.authorized_keys_path "$RESPONSE")
+fi
 [ -n "$reg_keys_path" ] || reg_keys_path=$keys_path
 
 key_type=$(printf '%s' "$public_key" | awk '{print $1}')

@@ -112,16 +112,21 @@ open the router's own LuCI through the tunnel.
    key (dropbear's cannot) and read it back; `ssh-keyscan` must exist. Each failing capability
    names the package that supplies it - `openssh-client` (the `ssh` binary), `openssh-keygen`
    and `openssh-client-utils` (`ssh-keyscan` lives there) - and all three are installed together
-   with `apk add` on images that use apk and `opkg install` on the rest. Note the trap: on 19.07
-   `uclient-fetch` advertises `--no-check-certificate` but has no TLS library linked, so an
-   https fetch dies with "SSL support not available"; `opkg install libustream-wolfssl` fixes it
+   with `apk add` on images that use apk and `opkg install` on the rest. Evidence level: the
+   opkg path was run end to end on 19.07.10, 23.05.5 and 24.10.1, while the apk path (the
+   development snapshot - 24.10.x still uses opkg) is exercised by `apk add --simulate` only:
+   the three package names resolve to `openssh-client`, `openssh-keygen` and
+   `openssh-client-utils`, but the install itself has not been replayed on an apk image.
+   Note the trap: on 19.07 `uclient-fetch` advertises `--no-check-certificate` but has no TLS
+   library linked, so an https fetch dies with "SSL support not available";
+   `opkg install libustream-wolfssl` fixes it
    (on 19.07 the exact package name is `libustream-wolfssl20150806`). The installer detects and
    names this case itself;
 3. posts `hostname`, `model`, `openwrt_version`, `mac`, `uptime_seconds`, `client_version`
    and `bootstrap_token` to `/api/v1/routers/bootstrap/exchange`. The token travels **in the
-   JSON body** (with the legacy `X-Bootstrap-Token` header and basic auth added on the curl
-   path only, which costs nothing there) - on a stock router the body is the only channel that
-   works, see section 2;
+   JSON body and nowhere else** - it is never on a command line, because every local user can
+   read `/proc/<pid>/cmdline`. On a stock router the body is also the only channel that works,
+   see section 2;
 4. writes the ed25519 private key from the response to `/root/.ssh/tunnelgate_ed25519` (0600)
    - this is the only time the key exists outside the router;
 5. scans the panel's host key and **aborts** unless the fingerprint matches the one in the
@@ -224,8 +229,29 @@ LAN, not the WAN.
 
 Requirements on the router: **dropbear must be running** (the installer enables and starts
 `/etc/init.d/dropbear` when the panel says the console is enabled). The console user defaults
-to `root`; if you set a dedicated user in the panel the installer creates it once, without
-a password.
+to `root`.
+
+If you set a dedicated user in the panel, the installer tries to create it once, without a
+password. Two things decide whether that works, and it is worth knowing which one you are in,
+because the panel's `console.user` field is stored on the router as `option console_user` and
+is what dropbear will be asked for:
+
+* **The account exists or was created.** The key is written to *that account's* key file -
+  `$HOME/.ssh/authorized_keys`, mode 0600 in a 0700 directory - not to root's. Dropbear reads a
+  user's own file only for that user; a `from=` line in `/etc/dropbear/authorized_keys` does
+  not authenticate a non-root login. The account is given a shell and no password, and it keeps
+  its home directory precisely so the key has somewhere to live.
+* **The account cannot be created** (`adduser` missing, read-only rootfs, full flash). The
+  installer does **not** leave the panel asking for a user that does not exist: it logs a
+  `WARNING`, writes `option console_user 'root'` into `/etc/config/tunnelgate` and puts the
+  key where root's dropbear reads it. The console then works, as root, and the panel's next
+  heartbeat sees the account the router actually has. Create the account by hand and re-run the
+  installer if you want it.
+
+A third option is recorded for removal: `option console_user_created '1'` is written only when
+the installer really created the account. Both uninstallers check it before deleting anything,
+so `--purge` removes the console account **only** if the agent created it - a user account that
+was there first is left alone.
 
 > Revoking access is done on the panel (rotate or delete the console key). The router keeps a
 > stale line until the next heartbeat delivers a higher serial, so rotate rather than hand-edit
@@ -342,6 +368,10 @@ drive the real scripts, but they also work on a device:
 | `TG_KNOWN_HOSTS` | `/root/.ssh/known_hosts` |
 | `TG_TLS_VERIFY` | injected by the panel; otherwise `tunnelgate.main.tls_verify` (section 8) |
 | `TG_TLS_WARN_FILE` | `/tmp/.tunnelgate-tls-warning` (rate limits the once-per-boot warning) |
+| `TG_TLS_CAP_WARN_FILE` | `/tmp/.tunnelgate-tls-capability-warning` (the same for the "cannot verify" warning) |
+| `TG_TLS_LIB_DIRS` | `/lib /usr/lib` (where a TLS-capable libustream is looked for) |
+| `TG_OPENWRT_RELEASE` | `/etc/openwrt_release` (the file the version checks read) |
+| `TG_PASSWD` | `/etc/passwd` (the account database the console-user step reads) |
 | `TG_INITD`, `TG_LOOP_BIN`, `TG_HB_BIN`, `TG_UNINSTALL_BIN` | the system paths above |
 
 ### Files the agent owns
@@ -453,6 +483,40 @@ warning on images older than 21.02:
 21.02 is the supported floor for this reason and others (see section 1). If a router must stay
 on 19.07, treat the agent endpoint as unauthenticated: keep the panel on a network you control,
 or use `http` deliberately rather than believing `https` bought you anything.
+
+### On such a router the installer refuses, unless you said so
+
+A warning in `logread` is not consent, and it is not even read: the exchange is the first
+https request the router ever makes, and the host key fingerprint arrives **in the same
+response** as the private key. A machine on the path can substitute the key, the fingerprint and
+the pinned `known_hosts` entry together, so `pin_host_key` cannot detect it - its input was
+attacker-controlled from the start.
+
+So when the panel URL is `https` and the fetcher cannot check a chain, the installer stops
+**before** the POST, when `tls_verify=1`:
+
+    error: this router's TLS stack cannot check a certificate (OpenWrt 19.07.10 is a
+    19.07-generation release, and such a fetcher was measured to accept a self-signed
+    certificate), so the panel cannot be authenticated over it. ...
+    Two ways forward: upgrade the router to OpenWrt 21.02 or newer ..., or - if the panel
+    really does use a self-signed certificate - open Settings > Agent endpoint in the panel and
+    turn the certificate check off for this panel. ...
+    Nothing has been sent: the bootstrap token already crossed the wire in the download command
+    you pasted, but no private key or API token has.
+
+Two ways out, both explicit:
+
+* **Upgrade to 21.02 or newer.** Real verification, nothing else to decide.
+* **Turn the check off in the panel** (section above). Then the acknowledgement is a setting
+  with an audit trail instead of a silent acceptance, the installer proceeds with one warning,
+  and the heartbeat repeats that warning once per boot. "Once per boot" is literal: procd
+  mounts `/tmp` as a fresh `tmpfs` (`mode=01777`) during early init, so the marker file cannot
+  survive a reboot and a router that power-blips warns once per blip - not once ever, and not
+  every 60 seconds.
+
+There is deliberately no environment-variable bypass for this. `TG_FORCE` exists to skip the
+OpenWrt check on a test host; mixing "not OpenWrt" and "I accept an unauthenticated panel" into
+one switch is how both get used by accident.
 
 ### Why `http` is different
 

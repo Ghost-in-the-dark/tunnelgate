@@ -20,6 +20,40 @@ CONFIG_FILE=${TG_CONFIG:-/etc/config/tunnelgate}
 
 umask 077
 
+# Private directory for ssh's stderr capture, created lazily on the first connection attempt.
+#
+# The file only ever holds ssh(1) diagnostics (host key warnings, "remote port forwarding
+# failed", DNS errors) - no key material, no token - so this is not a credential fix. It is a
+# symlink fix: "/tmp/tunnelgate-ssh-$$.log" with a predictable name let any local user pre-create
+# it and have root truncate or append to a file of their choosing. The cost of closing that is
+# one mktemp -d per reconnect.
+TMP_DIR=""
+
+make_tmp_dir() {
+    [ -n "$TMP_DIR" ] && return 0
+    TMP_DIR=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/tunnelgate-ssh.$$.XXXXXX" 2>/dev/null) || {
+        TMP_DIR=""
+        return 1
+    }
+    chmod 0700 "$TMP_DIR" 2>/dev/null
+}
+
+cleanup() {
+    [ -n "$TMP_DIR" ] && rm -rf "$TMP_DIR" 2>/dev/null
+    TMP_DIR=""
+}
+
+# procd stops this process with SIGTERM: without a handler the trap on EXIT still fires under
+# dash/busybox ash, but an explicit handler makes the intent readable.
+on_signal() {
+    cleanup
+    trap - EXIT INT TERM
+    exit 143
+}
+
+trap cleanup EXIT
+trap on_signal INT TERM
+
 log() {
     logger -t tunnelgate "$*" 2>/dev/null
     printf '[tunnelgate] %s\n' "$*" >&2
@@ -73,8 +107,16 @@ console_target_port=$(cfg_get console_target_port)
 log "agent starting (ssh $ssh_user@$ssh_host:$ssh_port, tunnel $tunnel_port -> 127.0.0.1:$local_port)"
 
 while :; do
-    stderr_file="/tmp/tunnelgate-ssh-$$.log"
-    : >"$stderr_file"
+    # A private directory per reconnect; if it cannot be created, skip the capture rather than
+    # fall back to a predictable path (the diagnostics are useful, not essential).
+    if make_tmp_dir; then
+        stderr_file="$TMP_DIR/ssh.log"
+    else
+        stderr_file=""
+    fi
+    if [ -n "$stderr_file" ]; then
+        : >"$stderr_file"
+    fi
 
     # One SSH connection carries BOTH reverse listeners. The panel authorizes exactly these
     # two ports on a single public key (one permitlisten per port), so a second connection
@@ -100,13 +142,17 @@ while :; do
 
     set -- "$@" "$ssh_user@$ssh_host"
 
-    "$@" 2>"$stderr_file"
+    if [ -n "$stderr_file" ]; then
+        "$@" 2>"$stderr_file"
+    else
+        "$@" 2>/dev/null
+    fi
     rc=$?
 
     # ssh(1) diagnostics (host key mismatch, "remote port forwarding failed", DNS errors) are
     # the only useful text and contain no key material - forward them to syslog ourselves,
     # because the procd instance runs with stderr 0 to keep the log format uniform.
-    if [ -s "$stderr_file" ]; then
+    if [ -n "$stderr_file" ] && [ -s "$stderr_file" ]; then
         log "ssh: $(tr '\n' ' ' <"$stderr_file" | cut -c1-400)"
     fi
     rm -f "$stderr_file"

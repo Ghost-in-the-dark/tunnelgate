@@ -39,6 +39,12 @@
 # a fixed back-off covers "reconnect forever" and keeps the failures in logread.
 
 set -u
+# Every file this script creates starts out private. The private temporary directory is already
+# 0700, but a mode inside it must not depend on that alone: a body file that carries the bootstrap
+# token, or a response that carries the private key, is worthless to an attacker only while it is
+# unreadable in its own right. Everything that must be executable or readable is chmod'ed
+# explicitly below, so this default never gets in the way.
+umask 077
 
 CLIENT_VERSION="1.0"
 EXCHANGE_PATH="/api/v1/routers/bootstrap/exchange"
@@ -54,19 +60,58 @@ INITD="${TG_INITD:-/etc/init.d/tunnelgate}"
 LOOP_BIN="${TG_LOOP_BIN:-/usr/bin/ssh-loop}"
 HB_BIN="${TG_HB_BIN:-/usr/bin/tunnelgate-heartbeat}"
 UNINSTALL_BIN="${TG_UNINSTALL_BIN:-/usr/bin/tunnelgate-uninstall}"
+# The account database the console-user step reads a home directory from. Same reason as the
+# other overrides: a test has to be able to describe a console account without creating one.
+PASSWD_FILE="${TG_PASSWD:-/etc/passwd}"
+# The release file the version checks read. Same reason as the other overrides: a test run has to
+# be able to say "pretend this is 19.07" without editing /etc.
+OPENWRT_RELEASE_FILE="${TG_OPENWRT_RELEASE:-/etc/openwrt_release}"
+# Where a TLS-capable libustream would be. Same reason as the other overrides: a test has to
+# be able to say "this image does ship one" without writing into /lib.
+TLS_LIB_DIRS="${TG_TLS_LIB_DIRS:-/lib /usr/lib}"
+# Exactly the set the installer adds (and agent/uninstall.sh removes): the client on its own does
+# not provide ssh-keygen or ssh-keyscan - they live in the other two packages.
+OPENSSH_PKGS="openssh-client openssh-keygen openssh-client-utils"
 # TG_SKIP_SERVICE=1 stages the files but does not call the init script (test suite only).
 SKIP_SERVICE="${TG_SKIP_SERVICE:-0}"
-DEF_RESPONSE="/tmp/tunnelgate-exchange.$$"
-DEF_BODY="/tmp/tunnelgate-report.$$"
-# Where http_post leaves the fetcher's complaint (it runs in a command substitution, so it
-# cannot return a variable); do_exchange turns that line into an actionable error.
-HTTP_ERR_FILE="/tmp/tunnelgate-fetch-err.$$"
+# Private working directory for the exchange. Created lazily and only when something is
+# actually written, with umask 077, so a file that carries a bootstrap token, an API token or
+# a private key is never world-readable and never at a path another local user could have
+# pre-created as a symlink (a bare "/tmp/name.$$" is guessable; choosing it before the open is
+# the classic bug). $$ is the pid, so two installers cannot collide; mktemp -d also refuses a
+# directory that already exists.
+TMP_DIR=""
+DEF_RESPONSE=""   # set once the directory exists
+DEF_BODY=""
+HTTP_ERR_FILE=""
+
+# 1 when this router's fetcher probably cannot check a certificate chain (see
+# tls_stack_cannot_verify). Decided ONCE in main, after the TLS library work.
+TLS_UNVERIFIABLE=0
 
 MODE="install"
 DRY_RUN=0
 PURGE=0
-RESPONSE_FILE="$DEF_RESPONSE"
-BODY_FILE="$DEF_BODY"
+RESPONSE_FILE=""
+BODY_FILE=""
+
+# make_tmp_dir: create the private directory and point the three paths at it. Called right
+# before the first write, never at startup - a --dry-run that never touches the network should
+# leave nothing behind at all.
+make_tmp_dir() {
+    [ -n "$TMP_DIR" ] && return 0
+    # umask 077 covers the window between mktemp choosing the name and the file being created;
+    # mktemp -d itself creates 0700 and refuses a path that already exists.
+    TMP_DIR=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/tunnelgate.$$.XXXXXX" 2>/dev/null) || {
+        err "cannot create a private temporary directory under ${TMPDIR:-/tmp}"
+    }
+    chmod 0700 "$TMP_DIR" 2>/dev/null
+    DEF_RESPONSE="$TMP_DIR/exchange.json"
+    DEF_BODY="$TMP_DIR/report.json"
+    HTTP_ERR_FILE="$TMP_DIR/fetch.err"
+    RESPONSE_FILE="$DEF_RESPONSE"
+    BODY_FILE="$DEF_BODY"
+}
 
 # The HTTP fetcher, probed ONCE (http_post explains why the two are not interchangeable).
 # Values: curl | wget | none. Stock OpenWrt has no curl at all and its wget is uclient-fetch;
@@ -145,11 +190,27 @@ USAGE
 }
 
 cleanup() {
-    rm -f "$DEF_RESPONSE" "$DEF_BODY" "$HTTP_ERR_FILE"
+    [ -n "$DEF_RESPONSE" ] && rm -f "$DEF_RESPONSE"
+    [ -n "$DEF_BODY" ] && rm -f "$DEF_BODY"
+    [ -n "$HTTP_ERR_FILE" ] && rm -f "$HTTP_ERR_FILE"
     rm -rf "${TMPDIR:-/tmp}/tg-probe.$$" 2>/dev/null
+    if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
+        rm -rf "$TMP_DIR"
+    fi
+    TMP_DIR=""
 }
 
-trap cleanup EXIT INT TERM
+# on_signal: a trapped signal must still end the process. A handler that only cleans up
+# returns to the interrupted code, so Ctrl-C during the exchange carried on with the install
+# - the cleanup ran, the script did not stop.
+on_signal() {
+    cleanup
+    trap - EXIT INT TERM
+    exit 130
+}
+
+trap cleanup EXIT
+trap on_signal INT TERM
 
 # --------------------------------------------------------------------------------------
 # arguments
@@ -188,8 +249,8 @@ check_openwrt() {
         log "TG_FORCE=1: skipping the OpenWrt check (development mode)"
         return 0
     fi
-    [ -r /etc/openwrt_release ] ||
-        err "this does not look like OpenWrt (/etc/openwrt_release is missing); set TG_FORCE=1 only for testing"
+    [ -r "$OPENWRT_RELEASE_FILE" ] ||
+        err "this does not look like OpenWrt ($OPENWRT_RELEASE_FILE is missing); set TG_FORCE=1 only for testing"
 }
 
 # A body that is not this script (a 401 page, a captive-portal splash, an HTML error page) must
@@ -414,9 +475,11 @@ needs_tls_lib() {
     # and only because on OpenWrt wget IS uclient-fetch.
     *) return 1 ;;
     esac
-    if [ -r /lib/libustream-ssl.so ] || [ -r /usr/lib/libustream-ssl.so ]; then
-        return 1 # a TLS-capable libustream is already there; any variant is enough
-    fi
+    for _tls_dir in $TLS_LIB_DIRS; do
+        if [ -r "$_tls_dir/libustream-ssl.so" ]; then
+            return 1 # a TLS-capable libustream is already there; any variant is enough
+        fi
+    done
     return 0
 }
 
@@ -458,26 +521,38 @@ ensure_tls_lib() {
     fi
 }
 
-# 0 when this image's uclient-fetch CANNOT validate a certificate chain, whatever tls_verify
-# says. MEASURED, not assumed: on 19.07.10 with libustream-wolfssl20150806 + ca-bundle installed,
-# uclient-fetch ACCEPTS a self-signed certificate (it fetched our self-signed test panel and
-# answered 401, where 21.02.7, 22.03.7, 23.05.5 and 24.10.1 all answer "Connection error: Invalid
-# SSL certificate"), while a hostname mismatch IS still caught. So on that generation
-# tls_verify=1 does not mean "the chain was checked", and saying it does would be a lie. 19.07 is
-# below the supported floor (21.02) but people run it, so say what is true rather than refuse.
+# 0 when this router's TLS stack probably CANNOT validate a certificate chain, whatever
+# tls_verify says. MEASURED for one generation, inferred for the rest - do not overclaim:
+#   * on 19.07.10 with libustream-wolfssl20150806 + ca-bundle installed, uclient-fetch ACCEPTS a
+#     self-signed certificate (it fetched our self-signed test panel and answered 401, where
+#     21.02.7, 22.03.7, 23.05.5 and 24.10.1 all answer "Connection error: Invalid SSL
+#     certificate"), while a hostname mismatch IS still caught;
+#   * only the wolfssl libustream variant was measured, and early 21.02 point releases had
+#     verification regressions of their own, so "major >= 21 is therefore safe" is NOT proven -
+#     it is merely the oldest generation on which no failure was observed.
+# So the gate below is "19.07-generation (major < 21) cannot verify", not "21.02+ always can".
+#
+# Fail CLOSED on a version it cannot parse (TLS_UNPARSED_RELEASE=1, warned about by the caller):
+# an unknown release must never be treated as a modern one.
 tls_stack_cannot_verify() {
     case "$FETCHER" in
     wget) ;;
     *) return 1 ;; # curl links its own SSL and does validate
     esac
     _rel=$(detect_openwrt_version)
-    [ -n "$_rel" ] || return 1
     _major=${_rel%%.*}
+    # Require the whole major component to be digits. "[0-9]*" also matches "19x", and the
+    # numeric test then returns 2 - which, inside an "if", reads as "safe" (fail open).
     case "$_major" in
-    [0-9]*) ;;
-    *) return 1 ;;
+    "" | *[!0-9]*)
+        # The version could not be parsed, so nothing is known - and an unknown release must
+        # never be treated as a modern one. The flag lets the caller say WHY, instead of claiming
+        # a release number it does not have.
+        TLS_UNPARSED_RELEASE=1
+        return 0
+        ;;
     esac
-    [ "$_major" -lt 21 ] 2>/dev/null
+    [ "$_major" -lt 21 ]
 }
 
 # --------------------------------------------------------------------------------------
@@ -494,8 +569,8 @@ detect_model() {
 }
 
 detect_openwrt_version() {
-    if [ -r /etc/openwrt_release ]; then
-        sed -n "s/^DISTRIB_RELEASE='\(.*\)'/\1/p" /etc/openwrt_release | head -n 1 | cut -c1-64
+    if [ -r "$OPENWRT_RELEASE_FILE" ]; then
+        sed -n "s/^DISTRIB_RELEASE='\(.*\)'/\1/p" "$OPENWRT_RELEASE_FILE" | head -n 1 | cut -c1-64
     fi
 }
 
@@ -545,7 +620,7 @@ write_json_lib() {
         return 0
     fi
     mkdir -p "$STATE_DIR" || err "cannot create $STATE_DIR"
-    cat >"$JSON_LIB" <<'TG_EOF_JSON'
+    cat >"$JSON_LIB" <<'TG_EOF_JSON' || err "cannot write $JSON_LIB (out of space?)"
 #!/bin/sh
 # TunnelGate - minimal JSON reader for busybox ash.
 #
@@ -715,7 +790,7 @@ write_loop_bin() {
         return 0
     fi
     mkdir -p "$(dirname "$LOOP_BIN")" || err "cannot create $(dirname "$LOOP_BIN")"
-    cat >"$LOOP_BIN" <<'TG_EOF_LOOP'
+    cat >"$LOOP_BIN" <<'TG_EOF_LOOP' || err "cannot write $LOOP_BIN (out of space?)"
 #!/bin/sh
 # TunnelGate router agent - reverse-tunnel supervisor loop.
 #
@@ -737,6 +812,40 @@ DEFAULT_KNOWN_HOSTS=/root/.ssh/known_hosts
 CONFIG_FILE=${TG_CONFIG:-/etc/config/tunnelgate}
 
 umask 077
+
+# Private directory for ssh's stderr capture, created lazily on the first connection attempt.
+#
+# The file only ever holds ssh(1) diagnostics (host key warnings, "remote port forwarding
+# failed", DNS errors) - no key material, no token - so this is not a credential fix. It is a
+# symlink fix: "/tmp/tunnelgate-ssh-$$.log" with a predictable name let any local user pre-create
+# it and have root truncate or append to a file of their choosing. The cost of closing that is
+# one mktemp -d per reconnect.
+TMP_DIR=""
+
+make_tmp_dir() {
+    [ -n "$TMP_DIR" ] && return 0
+    TMP_DIR=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/tunnelgate-ssh.$$.XXXXXX" 2>/dev/null) || {
+        TMP_DIR=""
+        return 1
+    }
+    chmod 0700 "$TMP_DIR" 2>/dev/null
+}
+
+cleanup() {
+    [ -n "$TMP_DIR" ] && rm -rf "$TMP_DIR" 2>/dev/null
+    TMP_DIR=""
+}
+
+# procd stops this process with SIGTERM: without a handler the trap on EXIT still fires under
+# dash/busybox ash, but an explicit handler makes the intent readable.
+on_signal() {
+    cleanup
+    trap - EXIT INT TERM
+    exit 143
+}
+
+trap cleanup EXIT
+trap on_signal INT TERM
 
 log() {
     logger -t tunnelgate "$*" 2>/dev/null
@@ -791,8 +900,16 @@ console_target_port=$(cfg_get console_target_port)
 log "agent starting (ssh $ssh_user@$ssh_host:$ssh_port, tunnel $tunnel_port -> 127.0.0.1:$local_port)"
 
 while :; do
-    stderr_file="/tmp/tunnelgate-ssh-$$.log"
-    : >"$stderr_file"
+    # A private directory per reconnect; if it cannot be created, skip the capture rather than
+    # fall back to a predictable path (the diagnostics are useful, not essential).
+    if make_tmp_dir; then
+        stderr_file="$TMP_DIR/ssh.log"
+    else
+        stderr_file=""
+    fi
+    if [ -n "$stderr_file" ]; then
+        : >"$stderr_file"
+    fi
 
     # One SSH connection carries BOTH reverse listeners. The panel authorizes exactly these
     # two ports on a single public key (one permitlisten per port), so a second connection
@@ -818,13 +935,17 @@ while :; do
 
     set -- "$@" "$ssh_user@$ssh_host"
 
-    "$@" 2>"$stderr_file"
+    if [ -n "$stderr_file" ]; then
+        "$@" 2>"$stderr_file"
+    else
+        "$@" 2>/dev/null
+    fi
     rc=$?
 
     # ssh(1) diagnostics (host key mismatch, "remote port forwarding failed", DNS errors) are
     # the only useful text and contain no key material - forward them to syslog ourselves,
     # because the procd instance runs with stderr 0 to keep the log format uniform.
-    if [ -s "$stderr_file" ]; then
+    if [ -n "$stderr_file" ] && [ -s "$stderr_file" ]; then
         log "ssh: $(tr '\n' ' ' <"$stderr_file" | cut -c1-400)"
     fi
     rm -f "$stderr_file"
@@ -842,7 +963,7 @@ write_heartbeat_bin() {
         return 0
     fi
     mkdir -p "$(dirname "$HB_BIN")" || err "cannot create $(dirname "$HB_BIN")"
-    cat >"$HB_BIN" <<'TG_EOF_HB'
+    cat >"$HB_BIN" <<'TG_EOF_HB' || err "cannot write $HB_BIN (out of space?)"
 #!/bin/sh
 # TunnelGate - heartbeat sender (procd instance "heartbeat", runs every 60 s).
 #
@@ -861,14 +982,25 @@ write_heartbeat_bin() {
 # console, so the installer cannot know the public half - this loop is the delivery channel.
 
 CONFIG_FILE=${TG_CONFIG:-/etc/config/tunnelgate}
+# The release file the capability check reads (overridable so a test can say "pretend 19.07").
+OPENWRT_RELEASE_FILE=${TG_OPENWRT_RELEASE:-/etc/openwrt_release}
 # The JSON reader is installed next to the other agent files; the installer writes
 # its exact path into UCI (TG_LIB_DIR overrides it, for tests and odd layouts).
 LIB_DIR=${TG_LIB_DIR:-}
 CLIENT_VERSION="1.0"
 DEFAULT_KEYS=${TG_KEYS:-/etc/dropbear/authorized_keys}
-TMP_BODY=/tmp/tunnelgate-heartbeat-body.$$
-RESPONSE=/tmp/tunnelgate-heartbeat-response.$$
 CONSOLE_MARK=tunnelgate-console
+
+# Private working directory for this run. It is created LAZILY (only when something is actually
+# written) with umask 077 and mode 0700, and removed on exit and on SIGTERM.
+#
+# Why not "/tmp/tunnelgate-heartbeat-body.$$": that file carries the API token in clear, and the
+# name is predictable, so any local user can pre-create it as a symlink to a file they can read -
+# or to one root can overwrite - and win the race. This process runs as root every 60 seconds, so
+# it is the perfect target for exactly that. The pid in the old name made the race easy, not safe.
+TMP_DIR=""
+TMP_BODY=""
+RESPONSE=""
 
 # The fetcher is probed once, for the same reason as in install.sh: stock OpenWrt has no curl,
 # and its uclient-fetch has no --header before 24.10.
@@ -880,7 +1012,41 @@ elif command -v wget >/dev/null 2>&1; then
 fi
 
 umask 077
-trap 'rm -f "$TMP_BODY" "$RESPONSE"' EXIT INT TERM
+
+# make_tmp_dir: create the private directory on first use. mktemp -d refuses a path that already
+# exists, which is what closes the symlink race; 0700 means another user cannot even list it.
+make_tmp_dir() {
+    [ -n "$TMP_DIR" ] && return 0
+    TMP_DIR=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/tunnelgate-hb.$$.XXXXXX" 2>/dev/null) || {
+        TMP_DIR=""
+        return 1
+    }
+    chmod 0700 "$TMP_DIR" 2>/dev/null
+    TMP_BODY="$TMP_DIR/heartbeat.json"
+    RESPONSE="$TMP_DIR/response.json"
+}
+
+# shellcheck disable=SC2329  # invoked from the traps below
+cleanup() {
+    if [ -n "$TMP_DIR" ]; then
+        rm -rf "$TMP_DIR" 2>/dev/null
+    fi
+    TMP_DIR=""
+    TMP_BODY=""
+    RESPONSE=""
+}
+
+# SIGTERM is how the init script stops this instance, so the exit path that removes the directory
+# has to run on a signal too. Exit 143 = killed by SIGTERM, the conventional value.
+# shellcheck disable=SC2329  # invoked from the traps below
+on_signal() {
+    cleanup
+    trap - EXIT INT TERM
+    exit 143
+}
+
+trap cleanup EXIT
+trap on_signal INT TERM
 
 
 log() {
@@ -936,22 +1102,60 @@ if [ "$_tls_value" = "0" ]; then
     TLS_VERIFY=0
 fi
 
+# Same capability question as in install.sh, and the same honest answer: MEASURED for the
+# 19.07 generation (uclient-fetch there accepts a self-signed certificate; a wrong hostname is
+# still caught), NOT proven safe for every 21.02+ point release, and unparsable versions are
+# treated as unverified rather than as modern. Returns 0 when the chain probably is not checked.
+# Do NOT use it to refuse the heartbeat: the installer already refuses a fresh install on such a
+# stack, and a router installed before that check must not silently lose its liveness signal.
+# This process only NAGS, once per boot.
+tls_stack_cannot_verify() {
+    [ "$FETCHER" = "wget" ] || return 1 # curl links its own SSL and does validate
+    _rel=""
+    if [ -r "$OPENWRT_RELEASE_FILE" ]; then
+        _rel=$(sed -n "s/^DISTRIB_RELEASE='\(.*\)'/\1/p" "$OPENWRT_RELEASE_FILE" | head -n 1)
+    fi
+    _major=${_rel%%.*}
+    # "[0-9]*" also matches "19x" and the numeric test then returns 2, which reads as "safe".
+    case "$_major" in
+    "" | *[!0-9]*) return 0 ;;
+    esac
+    [ "$_major" -lt 21 ]
+}
+
 cfg_set() {
     if command -v uci >/dev/null 2>&1; then
         uci -q set "tunnelgate.main.$1=$2" && uci -q commit tunnelgate
         return $?
     fi
-    # Fallback for a host without uci (test suite, or a stripped image): rewrite the option
-    # in place so the serial really is persisted and the next heartbeat does not reinstall
-    # the same console key forever.
+    # Fallback for a host without uci (test suite, or a stripped image): rewrite the option in
+    # place so the serial really is persisted and the next heartbeat does not reinstall the same
+    # console key forever.
+    #
+    # NO sed here. The value goes into a sed REPLACEMENT, where & means "the whole match",
+    # \1 is a backreference and the delimiter (whatever it is) terminates the expression - so a
+    # URL with a query string (&) or a value containing | or \ corrupted or broke the rewrite,
+    # silently, on the one path that exists precisely for hosts where nothing else works. awk
+    # takes the value as DATA, so nothing in it is special.
     [ -r "$CONFIG_FILE" ] || return 1
     _tmp="$CONFIG_FILE.tg-new.$$"
-    if grep -q "^[[:space:]]*option[[:space:]]*$1[[:space:]]" "$CONFIG_FILE" 2>/dev/null; then
-        sed "s|^[[:space:]]*option[[:space:]]*$1[[:space:]].*|\toption $1 '$2'|"             "$CONFIG_FILE" >"$_tmp" 2>/dev/null || { rm -f "$_tmp"; return 1; }
-    else
-        { cat "$CONFIG_FILE"; printf "\toption %s '%s'\n" "$1" "$2"; } >"$_tmp" 2>/dev/null ||
-            { rm -f "$_tmp"; return 1; }
-    fi
+    TG_OPT_NAME=$1 TG_OPT_VALUE=$2 awk '
+        BEGIN { name = ENVIRON["TG_OPT_NAME"]; value = ENVIRON["TG_OPT_VALUE"]; done = 0 }
+        {
+            # Match the option line by its second field, so a value that looks like an option is
+            # not mistaken for one.
+            if (!done && $1 == "option" && $2 == name) {
+                printf "\toption %s \047%s\047\n", name, value
+                done = 1
+                next
+            }
+            print
+        }
+        END { if (!done) printf "\toption %s \047%s\047\n", name, value }
+    ' "$CONFIG_FILE" >"$_tmp" 2>/dev/null || {
+        rm -f "$_tmp"
+        return 1
+    }
     chmod 0600 "$_tmp" && mv "$_tmp" "$CONFIG_FILE"
 }
 
@@ -976,10 +1180,13 @@ post() {
         if [ "$TLS_VERIFY" = "0" ]; then
             _tg_k="-k"
         fi
+        # NO credential on the command line: -H and -u both expose the API token in
+        # /proc/PID/cmdline to every local user, and this process starts again every 60 s. The
+        # body already carries api_token, and the panel accepts it there (which is also the only
+        # channel a pre-24.10 uclient-fetch has). Verified against the live panel with a
+        # body-only POST.
         _tg_code=$(curl -q -sS ${_tg_k:+"$_tg_k"} -o "$_tg_out" -w '%{http_code}' --max-time 30 -X POST \
             -H "Content-Type: application/json" \
-            -H "X-Api-Token: $_tg_token" \
-            -u "$_tg_token:" \
             --data-binary "@$_tg_body" \
             "$_tg_url" 2>/dev/null)
         case "$_tg_code" in
@@ -1021,20 +1228,23 @@ send_heartbeat() {
     _model=""
     [ -r /tmp/sysinfo/model ] && _model=$(head -n 1 /tmp/sysinfo/model)
     _openwrt=""
-    if [ -r /etc/openwrt_release ]; then
-        _openwrt=$(sed -n "s/^DISTRIB_RELEASE='\(.*\)'/\1/p" /etc/openwrt_release | head -n 1)
+    if [ -r "$OPENWRT_RELEASE_FILE" ]; then
+        _openwrt=$(sed -n "s/^DISTRIB_RELEASE='\(.*\)'/\1/p" "$OPENWRT_RELEASE_FILE" | head -n 1)
     fi
     _uptime=$(cut -d. -f1 /proc/uptime 2>/dev/null)
     [ -n "$_uptime" ] || _uptime=0
-    _tunnel_pid=$(cfg_get tunnel_pid)
-
+    # Nothing below can work without the private directory, and a credential must never be
+    # written to a path this process did not create itself.
+    make_tmp_dir || {
+        log "cannot create a private temporary directory under ${TMPDIR:-/tmp}; refusing to write the API token to a predictable path"
+        return 2
+    }
     {
         printf '{"hostname":%s' "$(json_quote "$_hostname")"
         printf ',"model":%s' "$(json_quote "$_model")"
         printf ',"openwrt_version":%s' "$(json_quote "$_openwrt")"
         printf ',"uptime_seconds":%s' "$_uptime"
         printf ',"client_version":%s' "$(json_quote "$CLIENT_VERSION")"
-        [ -n "$_tunnel_pid" ] && printf ',"tunnel_pid":%s' "$_tunnel_pid"
         [ "$1" = "1" ] && printf ',"console_installed":true'
         # The credential in the body: the only channel a pre-24.10 uclient-fetch can use.
         printf ',"api_token":%s' "$(json_quote "$api_token")"
@@ -1063,11 +1273,33 @@ fi
 # One warning per boot, not one per minute: this process is restarted every 60 s and a warning
 # that shouts every minute is a warning nobody reads.
 if [ "$TLS_VERIFY" = "0" ]; then
+    # The marker file is EMPTY and its name is the whole message: it carries no URL, no token and
+    # nothing else that would be worth keeping private, which is why these two stay in /tmp while
+    # everything that held a credential moved into the private directory.
     _tls_warned=${TG_TLS_WARN_FILE:-/tmp/.tunnelgate-tls-warning}
     if [ ! -e "$_tls_warned" ]; then
         log "WARNING: TLS certificate verification is OFF for $heartbeat_url (tunnelgate.main.tls_verify=0). Anyone who can answer for that host receives the API token. Restore it with: uci set tunnelgate.main.tls_verify=1 && uci commit tunnelgate && /etc/init.d/tunnelgate restart"
         : >"$_tls_warned" 2>/dev/null
     fi
+fi
+
+# The 19.07-generation nag. Separate marker file from the tls_verify=0 warning: they describe
+# different situations and one must not suppress the other.
+if [ "$TLS_VERIFY" = "1" ] && tls_stack_cannot_verify; then
+    _cap_warned=${TG_TLS_CAP_WARN_FILE:-/tmp/.tunnelgate-tls-capability-warning}
+    if [ ! -e "$_cap_warned" ]; then
+        log "WARNING: this router's OpenWrt release cannot check a certificate chain (measured on the 19.07 generation: such a fetcher accepts a self-signed certificate), so the panel at $heartbeat_url is not authenticated even though tls_verify=1. The API token is only as safe as the path to the panel. OpenWrt 21.02 or newer verifies a chain; if the panel uses a self-signed certificate, turn the check off in Settings > Agent endpoint so the acknowledgement is recorded"
+        : >"$_cap_warned" 2>/dev/null
+    fi
+fi
+
+# Create the directory in THIS shell, not inside send_heartbeat: that runs in a $(...) subshell,
+# so a directory created only there would leave RESPONSE empty in the parent and every
+# json_get "$RESPONSE" below would read nothing. make_tmp_dir is idempotent, so the guard inside
+# send_heartbeat still covers a direct call.
+if ! make_tmp_dir; then
+    log "cannot create a private temporary directory under ${TMPDIR:-/tmp}; refusing to write the API token to a predictable path"
+    exit 1
 fi
 
 http_code=$(send_heartbeat 0)
@@ -1117,7 +1349,14 @@ console_user=$(json_get console.user "$RESPONSE")
 [ -n "$console_user" ] || console_user=root
 allowed_from=$(json_get console.allowed_from "$RESPONSE")
 [ -n "$allowed_from" ] || allowed_from=127.0.0.1
-reg_keys_path=$(json_get console.authorized_keys_path "$RESPONSE")
+# The panel always sends /etc/dropbear/authorized_keys, which dropbear only reads for root. A
+# NON-root console account needs its own ~/.ssh/authorized_keys, so that file wins over the one
+# in the response whenever UCI names a non-root user: the installer decided this at install time
+# and wrote the effective path into UCI, and the panel's constant must not undo it.
+reg_keys_path=$(cfg_get console_authorized_keys_path)
+if [ -z "$reg_keys_path" ]; then
+    reg_keys_path=$(json_get console.authorized_keys_path "$RESPONSE")
+fi
 [ -n "$reg_keys_path" ] || reg_keys_path=$keys_path
 
 key_type=$(printf '%s' "$public_key" | awk '{print $1}')
@@ -1166,6 +1405,10 @@ case "$http_code" in
 esac
 exit 0
 TG_EOF_HB
+    chmod 0755 "$HB_BIN" || err "cannot chmod $HB_BIN"
+    log "heartbeat sender written to $HB_BIN"
+}
+
 
 write_uninstall_bin() {
     if [ "$DRY_RUN" = "1" ]; then
@@ -1173,7 +1416,7 @@ write_uninstall_bin() {
         return 0
     fi
     mkdir -p "$(dirname "$UNINSTALL_BIN")" || err "cannot create $(dirname "$UNINSTALL_BIN")"
-    cat >"$UNINSTALL_BIN" <<'TG_EOF_UNINSTALL'
+    cat >"$UNINSTALL_BIN" <<'TG_EOF_UNINSTALL' || err "cannot write $UNINSTALL_BIN (out of space?)"
 #!/bin/sh
 # TunnelGate router agent - uninstaller (OpenWrt, POSIX sh / busybox ash).
 #
@@ -1322,9 +1565,17 @@ delete_console_key() {
 
 delete_console_user() {
     _user=$(cfg_get console_user)
+    # Only an account the INSTALLER created is removed. A pre-existing account is somebody's
+    # login, and --purge must never delete it - it was not ours to remove. The installer records
+    # this in UCI precisely so the two uninstallers can agree without guessing.
+    _created=$(cfg_get console_user_created)
     case "$_user" in
     "" | root) return 0 ;;
     esac
+    if [ "$_created" != "1" ]; then
+        log "keeping console user $_user: the installer did not create it"
+        return 0
+    fi
     id -u "$_user" >/dev/null 2>&1 || return 0
     if [ "$DRY_RUN" = "1" ]; then
         log "dry-run: would remove the console user $_user"
@@ -1399,8 +1650,6 @@ TG_EOF_UNINSTALL
     chmod 0755 "$UNINSTALL_BIN" || err "cannot chmod $UNINSTALL_BIN"
     log "uninstaller written to $UNINSTALL_BIN"
 }
-    chmod 0755 "$HB_BIN"
-}
 
 # get <path>: value of a field in the exchange response ("" when absent).
 get() {
@@ -1418,10 +1667,55 @@ require_field() {
     printf '%s' "$_v"
 }
 
+# cfg_get <option> -> the value of tunnelgate.main.<option>, or nothing.
+#
+# This lives here because --status needs it and the file had no top-level copy: every other
+# cfg_get in this script is inside an embedded heredoc (the Rediscovery of the heartbeat and the
+# uninstaller), so it exists on the ROUTER but not in the INSTALLER's own namespace. do_status
+# therefore printed "cfg_get: not found" and then silently treated every option as unset - a
+# status command that reports a healthy default for a setting it could not read.
+#
+# uci(1) when it exists; otherwise the same tiny parser the rest of the agent uses, so this works
+# on a host where the config was written by the sed fallback.
+cfg_get() {
+    _tg_value=""
+    [ -f "$CONFIG" ] || {
+        printf '%s' ""
+        return 0
+    }
+    if command -v uci >/dev/null 2>&1; then
+        _tg_value=$(uci -q get "tunnelgate.main.$1" 2>/dev/null)
+    else
+        _tg_value=$(sed -n "s/^[[:space:]]*option[[:space:]]*$1[[:space:]]*'\(.*\)'[[:space:]]*$/\1/p" \
+            "$CONFIG" 2>/dev/null | head -n 1)
+    fi
+    printf '%s' "$_tg_value"
+}
+
+# tls_capability_reason: a short, honest phrase for the log and the refusal text.
+#
+# Deliberately does NOT say "OpenWrt 21.02 or newer always verifies": only the 19.07 generation
+# was measured to accept a self-signed certificate, only the wolfssl libustream variant was
+# tested, and early 21.02 point releases had verification problems of their own. The gate is
+# "this generation cannot verify (measured)"; the absence of evidence is not proof of safety for
+# every newer release, and the wording says which it is.
+tls_capability_reason() {
+    if [ "${TLS_UNPARSED_RELEASE:-0}" = "1" ]; then
+        printf 'this router reports an OpenWrt release we could not parse, so it is treated as one that cannot verify'
+        return 0
+    fi
+    _r=$(detect_openwrt_version)
+    printf 'OpenWrt %s is a 19.07-generation release, and such a fetcher was measured to accept a self-signed certificate' "${_r:-?}"
+}
+
 # --------------------------------------------------------------------------------------
 # HTTP
 # --------------------------------------------------------------------------------------
-# http_post <url> <header-name> <token> <body-file> <output-file> [timeout-seconds]
+# http_post <url> <unused-header-name> <token> <body-file> <output-file> [timeout-seconds]
+#
+# The header name and the token arguments stay in the signature because the exchange calls them
+# positionally, but no request uses them any more: both fetchers send the credential in the JSON
+# body only, so it never reaches argv (see the curl branch).
 # Prints the HTTP status code; empty when the request never completed.
 #
 # Two fetchers, and they are NOT interchangeable:
@@ -1459,11 +1753,15 @@ http_post() {
         fi
         # -q first: never read ~/.curlrc. 000 is what -w prints when the request never
         # completed (DNS, TLS, refused) - not an HTTP status, so report "no status".
-        _tg_errf="$_tg_out.err.$$"
+        _tg_errf="$_tg_out.err"
+        # NO credential on the command line. -H "X-Bootstrap-Token: ..." and -u "TOKEN:" both put
+        # the token in /proc/PID/cmdline, where every local user can read it for as long as the
+        # request runs - and the heartbeat does that every 60 s. The JSON body carries it
+        # already, and that is the only channel a pre-24.10 uclient-fetch has anyway. Measured
+        # against the disposable panel: a body-only POST authenticates the exchange AND the
+        # heartbeat, so the header and the basic-auth argument are dropped, not replaced.
         _tg_code=$(curl -q -sS ${_tg_k:+"$_tg_k"} -o "$_tg_out" -w '%{http_code}' --max-time "$_tg_timeout" -X POST \
             -H "Content-Type: application/json" \
-            -H "$_tg_hname: $_tg_token" \
-            -u "$_tg_token:" \
             --data-binary "@$_tg_body" \
             "$_tg_url" 2>"$_tg_errf")
         tail -n 1 "$_tg_errf" 2>/dev/null | tr -d '\r' >"$HTTP_ERR_FILE" 2>/dev/null
@@ -1480,7 +1778,7 @@ http_post() {
         # No -q: the status only exists in the progress output. No --header, no -S (see above).
         # GNU wget (a development host) and uclient-fetch word the same fact differently, so
         # all three spellings are parsed.
-        _tg_err="$_tg_out.err.$$"
+        _tg_err="$_tg_out.err"
         _tg_ncc=""
         if [ "$TLS_VERIFY" = "0" ]; then
             _tg_ncc="--no-check-certificate"
@@ -1523,7 +1821,12 @@ api_error_message() {
 # --------------------------------------------------------------------------------------
 # exchange
 # --------------------------------------------------------------------------------------
+# build_report [token]: the JSON body of the exchange request. The token is a PARAMETER so the
+# dry-run path can build a preview with "***" in it without ever putting the real credential in a
+# variable that the report then reads. The old save/restore form also tripped the test that greps
+# the shipped file for a literal token assignment - a guard worth keeping honest, not relaxing.
 build_report() {
+    _token=${1-$TG_BOOTSTRAP_TOKEN}
     _hostname=$(detect_hostname)
     _model=$(detect_model)
     _version=$(detect_openwrt_version)
@@ -1538,23 +1841,50 @@ build_report() {
         printf ',"uptime_seconds":%s' "$_uptime"
         printf ',"client_version":%s' "$(json_quote "$CLIENT_VERSION")"
         # The credential in the body: the only channel a pre-24.10 uclient-fetch can offer.
-        printf ',"bootstrap_token":%s' "$(json_quote "$TG_BOOTSTRAP_TOKEN")"
+        printf ',"bootstrap_token":%s' "$(json_quote "$_token")"
         printf '}\n'
     } >"$BODY_FILE" || err "cannot write $BODY_FILE"
 }
 
 do_exchange() {
-    build_report
     _url="${TG_PANEL_URL%/}$EXCHANGE_PATH"
     log "exchanging bootstrap token with $_url"
 
     if [ "$DRY_RUN" = "1" ]; then
+        # The real token is never placed in the report on this path: the marker is passed in as
+        # an argument, so no file ever holds the credential. A sed-based redaction of a written
+        # file was wrong twice over: the file existed with the secret in it, and / is legal in
+        # the base64 alphabet, so "s/$TOKEN/***/g" died with "unknown option to s" and printed
+        # nothing instead of a redacted preview.
+        make_tmp_dir
+        build_report "***"
         log "dry-run: would POST this report to $_url:"
-        # The report carries the token now, and dry-run output goes to a terminal and to
-        # whatever captures it - print the shape, never the credential.
-        sed "s/$TG_BOOTSTRAP_TOKEN/***/g" "$BODY_FILE"
+        cat "$BODY_FILE"
         return 0
     fi
+
+    # Item of the audit this defends, and what it is worth: on a 19.07-generation router the
+    # fetcher accepts a self-signed certificate (measured), so a warning in a log nobody re-reads
+    # is not consent. The host key fingerprint arrives in the SAME response that carries the
+    # private key, so a MITM can substitute the key, the fingerprint AND the pin together -
+    # pin_host_key cannot save this, its input is already attacker-controlled.
+    #
+    # Refuse BEFORE the POST, when the admin has NOT already accepted the risk in the panel
+    # setting. tls_verify=0 is the consent path: the acknowledgement lives in a panel setting
+    # with an audit entry, instead of an environment variable on the router (no TG_FORCE bypass
+    # here on purpose - TG_FORCE means "skip the OpenWrt check", and mixing two very different
+    # risks into one switch is how they both get used by accident).
+    #
+    # Honest about what the refusal buys: the bootstrap token has already crossed this wire in
+    # the download command itself. What it protects is the private key and the api_token handoff.
+    if [ "$TLS_UNVERIFIABLE" = "1" ] && [ "$TLS_VERIFY" = "1" ]; then
+        err "this router's TLS stack cannot check a certificate ($(tls_capability_reason)), so the panel cannot be authenticated over it. Continuing would send the bootstrap token and the private key across a channel anyone on the path can impersonate (the host key fingerprint arrives in that same response, so it cannot be checked either).
+Two ways forward: upgrade the router to OpenWrt 21.02 or newer (where a certificate chain is verified), or - if the panel really does use a self-signed certificate - open Settings > Agent endpoint in the panel and turn the certificate check off for this panel. That is an explicit, audited acknowledgement that the panel cannot be verified from this router.
+Nothing has been sent: the bootstrap token already crossed the wire in the download command you pasted, but no private key or API token has."
+    fi
+
+    make_tmp_dir
+    build_report
 
     [ "$FETCHER" != "none" ] ||
         err "neither curl nor wget is installed on this router, so the panel cannot be reached; install one of them and re-run"
@@ -1653,23 +1983,55 @@ pin_host_key() {
     probe_openssh ssh-keygen ||
         err "ssh-keygen cannot read an OpenSSH private key (it is the dropbear build, or missing): install openssh-keygen and re-run"
 
-    _scanned=/tmp/tunnelgate-keyscan.$$
+    make_tmp_dir
+    _scanned="$TMP_DIR/keyscan"
     _pool=""
+    _reachable=0
     for _t in ed25519 rsa ecdsa; do
         if ssh-keyscan -T 10 -p "$_port" -t "$_t" "$_host" >"$_scanned" 2>/dev/null &&
-            [ -s "$_scanned" ] &&
-            ssh-keygen -lf "$_scanned" 2>/dev/null | grep -qF "$_want"; then
-            # ssh-keyscan prefixes each block with a "# host:port SSH-2.0-..." comment.
-            # It carries no key, would never be matched by the host pattern below and
-            # would therefore accumulate one copy per run - drop it here.
-            _pool=$(grep -v '^#' "$_scanned")
-            break
+            [ -s "$_scanned" ]; then
+            # The host answered at least once, so an empty _pool at the end means a real key
+            # mismatch rather than an unreachable host. That distinction saves an operator an
+            # hour of hunting a MITM that is actually a firewall.
+            _reachable=1
+            # Pin the ONE key we were told about, not every key of that type the host publishes.
+            # A host with two ed25519 keys would otherwise get both pinned, and the second would
+            # keep being accepted even after the first was revoked.
+            #
+            # Each candidate line is fingerprinted IN ISOLATION (ssh-keygen -lf - reads a single
+            # key from stdin) instead of fingerprinting the whole file and hoping the output order
+            # matches the line order, which it only does for a well-formed file. The comparison is
+            # on the whole fingerprint FIELD: a substring match (grep -F on the full output) would
+            # accept a fingerprint that merely contains the wanted one.
+            #
+            # ssh-keyscan prefixes each block with a "# host:port SSH-2.0-..." comment: it carries
+            # no key and would accumulate one copy per run, so it is skipped here and never pinned.
+            _pool=$(
+                while IFS= read -r _cand; do
+                    case "$_cand" in
+                    "" | "#"*) continue ;;
+                    esac
+                    _cfp=$(printf '%s\n' "$_cand" | ssh-keygen -lf - 2>/dev/null | awk 'NR == 1 { print $2 }')
+                    if [ "$_cfp" = "$_want" ]; then
+                        printf '%s\n' "$_cand"
+                    fi
+                done <"$_scanned"
+            )
+            if [ -n "$_pool" ]; then
+                break
+            fi
         fi
     done
     rm -f "$_scanned"
 
     if [ -z "$_pool" ]; then
-        err "HOST KEY MISMATCH for $_host:$_port: no key from ssh-keyscan matches $_want. Refusing to continue (possible MITM, or a stale ssh host key fingerprint on the panel)"
+        # Two very different situations that used to print the same sentence. A firewall gives
+        # exactly the same empty answer as a MITM, and an operator sent hunting a MITM that is a
+        # blocked port wastes an hour.
+        if [ "$_reachable" = "1" ]; then
+            err "HOST KEY MISMATCH for $_host:$_port: the host answered, but no key it offered has fingerprint $_want. Refusing to continue (possible MITM, or a stale ssh host key fingerprint on the panel - re-scan it in the panel and retry)"
+        fi
+        err "could not fetch the host keys of $_host:$_port: ssh-keyscan got no answer at all. This is a firewall, a wrong ssh port or a DNS problem on the router, NOT a key mismatch. Fix the path to the panel's ssh port and re-run"
     fi
 
     _kh_dir=$(dirname "$KNOWN_HOSTS")
@@ -1699,30 +2061,75 @@ console_is_enabled() {
     esac
 }
 
+# The console account actually in use, and the authorized_keys file that account's dropbear
+# really reads. Both are decided HERE and written to UCI by write_config, so the panel and the
+# router can never disagree about which account to log in as.
+#
+# Why this exists: a non-root account created with 'adduser -D -H' has no home directory, and
+# /etc/dropbear/authorized_keys belongs to root - dropbear only consults it for root. Writing the
+# console key there while UCI names a non-root user produced a console that never opened, with
+# nothing in any log explaining it.
+CONSOLE_USER_EFFECTIVE=root
+CONSOLE_KEYS_EFFECTIVE=""
+# 1 when this run created the account, 0 when it already existed. Written to UCI and used by BOTH
+# uninstallers: deleting an account the installer did not create would destroy somebody's login,
+# and leaving a created one behind after --purge leaves a password-less shell account forever.
+CONSOLE_USER_CREATED=0
+
 ensure_console_user() {
     _user=$(get console.ssh_user)
     _shell=$(get console.shell)
     [ -n "$_shell" ] || _shell=/bin/ash
     [ -n "$_user" ] || _user=root
 
+    CONSOLE_USER_EFFECTIVE=$_user
+    CONSOLE_KEYS_EFFECTIVE=$(get console.authorized_keys_path)
+    [ -n "$CONSOLE_KEYS_EFFECTIVE" ] || CONSOLE_KEYS_EFFECTIVE=/etc/dropbear/authorized_keys
+
     if [ "$_user" = "root" ]; then
         log "console user: root (see docs/SECURITY.md for the trade-off and the UCI switch)"
         return 0
     fi
-    if id -u "$_user" >/dev/null 2>&1; then
+
+    if ! id -u "$_user" >/dev/null 2>&1; then
+        # A dedicated, password-less, shell-only account. Deliberately NOT added to any group:
+        # granting uci/ubus rights needs a sudo/polkit policy that differs per firmware, and a
+        # half-applied group membership is worse than the documented root fallback. A HOME is
+        # required now (-H drops it) because the per-user authorized_keys lives in it.
+        if run_cmd adduser -D -s "$_shell" -G nogroup "$_user" 2>/dev/null ||
+            run_cmd adduser -D -s "$_shell" "$_user" 2>/dev/null; then
+            CONSOLE_USER_CREATED=1
+            log "console user $_user created with shell $_shell"
+        else
+            # NEVER leave the config naming an account that does not exist: the panel would keep
+            # trying a login that cannot succeed and the operator would see a console that never
+            # opens, with no error anywhere. Fall back to root in the config, loudly.
+            CONSOLE_USER_EFFECTIVE=root
+            CONSOLE_KEYS_EFFECTIVE=$(get console.authorized_keys_path)
+            [ -n "$CONSOLE_KEYS_EFFECTIVE" ] || CONSOLE_KEYS_EFFECTIVE=/etc/dropbear/authorized_keys
+            log "WARNING: could not create console user $_user on this firmware. The console will connect as root, and 'console_user' in $CONFIG is set to root so the panel asks for an account that exists. Create the account by hand and re-run the installer to use it"
+            return 0
+        fi
+    else
         log "console user $_user already exists"
-        return 0
     fi
 
-    # A dedicated, password-less, shell-only account. Deliberately NOT added to any group:
-    # granting uci/ubus rights needs a sudo/polkit policy that differs per firmware, and a
-    # half-applied group membership is worse than the documented root fallback.
-    if run_cmd adduser -D -H -s "$_shell" -G nogroup "$_user" 2>/dev/null ||
-        run_cmd adduser -D -s "$_shell" "$_user" 2>/dev/null; then
-        log "console user $_user created with shell $_shell"
+    # dropbear reads /etc/dropbear/authorized_keys for root only; any other account needs its own
+    # ~/.ssh/authorized_keys. Point UCI (and the heartbeat) at the file this account reads.
+    _home=$(awk -F: -v u="$_user" '$1 == u { print $6 }' "$PASSWD_FILE" 2>/dev/null | head -n 1)
+    case "$_home" in
+    "" | /)
+        # No usable home: the per-user key cannot be placed, so refuse the non-root console
+        # instead of installing a key nobody will ever be asked for.
+        CONSOLE_USER_EFFECTIVE=root
+        CONSOLE_KEYS_EFFECTIVE=$(get console.authorized_keys_path)
+        [ -n "$CONSOLE_KEYS_EFFECTIVE" ] || CONSOLE_KEYS_EFFECTIVE=/etc/dropbear/authorized_keys
+        log "WARNING: console user $_user has no home directory, and dropbear only reads /etc/dropbear/authorized_keys for root. Falling back to a root console, and 'console_user' in $CONFIG is set to root"
         return 0
-    fi
-    log "warning: could not create console user $_user; the console will connect as root"
+        ;;
+    esac
+    CONSOLE_KEYS_EFFECTIVE="$_home/.ssh/authorized_keys"
+    log "console user: $_user, key file $CONSOLE_KEYS_EFFECTIVE (dropbear reads the root file only for root)"
 }
 
 prepare_console() {
@@ -1731,7 +2138,9 @@ prepare_console() {
         return 0
     }
 
-    _keys_path=$(get console.authorized_keys_path)
+    # The EFFECTIVE path, chosen by ensure_console_user: for a non-root console account that is
+    # that account's own ~/.ssh/authorized_keys, because dropbear only reads the root file as root.
+    _keys_path=$CONSOLE_KEYS_EFFECTIVE
     [ -n "$_keys_path" ] || _keys_path=/etc/dropbear/authorized_keys
     _dir=$(dirname "$_keys_path")
 
@@ -1785,9 +2194,12 @@ write_config() {
     _console_port=$(get console.console_port)
     _console_target=$(get console.target_port)
     [ -n "$_console_target" ] || _console_target=22
-    _console_keys=$(get console.authorized_keys_path)
+    _console_keys=$CONSOLE_KEYS_EFFECTIVE
     [ -n "$_console_keys" ] || _console_keys=/etc/dropbear/authorized_keys
-    _console_user=$(get console.ssh_user)
+    # The EFFECTIVE account, not the requested one: ensure_console_user falls back to root when
+    # the requested account cannot be created or has no home for a per-user key. Writing the
+    # requested name here regardless was the bug that produced a console nobody could open.
+    _console_user=$CONSOLE_USER_EFFECTIVE
     [ -n "$_console_user" ] || _console_user=root
     # Persisted so the heartbeat keeps the same policy once this installer exits, and so the
     # operator can flip it later with 'uci set tunnelgate.main.tls_verify=0' + a restart.
@@ -1823,6 +2235,7 @@ config tunnelgate 'main'
 	option console_target_port '$(uci_quote_raw "$_console_target")'
 	option console_user '$(uci_quote_raw "$_console_user")'
 	option console_authorized_keys_path '$(uci_quote_raw "$_console_keys")'
+	option console_user_created '$CONSOLE_USER_CREATED'
 	option console_serial '0'
 	option tls_verify '$_tls_verify'
 EOF_UCI
@@ -1836,7 +2249,7 @@ write_init_script() {
         return 0
     fi
     mkdir -p "$(dirname "$INITD")" || err "cannot create $(dirname "$INITD")"
-    cat >"$INITD" <<'TG_EOF_INIT'
+    cat >"$INITD" <<'TG_EOF_INIT' || err "cannot write $INITD (out of space?)"
 #!/bin/sh /etc/rc.common
 # shellcheck shell=sh disable=SC2034,SC1091,SC2317
 # TunnelGate agent - procd service (installed as /etc/init.d/tunnelgate).
@@ -1981,6 +2394,21 @@ do_status() {
         0) printf '  %-15s %s\n' 'tls policy' 'OFF - the panel certificate is NOT verified' ;;
         *) printf '  %-15s %s\n' 'tls policy' 'verify (default)' ;;
         esac
+        # The policy is one thing, whether this router CAN honour it is another, and only saying
+        # "verify" while the fetcher accepts any certificate would be a lie in the one command an
+        # operator runs to find out what is going on.
+        detect_fetcher
+        case "$(cfg_get panel_url)" in
+        https://*)
+            if tls_stack_cannot_verify; then
+                printf '  %-15s %s\n' 'tls capability' \
+                    "CANNOT verify on this release - tls_verify=1 is not being enforced here"
+            else
+                printf '  %-15s %s\n' 'tls capability' 'checks the certificate chain'
+            fi
+            ;;
+        *) printf '  %-15s %s\n' 'tls capability' 'plain http - there is no certificate at all' ;;
+        esac
     else
         printf 'config          : missing (not installed)\n'
     fi
@@ -2019,14 +2447,25 @@ do_uninstall() {
 
     if [ "$PURGE" = "1" ]; then
         _console_user=""
+        _console_created=0
         if [ -f "$CONFIG" ] && command -v uci >/dev/null 2>&1; then
             _console_user=$(uci -q get tunnelgate.main.console_user 2>/dev/null)
+            _console_created=$(uci -q get tunnelgate.main.console_user_created 2>/dev/null)
+        fi
+        # Only an account this installer created is removed. A pre-existing account somebody else
+        # made would be somebody's login, and --purge must not delete it.
+        if [ "$_console_created" != "1" ] && [ -n "$_console_user" ]; then
+            log "keeping console user $_console_user: the installer did not create it"
+            _console_user=""
         fi
         case "$_console_user" in
         "" | root) ;;
         *)
-            log "removing console user $_console_user"
-            deluser "$_console_user" >/dev/null 2>&1
+            if id -u "$_console_user" >/dev/null 2>&1; then
+                log "removing console user $_console_user"
+                deluser "$_console_user" >/dev/null 2>&1 ||
+                    log "warning: could not remove console user $_console_user"
+            fi
             ;;
         esac
     fi
@@ -2037,9 +2476,22 @@ do_uninstall() {
     rm -f /tmp/tunnelgate-exchange.* /tmp/tunnelgate-report.* /tmp/tunnelgate-heartbeat-* 2>/dev/null
 
     if [ "$PURGE" = "1" ]; then
+        # The SAME three packages agent/uninstall.sh removes, and for the same reason: the
+        # installer adds openssh-client, openssh-keygen and openssh-client-utils, and leaving the
+        # last one behind on 24.10 keeps an ssh-keygen that shadows dropbear's.
         case "$(detect_pkg_manager)" in
-        apk) apk del openssh-client >/dev/null 2>&1 || log "warning: could not remove openssh-client" ;;
-        opkg) opkg remove openssh-client >/dev/null 2>&1 || log "warning: could not remove openssh-client" ;;
+        apk)
+            for _pkg in $OPENSSH_PKGS; do
+                log "removing $_pkg via apk"
+                apk del "$_pkg" >/dev/null 2>&1 || log "warning: apk could not remove $_pkg"
+            done
+            ;;
+        opkg)
+            for _pkg in $OPENSSH_PKGS; do
+                log "removing $_pkg via opkg"
+                opkg remove "$_pkg" >/dev/null 2>&1 || log "warning: opkg could not remove $_pkg"
+            done
+            ;;
         esac
     fi
 
@@ -2092,9 +2544,20 @@ main() {
         # After the OpenSSH work and before the exchange: on 19.07 the exchange itself is the
         # first https request this router makes, and it fails with a message about uclient-fetch.
         ensure_tls_lib
-        # Say this out loud, once, when the setting cannot deliver what its name promises.
-        if [ "$TLS_VERIFY" = "1" ] && tls_stack_cannot_verify; then
-            log "WARNING: on OpenWrt $(detect_openwrt_version) the fetcher cannot check a certificate chain: it accepts self-signed certificates (a wrong hostname is still caught). tls_verify=1 is recorded, but it is not being enforced. 21.02 or newer is required for real verification"
+        # Decide ONCE whether this router could actually verify a certificate chain. Only https
+        # presents a certificate at all, so http never counts as "unverifiable".
+        TLS_UNVERIFIABLE=0
+        case "$TG_PANEL_URL" in
+        https://*)
+            if tls_stack_cannot_verify; then
+                TLS_UNVERIFIABLE=1
+            fi
+            ;;
+        esac
+        if [ "$TLS_UNVERIFIABLE" = "1" ] && [ "$TLS_VERIFY" = "0" ]; then
+            # The consent path: the admin already turned verification off in the panel, so the
+            # acknowledgement exists where an audit log can see it. Warn once, then go on.
+            log "WARNING: this router's TLS stack cannot check a certificate chain ($(tls_capability_reason)), and tls_verify=0, so the panel is unauthenticated. The panel setting is the recorded acknowledgement; anyone who can answer for that host receives the bootstrap token and the API token"
         fi
     fi
 

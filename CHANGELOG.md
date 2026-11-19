@@ -52,6 +52,18 @@ generation rather than reasoned about, and both changed the design.
   **`CONTRIBUTING.md`**.
 - The router agent installs the OpenSSH client itself when the router has only dropbear, including
   on images that use `apk`.
+- **The installer refuses to hand a private key over an unverifiable channel.** On a 19.07-generation
+  image the fetcher accepts a self-signed certificate (measured), so a warning in `logread` is not
+  consent - and the host key fingerprint arrives in the *same response* as the private key, so a
+  machine on the path can substitute the key, the fingerprint and the pin together;
+  `pin_host_key` cannot detect that, because its input is attacker-controlled from the start. When
+  the panel URL is https and `tls_verify=1`, the install now stops **before the POST**. The two
+  ways forward are an upgrade to 21.02 or newer, or turning the check off in the panel - which puts
+  the acknowledgement in an audited setting rather than an environment variable. There is
+  deliberately no `TG_FORCE` bypass: mixing "not OpenWrt" and "I accept an unauthenticated panel"
+  into one switch is how both get used by accident. The same capability warning now also appears in
+  the heartbeat (once per boot, on `tmpfs`, so it cannot accumulate) and in `--status`, so an
+  operator who never re-reads the install log still sees it.
 
 ### Fixed
 
@@ -82,6 +94,57 @@ generation rather than reasoned about, and both changed the design.
 - `doctor` no longer reports a warning as a failure when it cannot open nginx's pid file as an
   unprivileged user.
 
+### Security
+
+The router agent writes credentials to disk and runs as root on every boot, so its temporary
+files and command lines were audited the way the panel's were. Every item below was reproduced
+before it was fixed, and has a regression test that fails on the old code.
+
+- **`write_heartbeat_bin` was never closed.** The heredoc that embeds the heartbeat ended without
+  a closing brace, so `write_uninstall_bin` was defined *inside* it: a `--dry-run` printed
+  `write_uninstall_bin: not found` and then carried on, because the script does not set `-e`. A
+  nested function is invisible until the outer one runs, which is why no test noticed.
+- **Credentials in world-readable `/tmp`.** The exchange body, the heartbeat body and the
+  fetchers' error files were fixed, pid-derived names (`/tmp/tunnelgate-report.$$`), created 0644
+  and containing the bootstrap token and the API token. A local user could pre-create the name as
+  a symlink and have root write through it. Each of the three processes (installer, heartbeat,
+  reconnect loop) now creates a private `mktemp -d` directory under `umask 077` with mode 0700,
+  lazily on first use, and removes it on `EXIT` and on `INT`/`TERM` - a trap handler that only
+  cleans up *returns* to the interrupted code, so the signal handler exits explicitly.
+- **The token was on every command line.** The exchange and the heartbeat passed the credential
+  as `-H "X-Api-Token: ..."` and as basic auth, which puts it in `/proc/PID/cmdline` for anyone
+  to read - every 60 seconds, forever. Both are gone; the JSON body carries the token and the
+  panel accepts it there, which is also the only channel a pre-24.10 `uclient-fetch` has.
+- **`--dry-run` wrote the real token to disk** before checking that it was a dry run, then tried
+  to redact it with `sed "s/$TOKEN/***/g"` - which dies with `unknown option to 's'` whenever the
+  base64 token contains a `/`, so the preview vanished and the file stayed. The report is now
+  built with the marker already in place; the token is never written on that path at all.
+- **`pin_host_key` pinned every key of the matching type.** If the panel host published two
+  ed25519 keys, both were pinned, and the second kept being accepted after the first was revoked.
+  Each candidate is now fingerprinted in isolation and only the one the panel named is pinned.
+  "The host answered with different keys" and "`ssh-keyscan` got no answer" are also now
+  different errors: the second is a firewall, not a MITM.
+- **A console account that cannot log in, silently.** `adduser -D -H` creates a non-root account
+  with no home, and the console key was then written to root's `/etc/dropbear/authorized_keys`,
+  which dropbear does not read for non-root users. When `adduser` failed the log said "the console
+  will connect as root" while the config still named the missing user. The installer now decides
+  the effective account and key path once, writes both to UCI so panel and router cannot disagree,
+  puts a non-root key in `$HOME/.ssh/authorized_keys`, records `console_user_created` so
+  `--purge` deletes only an account it created, and falls back to root *in the config* when the
+  account cannot be created.
+- **`cfg_set`'s fallback injected into a `sed` replacement.** A value containing `&` (any URL
+  with a query string), `|` or a backslash corrupted the config - on the one path that exists for
+  hosts where nothing else works. Replaced with an `awk` rewrite that takes the value as data.
+- **The TLS capability gate failed open.** `[0-9]*` matches `19x`, then the numeric comparison
+  returned 2, which read as "safe". A release string that is not all digits now counts as
+  unverifiable, which is the conservative direction.
+- **`--status` on the installer itself was broken.** `cfg_get` existed only inside the embedded
+  heredocs, so `--status` printed `cfg_get: not found` and then reported every option at its
+  default - a https panel shown as plain http.
+- Heredoc writes now fail loudly (`|| err cannot write ...`) instead of silently producing a
+  truncated agent on a full filesystem, and the dead `tunnel_pid` option (written by nobody,
+  read by two scripts) is gone.
+
 ### Documentation
 
 - docs/INSTALL_ROUTER.md gains the sentinel check, the three-package OpenSSH table, the 19.07
@@ -93,9 +156,10 @@ generation rather than reasoned about, and both changed the design.
 
 ### Testing
 
-837 tests. `ruff check` and `ruff format --check` clean, shellcheck plus `busybox sh -n` on the
+879 tests. `ruff check` and `ruff format --check` clean, shellcheck plus `busybox sh -n` on the
 installer, uninstaller, heartbeat and both server scripts, and the five embedded heredocs asserted
-byte-identical to their standalone sources.
+byte-identical to their standalone sources. Every security fix above has a test that was shown to
+fail on the old code before the fix was accepted.
 
 The whole path was exercised against real stock images of **19.07.10, 22.03.7, 23.05.5 and
 24.10.1** in containers, against a disposable panel with a real sshd — including a bare 23.05.5
@@ -108,9 +172,16 @@ endpoint API's normalisation matrix was verified against the live panel.
 - On **19.07** with `libustream`, `uclient-fetch` accepts a self-signed certificate outright, so
   `tls_verify=1` there records a promise the fetcher cannot keep (a hostname mismatch is still
   caught). The installer detects this and says so; 21.02 is the floor for real chain verification.
-- The token is visible on the router: as an argument in the shell history and in `ps` while the
-  command runs. It is single-use and expires in 15 minutes, and the alternative channel
-  (`--header`) does not exist on the fetchers these devices have.
+- The token is visible on the router: as an argument in the shell history of the shell that ran
+  the install command, and in `ps` for the few milliseconds that command runs. It is single-use
+  and expires in 15 minutes. The agent itself never puts a credential on a command line; only the
+  one-liner the operator pastes does.
+- `apk` package resolution (the SNAPSHOT/SDK images) is verified with `apk add --simulate`, not
+  with a full install; the `opkg` path is exercised end to end on 19.07.10, 22.03.7, 23.05.5 and
+  24.10.1.
+- A non-root console account is created, pointed at its own key file and recorded for `--purge`,
+  but no test creates a real Unix account: the tests stub `id`/`adduser` and assert the
+  decision. The account creation and dropbear's read of that file are the operator's step.
 
 ## [1.1.0] - 2026-11-18
 

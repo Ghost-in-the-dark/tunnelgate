@@ -83,6 +83,10 @@ in a temp tree during tests:
 | `TG_FORCE` | `0` (set `1` to skip the OpenWrt check) |
 | `TG_TLS_VERIFY` | injected by the panel; falls back to `uci get tunnelgate.main.tls_verify` |
 | `TG_TLS_WARN_FILE` | `/tmp/.tunnelgate-tls-warning` (once-per-boot warning sentinel) |
+| `TG_TLS_CAP_WARN_FILE` | `/tmp/.tunnelgate-tls-capability-warning` (same, for "cannot verify") |
+| `TG_TLS_LIB_DIRS` | `/lib /usr/lib` (where libustream is looked for) |
+| `TG_OPENWRT_RELEASE` | `/etc/openwrt_release` (read by the version checks) |
+| `TG_PASSWD` | `/etc/passwd` (the console-user lookup) |
 
 ## The fetcher, and where the token travels
 
@@ -99,9 +103,18 @@ answer. The two are not interchangeable, and the reason is measured, not stylist
 * **URL userinfo is out.** GNU wget 1.25 rejects a userinfo URL outright (exit 6).
 
 So the token has one reliable channel on every generation: **the JSON request body**
-(`bootstrap_token` for the exchange, `api_token` for the heartbeat). The curl path *also*
-sends the legacy `X-Bootstrap-Token`/`X-Api-Token` header and `-u "$TOKEN:"`, because curl can
-and it costs nothing.
+(`bootstrap_token` for the exchange, `api_token` for the heartbeat). That is the only channel
+used - the legacy `X-Bootstrap-Token`/`X-Api-Token` header and `-u "$TOKEN:"` were removed
+from the curl path even though curl could send them:
+
+* every argument of a running process is world-readable in `/proc/<pid>/cmdline`, so a header
+  or a `-u` value is a credential on display for the whole life of the request - and the
+  heartbeat survives long enough to matter, since procd restarts it every 60 seconds;
+* the body channel is already required and already authenticated by the panel
+  (`app/api/heartbeat.py` accepts the token there), so the extra channel bought nothing.
+
+The rule that follows: **no credential ever appears in an argument list**; it goes into a file
+with mode 0600 inside the private temporary directory, and `--data-binary @file` carries it.
 
 The status is derived per fetcher: curl keeps `-w '%{http_code}'` (`000` means the request
 never completed - DNS, TLS, refused - not an HTTP status); the wget path runs **without `-q`**
@@ -140,6 +153,8 @@ script disables certificate checking, and `http_post`/`post()` are the only call
 
 When verification is off the installer logs one warning naming the host and the fix, and the
 heartbeat warns **once per boot** (sentinel file `TG_TLS_WARN_FILE`) rather than every minute.
+"Once per boot" is literal on OpenWrt: procd mounts `/tmp` as a fresh `tmpfs` (`mode=01777`) in
+early init (`/sbin/init`), so the marker is gone after a reboot and there is no accumulation.
 
 ### Where "verified" is not true: OpenWrt 19.07
 
@@ -149,12 +164,30 @@ reported the panel's `401`, where 21.02.7, 22.03.7, 23.05.5 and 24.10.1 all stop
 `Connection error: Invalid SSL certificate`. A **hostname mismatch is still caught**
 (`Server hostname does not match SSL certificate`), so the gap is specifically the chain check.
 
-So `tls_verify=1` on that generation records a promise the fetcher cannot keep. `install.sh`
-detects it (`tls_stack_cannot_verify`: fetcher is wget and `DISTRIB_RELEASE` major < 21) and logs
-a second, different warning that says so in as many words. It is not a reason to refuse the
-install - people run 19.07 - but it is a reason never to describe such a connection as
-authenticated. 21.02 is the floor for real verification, which is why the docs state it as a
-requirement.
+So `tls_verify=1` on that generation records a promise the fetcher cannot keep.
+`tls_stack_cannot_verify` detects it (fetcher is wget and `DISTRIB_RELEASE` major < 21, or the
+release could not be parsed at all - `[0-9]*` also matches `19x`, the numeric comparison then
+returns 2, and inside an `if` that reads as "safe", so an unparsable version is treated as
+unverified and never as modern).
+
+The detection has two consequences, and the difference between them is the point:
+
+* `tls_verify=1` (the default) - `do_exchange` **refuses before the POST**. A warning in a log
+  is not consent, and it could not help anyway: the host key fingerprint arrives in the same
+  response as the private key, so a machine on the path substitutes the key, the fingerprint and
+  the pinned entry together and `pin_host_key` sees a perfect match. The refusal names both ways
+  out (OpenWrt 21.02+, or turn the check off in the panel) and states what it did and did not
+  protect: the bootstrap token already crossed the wire in the download command, the private key
+  and the API token have not.
+* `tls_verify=0` - the acknowledgement already exists as a panel setting with an audit trail,
+  so the installer proceeds with one warning, and `lib/heartbeat.sh` repeats a *different*
+  warning once per boot (its own sentinel, `TG_TLS_CAP_WARN_FILE`, so it cannot be suppressed by
+  the `tls_verify=0` one). The heartbeat deliberately does not refuse: a router installed before
+  this check must not silently lose its liveness signal.
+
+There is no environment override for the refusal. `TG_FORCE` means "not OpenWrt, do not check" -
+one switch for two unrelated risks is how both get used by accident. 21.02 is the floor for real
+verification, which is why the docs state it as a requirement.
 
 ## Conventions
 

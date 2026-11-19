@@ -146,9 +146,17 @@ delete_console_key() {
 
 delete_console_user() {
     _user=$(cfg_get console_user)
+    # Only an account the INSTALLER created is removed. A pre-existing account is somebody's
+    # login, and --purge must never delete it - it was not ours to remove. The installer records
+    # this in UCI precisely so the two uninstallers can agree without guessing.
+    _created=$(cfg_get console_user_created)
     case "$_user" in
     "" | root) return 0 ;;
     esac
+    if [ "$_created" != "1" ]; then
+        log "keeping console user $_user: the installer did not create it"
+        return 0
+    fi
     id -u "$_user" >/dev/null 2>&1 || return 0
     if [ "$DRY_RUN" = "1" ]; then
         log "dry-run: would remove the console user $_user"

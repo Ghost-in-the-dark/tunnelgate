@@ -339,6 +339,9 @@ class AgentEndpointOut(BaseModel):
     # operator leaves the port box empty.
     port: int | None = None
     source: Literal["environment", "database"]
+    # True = the router verifies the panel certificate. False = it was told to accept a
+    # self-signed one. Always True on an http endpoint (there is nothing to verify).
+    verify_tls: bool = True
 
 
 class AgentEndpointIn(BaseModel):
@@ -348,6 +351,7 @@ class AgentEndpointIn(BaseModel):
     scheme: str
     host: str
     port: int | None = None
+    verify_tls: bool = True
 
 
 class AgentEndpointOutEnvelope(BaseModel):
@@ -363,6 +367,8 @@ class AgentEndpointTestIn(BaseModel):
     scheme: str
     host: str
     port: int | None = None
+    # The probe must test the policy the operator is about to save, not the default.
+    verify_tls: bool = True
 
 
 class AgentEndpointTestOut(BaseModel):

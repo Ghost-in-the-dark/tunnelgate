@@ -89,7 +89,7 @@ async def save_agent_endpoint(
 ) -> AgentEndpointOutEnvelope:
     """Store an override. From the next install script or heartbeat on, routers use it."""
     endpoint, problems = agent_endpoint.save(
-        db, payload.scheme, payload.host, payload.port, user=admin
+        db, payload.scheme, payload.host, payload.port, verify_tls=payload.verify_tls, user=admin
     )
     if endpoint is None:
         raise ApiError(
@@ -104,7 +104,9 @@ async def save_agent_endpoint(
         actor=admin,
         ip=client_ip(request),
         user_agent=request.headers.get("user-agent"),
-        detail={"agent_url": endpoint.url},
+        # verify_tls belongs in the audit row: turning it off means the router can no longer tell
+        # this panel from an impostor, and the bootstrap/API tokens ride on that connection.
+        detail={"agent_url": endpoint.url, "verify_tls": endpoint.verify_tls},
     )
     db.commit()
     return _envelope(endpoint)
@@ -131,7 +133,11 @@ async def reset_agent_endpoint(
         actor=admin,
         ip=client_ip(request),
         user_agent=request.headers.get("user-agent"),
-        detail={"removed": removed, "agent_url": endpoint.url},
+        detail={
+            "removed": removed,
+            "agent_url": endpoint.url,
+            "verify_tls": endpoint.verify_tls,
+        },
     )
     db.commit()
     return _envelope(endpoint)
@@ -153,7 +159,9 @@ async def test_agent_endpoint(
     the panel issue an outbound request to an operator-chosen address, and it is audited for the
     same reason.
     """
-    endpoint, problems = agent_endpoint.normalize(payload.scheme, payload.host, payload.port)
+    endpoint, problems = agent_endpoint.normalize(
+        payload.scheme, payload.host, payload.port, payload.verify_tls
+    )
     if endpoint is None:
         raise ApiError(
             422,
@@ -161,8 +169,11 @@ async def test_agent_endpoint(
             "That endpoint is not usable",
             {"fields": _field_errors(problems)},
         )
-    # The probe is a blocking HTTP call; keep it off the event loop.
-    result = await asyncio.to_thread(agent_endpoint.probe, endpoint.url)
+    # The probe is a blocking HTTP call; keep it off the event loop. It honours verify_tls so a
+    # self-signed panel that the router would accept is not reported unreachable.
+    result = await asyncio.to_thread(
+        agent_endpoint.probe, endpoint.url, verify_tls=endpoint.verify_tls
+    )
     audit_record(
         db,
         "settings.agent_endpoint.test",
@@ -170,7 +181,11 @@ async def test_agent_endpoint(
         outcome="ok" if result["ok"] else "error",
         ip=client_ip(request),
         user_agent=request.headers.get("user-agent"),
-        detail={"checked_url": result["checked_url"], "error": result["error"]},
+        detail={
+            "checked_url": result["checked_url"],
+            "error": result["error"],
+            "verify_tls": endpoint.verify_tls,
+        },
     )
     db.commit()
     return AgentEndpointTestOut(**result)

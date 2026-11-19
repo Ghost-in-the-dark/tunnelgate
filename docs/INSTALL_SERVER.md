@@ -33,8 +33,8 @@ directory, installs the panel and removes that directory afterwards. Using the t
 `main` pins a version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Ghost-in-the-dark/tunnelgate/v1.1.0/scripts/quick-install.sh \
-  | sudo sh -s -- --host gate.example.com --ref v1.1.0
+curl -fsSL https://raw.githubusercontent.com/Ghost-in-the-dark/tunnelgate/v1.2.0/scripts/quick-install.sh \
+  | sudo sh -s -- --host gate.example.com --ref v1.2.0
 ```
 
 Piping a shell script to `sh` is only reasonable when you can read it first, so the script
@@ -552,7 +552,11 @@ TUNNELGATE_CONSOLE_PORT_MAX=30000
 # --- proxy ---
 TUNNELGATE_PROXY_DRIVER=nginx
 TUNNELGATE_PROXY_ROUTES_PATH=/etc/nginx/tunnelgate/routes.conf
-TUNNELGATE_PROXY_RELOAD_COMMAND="nginx -t && nginx -s reload"
+# EMPTY, not "nginx -s reload": the systemd unit runs NoNewPrivileges=yes, so the panel
+# cannot signal the root-owned nginx master. deploy/systemd/tunnelgate-nginx-reload.path
+# does the reload as root when it sees routes.conf change. A command here fails on every
+# route change and /api/v1/stats reports reload_pending forever.
+TUNNELGATE_PROXY_RELOAD_COMMAND=
 
 # --- secrets (generate: openssl rand -base64 48) ---
 TUNNELGATE_SECRET_KEY=CHANGE-ME
@@ -730,6 +734,13 @@ certbot renew --dry-run
 > The wildcard `*.panel.example.com` also matches `console.panel.example.com`, so one
 > certificate covers the panel, the console and every router vhost.
 
+The certificate must also cover the **agent endpoint** - the name routers dial, which is not
+necessarily the one you use in a browser (it may be an internal address, or the panel behind a
+proxy). If it does not, routers reject the connection and the panel looks broken while working
+perfectly from your desk. The fix is to name the endpoint after a certificate you own, not to wave
+the check through; the escape hatch exists for a self-signed panel on a LAN you control and costs
+what `docs/SECURITY.md` §7, "When to turn certificate verification off" describes.
+
 ---
 
 ## 7. Moving the panel, and running behind a proxy
@@ -798,6 +809,14 @@ Then:
 4. Keep the old name alive until the routers have converged, then retire it. A router that
    cannot reach the panel cannot learn the new address either - that is the one real
    out-of-band case, and the answer is to re-run the installer on that device.
+
+The endpoint row also carries `verify_tls`, the policy a router applies to the panel's
+certificate. It moves with the address but **not** through the heartbeat: `desired` carries the
+address only, so turning verification off (or back on) affects install commands and installer
+re-runs, never a device that is already in the field. Set it per router with
+`uci set tunnelgate.main.tls_verify=0` plus `/etc/init.d/tunnelgate restart`, or re-run the
+installer there. See `docs/SECURITY.md`, "When to turn certificate verification off", before
+using it anywhere a router reaches the panel across a network you do not control.
 
 The override lives in the database, not the env file, for that reason: changing it needs no
 systemd restart and no second file to keep in sync. `TUNNELGATE_PANEL_URL` stays the fallback
@@ -1023,7 +1042,7 @@ as written the first time.
 |---|---|---|
 | 1 | Open `https://panel.example.com` | login page; log in as `admin` |
 | 2 | Create a router named "Office AP" | wizard step 2; note the slug it picks |
-| 3 | Advance to the copy-command step | the command contains only `X-Bootstrap-Token` - no key, no port |
+| 3 | Advance to the copy-command step | the block carries the single-use token as its basic-auth username and nothing else - no key, no port |
 | 4 | Run the command on the router (`docs/INSTALL_ROUTER.md`) | the wizard goes Waiting → Connected → Done within a minute |
 | 5 | `ss -ltnH \| grep <port>` on the panel | one listener on `127.0.0.1:<port>`, nothing on `0.0.0.0` |
 | 6 | Click **Open LuCI** | you land in LuCI at `https://office-ap.panel.example.com/` and every page, stylesheet and XHR works (no 404s in the browser console) |
@@ -1052,7 +1071,7 @@ One command, on the panel host:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Ghost-in-the-dark/tunnelgate/main/scripts/update.sh \
-  | sudo sh -s -- --ref v1.1.0
+  | sudo sh -s -- --ref v1.2.0
 ```
 
 Drop `--ref` to take the latest GitHub release. `--check-only` prints the installed and the
@@ -1089,7 +1108,7 @@ stale (it is reconciled on startup).
 
 ```bash
 cd /opt/tunnelgate
-git fetch --tags && git checkout v1.1.0
+git fetch --tags && git checkout v1.2.0
 .venv/bin/pip install -r requirements.txt
 (cd web && npm ci && npm run build)   # required: web/dist is not in the repo
 .venv/bin/python -m app.cli check-schema
@@ -1150,39 +1169,86 @@ online reconnect within one retry interval.
 
 ---
 
-## Appendix - all environment variables
+## Appendix - environment variables
 
-See `app/config.py`; every field there is settable with `TUNNELGATE_<UPPER_NAME>`. The values you
-are most likely to touch:
+`app/config.py` defines 61 settings; every one is settable as
+`TUNNELGATE_<UPPER_SNAKE_NAME>` (plus `TUNNELGATE_ENV_FILE`, which points pydantic at a
+different env file). `docs/CONFIGURATION.md` is the full reference: every setting, its default,
+and the failure it prevents. `deploy/env/tunnelgate.env.example` lists the same 61 keys - the
+ones a normal install sets are active, the rest are commented at their defaults.
+
+Two things are worth knowing before you touch any of them:
+
+* `TUNNELGATE_PORT` is **not** a setting. The app never reads it; it is the port the launch
+  command hands to uvicorn (`deploy/systemd/tunnelgate.service`, `deploy/docker/entrypoint.sh`,
+  `scripts/quick-install.sh`) and the port `scripts/update.sh` probes for the health check. Change
+  the port and you change the unit as well - see docs/CONFIGURATION.md "The listen socket".
+* `TUNNELGATE_PROXY_RELOAD_COMMAND` ships with the default `nginx -s reload` **in the code**, but
+  every shipped install shape (systemd unit, compose file, `quick-install.sh`,
+  `setup-server.sh`) sets it **empty**. The panel unit runs `NoNewPrivileges=yes` and cannot signal
+  a root-owned nginx; `tunnelgate-nginx-reload.path` reloads as root instead. See
+  `deploy/README.md` "Why the nginx reload is not done by the panel".
+
+The values you are most likely to touch:
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `TUNNELGATE_ENV` | `dev` | `production` turns off `/api/docs` and `/api/openapi.json` (unless `TUNNELGATE_DOCS_ENABLED` overrides) and requires `TUNNELGATE_SECRET_KEY` |
+| `TUNNELGATE_LOG_LEVEL` | `info` | Applies to the panel's own `tunnelgate` logger tree only |
 | `TUNNELGATE_PANEL_URL` | `http://127.0.0.1:8080` | Where the panel listens for its own proxy - **not** necessarily what routers dial. Fallback for the agent endpoint; override it from the UI instead. See §7 |
 | `TUNNELGATE_PANEL_HOST` | `panel.example.com` | nginx `server_name` for the panel |
 | `TUNNELGATE_PUBLIC_URL` | derived from `PANEL_URL` + `PANEL_HOST` | Origin **browsers and routers** use: every redirect the panel writes (login bounce, router launch) names it, it sets the scheme of the advertised router URLs, and it is the agent endpoint when `PANEL_URL` is loopback. Required when `PANEL_URL` is loopback - see §7 |
 | `TUNNELGATE_ROUTE_MODE` | `subdomain` | How routers are published: `subdomain` (`<slug>.<suffix>`, needs a wildcard certificate) or `path` (one gateway host, `<gateway>/<slug>/`, needs one ordinary certificate and **nginx**). Unknown values fall back to `subdomain` so a typo cannot stop the panel from booting; `app.cli doctor` reports it |
 | `TUNNELGATE_SUBDOMAIN_SUFFIX` | =`panel_host` | Suffix for router vhosts - `subdomain` mode only |
 | `TUNNELGATE_GATEWAY_HOST` | =`gate.<suffix>` | The single host routers are published under in `path` mode. Must be a DNS name, not an IP: a CA cannot issue for an IP. Equal to `TUNNELGATE_PANEL_HOST` selects the *merged* layout (shared origin; include `routes.conf` inside the panel `server` block), different gives *separate*, the recommended one. Checked by `app.cli doctor`, which warns on merged and fails an IP, empty or dotless value |
-| `TUNNELGATE_COOKIE_SECURE` | `false` | Usually leave it. The cookie is already marked `Secure` when a request arrives over HTTPS from a trusted proxy, so a TLS-terminating deployment needs nothing. Set `true` only when the panel is **never** reachable over plain HTTP - forcing it on a LAN deployment makes browsers drop the cookie over `http://` and logins silently do not stick |
+| `TUNNELGATE_COOKIE_SECURE` | `false` | Usually leave it. The cookie is already marked `Secure` when a request arrives over HTTPS from a trusted proxy (`app/forwarded.py:request_scheme`), so a TLS-terminating deployment needs nothing. Set `true` only when the panel is **never** reachable over plain HTTP - forcing it on a LAN deployment makes browsers drop the cookie over `http://` and logins silently do not stick |
+| `TUNNELGATE_COOKIE_NAME` | `tg_session` | Name of the panel session cookie. Renaming is supported; every signed-in operator is logged out once |
 | `TUNNELGATE_COOKIE_DOMAIN` | unset (host-only) | **Leave unset.** Operator opt-in only; a domain cookie is sent to every router host - see §5 "Do not widen the session cookie" |
+| `TUNNELGATE_SESSION_TTL_MINUTES` | `720` | Panel session lifetime |
+| `TUNNELGATE_CSRF_HEADER` | `X-CSRF-Token` | Header the SPA echoes the CSRF token in (`app/deps.py:csrf_protect`) |
 | `TUNNELGATE_DB_URL` | `sqlite:///./data/tunnelgate.db` | SQLAlchemy URL |
+| `TUNNELGATE_DATA_DIR` | `./data` | Parent of the sqlite file and of `authorized_keys` when those use relative defaults |
+| `TUNNELGATE_SSH_HOST` | `127.0.0.1` | Where sshd listens; changes only when sshd is not on this host |
+| `TUNNELGATE_SSH_PORT` | `22` | sshd port |
 | `TUNNELGATE_SSH_USER` | `tunnelgate` | The system user holding forwards |
+| `TUNNELGATE_SSH_HOST_KEY_PATH` | `/etc/ssh/ssh_host_ed25519_key.pub` | Host key pinned into each router's `known_hosts` |
 | `TUNNELGATE_AUTHORIZED_KEYS_PATH` | `./data/authorized_keys` | Where router keys are rendered |
-| `TUNNELGATE_PORT_MIN/MAX` | 20000/25000 | LuCI tunnel port pool |
-| `TUNNELGATE_CONSOLE_PORT_MIN/MAX` | 25001/30000 | Console port pool |
-| `TUNNELGATE_PROXY_DRIVER` | `nginx` | `nginx` \| `caddy` \| `none` |
+| `TUNNELGATE_AUTHORIZED_KEYS_MODE` | `0600` | Octal int. sshd refuses an `authorized_keys` that is group- or world-writable |
+| `TUNNELGATE_SSHD_RELOAD_COMMAND` | empty | Run after `authorized_keys` changes. `authorized_keys` is re-read on the next authentication, so a reload is not needed for new keys to work |
+| `TUNNELGATE_PORT_MIN` / `TUNNELGATE_PORT_MAX` | `20000` / `25000` | LuCI tunnel port pool |
+| `TUNNELGATE_CONSOLE_PORT_MIN` / `TUNNELGATE_CONSOLE_PORT_MAX` | `25001` / `30000` | Console port pool |
+| `TUNNELGATE_BIND_ADDRESS` | `127.0.0.1` | Address the panel's uvicorn socket is expected on. Keep it loopback |
+| `TUNNELGATE_ROUTER_HTTP_PORT` | `80` | Port LuCI answers on **the router**, dialled through the tunnel |
+| `TUNNELGATE_BOOTSTRAP_TTL_MINUTES` | `15` | Lifetime of a bootstrap token; the router installers are its only consumers |
+| `TUNNELGATE_TUNNEL_POLL_SECONDS` | `5` | How often the monitor re-reads forward state |
+| `TUNNELGATE_HEALTH_TIMEOUT_SECONDS` | `3.0` | Per-probe timeout when checking a router's LuCI through its tunnel |
+| `TUNNELGATE_HEALTH_PATH` | `/` | Path probed to decide whether a router is online |
+| `TUNNELGATE_STALE_OFFLINE_SECONDS` | `90` | How long a silent heartbeat is trusted before the router is called offline |
+| `TUNNELGATE_REQUIRE_HEALTH_FOR_ONLINE` | `true` | `true` = a live SSH forward with a dead LuCI is reported **offline**, not a false "online" |
+| `TUNNELGATE_PROXY_DRIVER` | `nginx` | `nginx` | `caddy` | `none` |
 | `TUNNELGATE_PROXY_ROUTES_PATH` | `./data/tunnelgate.routes.conf` | Generated vhost include |
-| `TUNNELGATE_PROXY_RELOAD_COMMAND` | `nginx -s reload` | Shell command after a route change |
+| `TUNNELGATE_PROXY_RELOAD_COMMAND` | `nginx -s reload` in code, **empty** in every shipped install shape | Shell command after a route change. Leave empty under systemd - see the note above |
+| `TUNNELGATE_CADDY_ADMIN_URL` | `http://127.0.0.1:2019` | Caddy admin API, `PROXY_DRIVER=caddy` only |
+| `TUNNELGATE_CADDY_SERVER` | `srv0` | Caddy server name to inject routes into |
 | `TUNNELGATE_TRUST_PROXY_HEADERS` | `true` | Whether forwarded headers are considered at all. See §7 |
 | `TUNNELGATE_TRUSTED_PROXIES` | `["127.0.0.1", "::1"]` | Peers/CIDRs whose forwarded headers are believed. **JSON list syntax** - the comma form stops the panel from starting |
 | `TUNNELGATE_FORWARDED_ALLOW_HOPS` | `1` | Number of proxies appending `X-Forwarded-For`; raise only when you genuinely have more |
-| `TUNNELGATE_TRUST_FORWARDED_PROTO` | `true` | Declared for symmetry and **unused by the app** - `X-Forwarded-Proto` is consumed by uvicorn's `--proxy-headers`, not by the panel |
+| `TUNNELGATE_TRUST_FORWARDED_PROTO` | `true` | Believe `X-Forwarded-Proto` from a trusted peer, so the session cookie is marked `Secure` behind a TLS terminator without also setting `COOKIE_SECURE`. Consumed by `app/forwarded.py:request_scheme`; uvicorn's `--proxy-headers` handles the transport-level part of the same header |
+| `TUNNELGATE_LOGIN_RATE_LIMIT` | `10` | Login attempts per window (`app/api/auth.py`) |
+| `TUNNELGATE_LOGIN_RATE_WINDOW_SECONDS` | `900` | Window for the limit above |
+| `TUNNELGATE_ADMIN_USERNAME` | `admin` | Seeded admin account |
+| `TUNNELGATE_CORS_ORIGINS` | `[]` | Extra allowed origins. **JSON list syntax** |
+| `TUNNELGATE_ROUTER_COOKIE_NAME` | `tg_luci` | Cookie the router vhost sets; deliberately different from the panel session so the two can never be confused |
+| `TUNNELGATE_LAUNCH_TICKET_TTL_SECONDS` | `120` | Redeemability of the single-use launch ticket |
+| `TUNNELGATE_ROUTER_SESSION_TTL_MINUTES` | `60` | Lifetime of the router-host cookie |
 | `TUNNELGATE_DOCS_ENABLED` | unset (off when `ENV=production`) | Serve `/api/docs` and `/api/openapi.json`. `TUNNELGATE_ENV` is set to `production` by the env example and `setup-server.sh`, so both return `404` on a normal install |
-| `TUNNELGATE_SECRET_KEY` | unset | **Required** in production |
+| `TUNNELGATE_STATIC_DIR` | unset (built `web/dist`) | Override where the SPA is served from |
+| `TUNNELGATE_SECRET_KEY` | unset | **Required** in production. Encrypts console private keys; losing it invalidates every console key |
 | `TUNNELGATE_ADMIN_PASSWORD` | unset | Seeds the admin user on first start |
-| `TUNNELGATE_SESSION_TTL_MINUTES` | 720 | Panel session lifetime |
-| `TUNNELGATE_LOGIN_RATE_LIMIT` | 10 | Login attempts per window |
 | `TUNNELGATE_CONSOLE_ENABLED` | `true` | Master switch for the web console |
 | `TUNNELGATE_CONSOLE_IDLE_TIMEOUT_SECONDS` | 900 | Idle shell timeout |
+| `TUNNELGATE_CONSOLE_MAX_SESSIONS_PER_USER` | 3 | Concurrent console tabs a single operator may hold |
 | `TUNNELGATE_CONSOLE_MAX_SESSION_SECONDS` | 7200 | Hard shell duration cap |
+| `TUNNELGATE_CONSOLE_TERM` | `xterm-256color` | `TERM` the router-side shell is given |
 | `TUNNELGATE_CONSOLE_SSH_USER` | `root` | Account the console logs in as **on the router**. It is the same value used to install the console key, so the dial and the key cannot drift. Change it only after creating that account on the device (docs/SECURITY.md §5) |
+| `TUNNELGATE_CONSOLE_CONNECT_TIMEOUT_SECONDS` | `10.0` | Bounds the dial to the router, so a dark router fails the tab instead of hanging it |

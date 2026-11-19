@@ -100,9 +100,9 @@ sequenceDiagram
     API->>DB: INSERT router (status=pending)
     API->>DB: INSERT bootstrap_token (SHA-256 only, TTL 15 min)
     API-->>UI: RouterCreatedOut {install_command, bootstrap_expires_at}
-    Note over UI: Step 3 shows the one-liner.<br/>The plaintext token exists ONLY here.
-    OP->>R: paste: curl -s <panel>/api/v1/routers/install -H "X-Bootstrap-Token: <token>" | sh
-    R->>API: GET /api/v1/routers/install (X-Bootstrap-Token)
+    Note over UI: Step 3 shows the block.<br/>The plaintext token exists ONLY here.
+    OP->>R: paste: fetch the installer with curl or wget (token as basic-auth user)
+    R->>API: GET /api/v1/routers/install (Basic username = token, or X-Bootstrap-Token)
     API->>DB: SELECT token by sha256(token), unused, unexpired
     API-->>R: sh script with TG_PANEL_URL + TG_BOOTSTRAP_TOKEN substituted
     R->>API: POST /api/v1/routers/bootstrap/exchange (X-Bootstrap-Token, router report)
@@ -123,10 +123,18 @@ sequenceDiagram
 
 ### Why the token lives in the script and not in the URL
 
-A URL lands in nginx access logs, in shell history, and in `ps` output while `curl` runs. The
-script body does not. The script is served over TLS, substituted server-side, and carries
+A URL lands in nginx access logs, in shell history, and in `ps` output while the fetcher runs.
+The script body does not. The script is served over TLS, substituted server-side, and carries
 `Cache-Control: no-store`. The token is `secrets.token_urlsafe(32)` (256 bits), stored only as
 SHA-256, single use, 15 minutes.
+
+The fetch itself is the one place where the token *is* visible on the router: no stock OpenWrt
+image ships `curl`, and its `/usr/bin/wget` is a symlink to `uclient-fetch`, which only
+learned `--header` in 24.10. The only channel that exists on every generation is HTTP Basic
+auth, so the token travels as the **basic-auth username** (`--user="$TK"`, and `-u "$TK:"` for
+curl). It is therefore an argument in the router's shell history - which is why it is single use
+and expires in 15 minutes. See [INSTALL_ROUTER.md §2](INSTALL_ROUTER.md) for the measured
+detail and the placeholder password that keeps `uclient-fetch` from dropping the colon.
 
 ## 5. Request path (operator opens LuCI)
 

@@ -9,6 +9,9 @@
 #     UCI is behind the serial shipped by the panel, rewrite the tunnelgate-console line in
 #     /etc/dropbear/authorized_keys, bump the stored serial and report console_installed.
 #
+# TLS: the panel connection is verified unless tls_verify is exactly "0" (a self-signed panel
+# certificate). Only that option adds -k / --no-check-certificate.
+#
 # The console key pair is created lazily by the panel the first time an operator opens a
 # console, so the installer cannot know the public half - this loop is the delivery channel.
 
@@ -21,6 +24,15 @@ DEFAULT_KEYS=${TG_KEYS:-/etc/dropbear/authorized_keys}
 TMP_BODY=/tmp/tunnelgate-heartbeat-body.$$
 RESPONSE=/tmp/tunnelgate-heartbeat-response.$$
 CONSOLE_MARK=tunnelgate-console
+
+# The fetcher is probed once, for the same reason as in install.sh: stock OpenWrt has no curl,
+# and its uclient-fetch has no --header before 24.10.
+FETCHER=""
+if command -v curl >/dev/null 2>&1; then
+    FETCHER=curl
+elif command -v wget >/dev/null 2>&1; then
+    FETCHER=wget
+fi
 
 umask 077
 trap 'rm -f "$TMP_BODY" "$RESPONSE"' EXIT INT TERM
@@ -61,6 +73,24 @@ else
     json_get() { return 2; }
 fi
 
+# TLS policy for the panel connection (see docs/INSTALL_ROUTER.md).
+#
+# TG_TLS_VERIFY wins when the installer started this process; at runtime the UCI option the
+# installer wrote is the source of truth, so 'uci set tunnelgate.main.tls_verify=0' plus
+# '/etc/init.d/tunnelgate restart' changes the behaviour without re-installing.
+#
+# ONLY the exact string "0" disables verification: "1", "yes", "2", "false", "" and anything
+# else mean VERIFY, because a value we do not understand must not downgrade the connection that
+# carries the API token.
+TLS_VERIFY=1
+_tls_value=${TG_TLS_VERIFY:-}
+if [ -z "$_tls_value" ]; then
+    _tls_value=$(cfg_get tls_verify)
+fi
+if [ "$_tls_value" = "0" ]; then
+    TLS_VERIFY=0
+fi
+
 cfg_set() {
     if command -v uci >/dev/null 2>&1; then
         uci -q set "tunnelgate.main.$1=$2" && uci -q commit tunnelgate
@@ -87,20 +117,57 @@ json_quote() {
 
 # post <url> <token> <body-file> <output-file> -> HTTP status on stdout ("" when unreachable)
 post() {
-    if command -v curl >/dev/null 2>&1; then
-        curl -q -sS -o "$4" -w '%{http_code}' --max-time 30 -X POST \
+    _tg_url=$1
+    _tg_token=$2
+    _tg_body=$3
+    _tg_out=$4
+
+    rm -f "$_tg_out" 2>/dev/null
+
+    case "$FETCHER" in
+    curl)
+        # -k only when tls_verify is exactly 0; there is no global switch.
+        _tg_k=""
+        if [ "$TLS_VERIFY" = "0" ]; then
+            _tg_k="-k"
+        fi
+        _tg_code=$(curl -q -sS ${_tg_k:+"$_tg_k"} -o "$_tg_out" -w '%{http_code}' --max-time 30 -X POST \
             -H "Content-Type: application/json" \
-            -H "X-Api-Token: $2" \
-            --data-binary "@$3" \
-            "$1" 2>/dev/null
+            -H "X-Api-Token: $_tg_token" \
+            -u "$_tg_token:" \
+            --data-binary "@$_tg_body" \
+            "$_tg_url" 2>/dev/null)
+        case "$_tg_code" in
+        000 | "") return 0 ;;
+        *)
+            printf '%s' "$_tg_code"
+            return 0
+            ;;
+        esac
+        ;;
+    wget)
+        _tg_err="$_tg_out.err.$$"
+        _tg_ncc=""
+        if [ "$TLS_VERIFY" = "0" ]; then
+            _tg_ncc="--no-check-certificate"
+        fi
+        wget -O "$_tg_out" ${_tg_ncc:+"$_tg_ncc"} --post-file="$_tg_body" --timeout=30 "$_tg_url" 2>"$_tg_err"
+        _tg_rc=$?
+        _tg_code=$(sed -n \
+            -e 's/.*HTTP error \([0-9][0-9][0-9]\).*/\1/p' \
+            -e 's/.*awaiting response\.\.\. \([0-9][0-9][0-9]\).*/\1/p' \
+            -e 's/.*ERROR \([0-9][0-9][0-9]\).*/\1/p' \
+            "$_tg_err" 2>/dev/null | tail -n 1)
+        rm -f "$_tg_err"
+        if [ -n "$_tg_code" ]; then
+            printf '%s' "$_tg_code"
+            return 0
+        fi
+        [ "$_tg_rc" = "0" ] && printf '200'
         return 0
-    fi
-    wget -q -O "$4" \
-        --header "Content-Type: application/json" \
-        --header "X-Api-Token: $2" \
-        --post-file="$3" \
-        --timeout=30 -S "$1" 2>&1 |
-        sed -n 's/.*HTTP\/1\.[01] \([0-9][0-9][0-9]\).*/\1/p' | tail -n 1
+        ;;
+    esac
+    return 1
 }
 
 # send_heartbeat [console_installed_flag] -> prints HTTP status
@@ -124,6 +191,8 @@ send_heartbeat() {
         printf ',"client_version":%s' "$(json_quote "$CLIENT_VERSION")"
         [ -n "$_tunnel_pid" ] && printf ',"tunnel_pid":%s' "$_tunnel_pid"
         [ "$1" = "1" ] && printf ',"console_installed":true'
+        # The credential in the body: the only channel a pre-24.10 uclient-fetch can use.
+        printf ',"api_token":%s' "$(json_quote "$api_token")"
         printf '}\n'
     } >"$TMP_BODY"
 
@@ -139,6 +208,21 @@ keys_path=$(cfg_get console_authorized_keys_path)
 if [ -z "$heartbeat_url" ] || [ -z "$api_token" ]; then
     log "heartbeat disabled: heartbeat_url or api_token missing in $CONFIG_FILE"
     exit 0
+fi
+
+if [ -z "$FETCHER" ]; then
+    log "heartbeat disabled: neither curl nor wget is installed, so $heartbeat_url cannot be reached"
+    exit 0
+fi
+
+# One warning per boot, not one per minute: this process is restarted every 60 s and a warning
+# that shouts every minute is a warning nobody reads.
+if [ "$TLS_VERIFY" = "0" ]; then
+    _tls_warned=${TG_TLS_WARN_FILE:-/tmp/.tunnelgate-tls-warning}
+    if [ ! -e "$_tls_warned" ]; then
+        log "WARNING: TLS certificate verification is OFF for $heartbeat_url (tunnelgate.main.tls_verify=0). Anyone who can answer for that host receives the API token. Restore it with: uci set tunnelgate.main.tls_verify=1 && uci commit tunnelgate && /etc/init.d/tunnelgate restart"
+        : >"$_tls_warned" 2>/dev/null
+    fi
 fi
 
 http_code=$(send_heartbeat 0)

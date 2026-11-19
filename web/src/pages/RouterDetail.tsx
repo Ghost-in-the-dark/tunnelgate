@@ -730,6 +730,12 @@ function InstallTab({
             <pre className="overflow-x-auto p-3.5 font-mono text-2xs leading-relaxed text-text">
               <code>{command}</code>
             </pre>
+            <p className="border-t border-border px-3.5 py-2 text-3xs leading-relaxed text-faint">
+              It is a whole block: paste all of it, not just the first line. It needs neither curl
+              nor an extra package on a stock OpenWrt, and the token it carries is already in the URL -
+              so it ends up in the router&apos;s shell history, but it is single-use and expires in
+              minutes.
+            </p>
           </>
         ) : (
           <div className="px-3.5 py-6 text-center">

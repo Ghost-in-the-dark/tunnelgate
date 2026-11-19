@@ -146,7 +146,7 @@ valid label (1-40 chars of `a-z0-9-`).
 {
   "bootstrap_token": "Q1r...43-chars",
   "bootstrap_expires_at": "2026-11-17T21:57:34Z",
-  "install_command": "curl -fsSL -H 'X-Bootstrap-Token: Q1r...' 'https://panel.example.com/api/v1/routers/install?os=linux' | sh",
+  "install_command": "TK='Q1r...'; U='https://panel.example.com/api/v1/routers/install?os=linux'; F=/tmp/tg-install.$$.sh\nif command -v curl >/dev/null 2>&1; then curl -fsSL -o \"$F\" -u \"$TK:\" \"$U\"\nelif command -v wget >/dev/null 2>&1; then wget -q -O \"$F\" --user=\"$TK\" --password=x \"$U\"\nelse echo 'TunnelGate: neither curl nor wget is installed on this router' >&2; exit 1; fi\ngrep -q 'TunnelGate router agent installer' \"$F\" 2>/dev/null || { ...; rm -f \"$F\"; exit 1; }\nsh \"$F\"",
   "install_script_url": "https://panel.example.com/api/v1/routers/install?os=linux"
 }
 ```
@@ -252,13 +252,19 @@ Cheap endpoint for the wizard's 2-second poll.
 
 Header: `X-Bootstrap-Token`.
 
-→ `200 text/x-shellscript`, `Cache-Control: no-store`, with `TG_PANEL_URL` and
-`TG_BOOTSTRAP_TOKEN` substituted into the script body. The token is **never** echoed in a URL,
-a log line or a response header.
+→ `200 text/x-shellscript`, `Cache-Control: no-store`, with `TG_PANEL_URL`,
+`TG_BOOTSTRAP_TOKEN` and `TG_TLS_VERIFY` (`1` or `0`, from the agent endpoint's `verify_tls`)
+substituted into the script body. The token is **never** echoed in a URL, a log line or a response
+header.
 
 The `os` parameter only selects the shell dialect of the generated script (`linux` → POSIX sh,
 `freebsd` → sh with `pkg` notes, `windows` → a PowerShell equivalent that is documented but
 marked experimental).
+
+`TG_TLS_VERIFY=0` makes the body fetch with `-k` (curl) or `--no-check-certificate`
+(wget/uclient-fetch) and prefixed with a comment saying so; with `1` the body is byte-for-byte what
+it was before the flag existed. The installer writes the value into `tunnelgate.main.tls_verify`,
+which is what the agent (and the heartbeat) read from then on.
 
 ### `POST /api/v1/routers/bootstrap/exchange`
 
@@ -345,6 +351,11 @@ stored, and when the two differ and the new value starts with `http://` or `http
 repeated on every heartbeat, so a router that missed a beat still converges, and a value that is
 not an http(s) URL is ignored with a log line rather than written. See
 `docs/INSTALL_SERVER.md`, "Moving the panel without re-installing routers".
+
+`desired` carries the address and **only** the address: the endpoint's `verify_tls` is not part
+of it, so changing the flag never reaches a router that is already installed. That router's policy
+is the `tunnelgate.main.tls_verify` option the installer wrote for it - see
+`docs/SECURITY.md`, "When to turn certificate verification off".
 
 `console` is present only while the router's stored key serial is behind the server's, so a
 router rewrites its `authorized_keys` exactly once per rotation. A heartbeat can refresh
@@ -496,6 +507,12 @@ panel still binds loopback, while routers dial the public address. Pointing `pan
 public name to fix that would break the panel's own routing, which is why the override lives in
 the database and not in the env file.
 
+The endpoint also carries one bit of TLS policy, `verify_tls` (default `true`). It is
+deliberately **not** part of `agent_url`: the URL stays a plain address that can be pasted into a
+shell or printed in a log line, while the policy travels beside it - `false` makes the install
+command fetch with `-k` / `--no-check-certificate` and makes the agent accept a certificate it
+cannot verify. An `http` endpoint is always `true`, because there is no certificate to verify.
+
 Source is reported honestly in every response: `environment` (from `TUNNELGATE_PANEL_URL`, or
 from `TUNNELGATE_PUBLIC_URL` when the former is loopback and therefore unreachable from a router)
 or `database` (the admin stored an override).
@@ -508,13 +525,17 @@ or `database` (the admin stored an override).
 {
   "agent_url": "https://panel.example.com",
   "agent_endpoint": {"scheme": "https", "host": "panel.example.com", "port": null,
-                     "source": "environment"}
+                     "source": "environment", "verify_tls": true}
 }
 ```
 
 `port: null` means "the scheme default" (80/443); a port equal to that default is normalised
 away, so `https` + `443` and `https` + `null` produce the same `agent_url`. IPv6 hosts are
 stored unbracketed and rendered bracketed.
+
+`verify_tls` is what the router is told to do with the panel's certificate: `true` (the default)
+verifies it, `false` accepts a self-signed or otherwise unverifiable one. Rows written before this
+field existed read as `true`.
 
 → `409 agent_endpoint_unusable` when `TUNNELGATE_PANEL_URL` cannot be parsed as an http(s) URL
 and no override is stored. Nothing is broken in that state - installs and heartbeats fall back to
@@ -527,12 +548,18 @@ it), but the panel's own reachability details are not something every account ne
 ### `PUT /api/v1/settings/agent-endpoint`
 
 ```json
-{"scheme": "https", "host": "panel.example.com", "port": 8443}
+{"scheme": "https", "host": "panel.example.com", "port": 8443, "verify_tls": false}
 ```
 
 `scheme` is `http` or `https`; `host` is a hostname, an IPv4 literal or an IPv6 literal (bare or
 bracketed) and must not carry a scheme, a port, a path, credentials or separators; `port` is
-optional. → `200` with the same envelope as `GET`, `source` now `database`.
+optional; `verify_tls` is optional and defaults to `true` - omit it and routers verify the
+certificate. → `200` with the same envelope as `GET`, `source` now `database`.
+
+One normalisation a client author should know about: `scheme: "http"` with `verify_tls: false`
+comes back as `verify_tls: true`. It is not a rejection - there is no certificate on an `http`
+endpoint to verify or to skip, so the flag is stored as the no-op it is. Read the response, not
+the request, if you need to know what routers are being told.
 
 Field-level validation failures are a `422` in the standard envelope, with one entry per bad
 field so the SPA can highlight it:
@@ -553,7 +580,13 @@ Effect is immediate and needs no restart. The next `POST /api/v1/routers`, rotat
 out the new `heartbeat_url`; the next heartbeat tells every already-installed router to move.
 See `docs/INSTALL_SERVER.md`, "Moving the panel without re-installing routers".
 
-Audit: `settings.agent_endpoint.save`, `detail.agent_url`.
+The flag changes nothing about the address: the next `POST /api/v1/routers` renders a command
+that fetches with `-k` / `--no-check-certificate` instead of verifying. It reaches **new**
+installs only - a router that is already installed keeps the policy in its own UCI option, since
+the heartbeat's `desired` payload carries the address and nothing else
+(see [Heartbeat](#heartbeat-router-facing)).
+
+Audit: `settings.agent_endpoint.save`, `detail: {agent_url, verify_tls}`.
 
 ### `DELETE /api/v1/settings/agent-endpoint`
 
@@ -562,13 +595,17 @@ envelope (`source: environment`). **Idempotent**: deleting when nothing is store
 error, it reports what is in effect. `409` if the override came out and the environment value is
 still unusable - that combination is worth seeing rather than hiding.
 
-Audit: `settings.agent_endpoint.reset`, `detail: {removed: bool, agent_url: ...}`.
+Audit: `settings.agent_endpoint.reset`, `detail: {removed: bool, agent_url: ..., verify_tls}`.
 
 ### `POST /api/v1/settings/agent-endpoint/test`
 
 Probes a **candidate** endpoint from the panel and reports what came back. Body is the same
-`{scheme, host, port}`; it is validated exactly like `PUT` and validated **before** anything is
-sent.
+`{scheme, host, port, verify_tls}`; it is validated exactly like `PUT` and validated **before**
+anything is sent.
+
+`verify_tls: false` is honoured here too, and it has to be: if the probe verified the certificate
+of an endpoint whose routers are told not to, it would answer `ok: false` for a panel that works,
+and the operator would go looking for the wrong fault.
 
 → `200`
 
@@ -592,13 +629,13 @@ something, but it is not a TunnelGate panel (no health payload)"` (200 but no
 HTTP 200 and a JSON body whose `status` is `ok`.
 
 The probe is exactly one unauthenticated `GET <url>/api/v1/health` with redirects **not**
-followed and a 5 s timeout. It never persists the candidate: after a successful test the
-effective endpoint is unchanged.
+followed and a 5 s timeout, verifying the certificate unless the candidate says `verify_tls: false`.
+It never persists the candidate: after a successful test the effective endpoint is unchanged.
 
 This is the only reliable way to tell "the router will reach this address" apart from "my
 browser can" - the panel's network position is the one that matters. It is admin-only because it
 makes the panel issue an outbound request to an operator-chosen address, and every attempt is
-audited (`settings.agent_endpoint.test`, `detail: {checked_url, error}`).
+audited (`settings.agent_endpoint.test`, `detail: {checked_url, error, verify_tls}`).
 
 ---
 
@@ -607,7 +644,7 @@ audited (`settings.agent_endpoint.test`, `detail: {checked_url, error}`).
 ### `GET /api/v1/health` (no auth)
 
 ```json
-{"status": "ok", "version": "1.1.0", "time": "2026-11-17T21:42:34Z"}
+{"status": "ok", "version": "1.2.0", "time": "2026-11-17T21:42:34Z"}
 ```
 
 ### `GET /api/v1/config`
@@ -616,10 +653,10 @@ audited (`settings.agent_endpoint.test`, `detail: {checked_url, error}`).
 {"panel_url": "http://127.0.0.1:8080", "subdomain_suffix": "panel.example.com",
  "route_mode": "subdomain", "gateway_host": "gate.panel.example.com",
  "bootstrap_ttl_minutes": 15, "poll_interval_seconds": 2, "proxy_driver": "nginx",
- "version": "1.1.0",
+ "version": "1.2.0",
  "agent_url": "https://panel.example.com",
  "agent_endpoint": {"scheme": "https", "host": "panel.example.com", "port": null,
-                    "source": "environment"},
+                    "source": "environment", "verify_tls": true},
  "agent_endpoint_testable": true}
 ```
 
@@ -629,7 +666,7 @@ The two URLs answer different questions and are deliberately not the same field:
 |---|---|
 | `panel_url` | where the panel listens for **its own** reverse proxy (`proxy_pass` target). Loopback in the shipped layout. |
 | `agent_url` | the base URL a **router** dials - what the installer, bootstrap exchange and heartbeat use. |
-| `agent_endpoint` | the parsed form of `agent_url` plus its `source` (`environment` or `database`). `null` when `TUNNELGATE_PANEL_URL` is unparseable and no override is stored. |
+| `agent_endpoint` | the parsed form of `agent_url` plus its `source` (`environment` or `database`) and its TLS policy `verify_tls`. `null` when `TUNNELGATE_PANEL_URL` is unparseable and no override is stored. |
 | `agent_endpoint_testable` | `false` exactly when `agent_endpoint` is `null` - there is nothing well-formed to probe. |
 
 `agent_url` is always populated: it falls back to the raw `TUNNELGATE_PANEL_URL` string even when

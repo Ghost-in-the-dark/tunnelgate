@@ -1,6 +1,6 @@
 [project]
 name = "tunnelgate"
-version = "1.1.0"
+version = "1.2.0"
 description = "Centralised access gateway for OpenWrt LuCI over SSH reverse tunnels"
 requires-python = ">=3.11"
 

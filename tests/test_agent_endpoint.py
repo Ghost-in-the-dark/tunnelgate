@@ -281,3 +281,139 @@ def test_a_stored_override_still_beats_the_public_fallback() -> None:
         endpoint = agent_endpoint.effective(db, settings)
         assert endpoint.url == "https://moved.example.com"
         assert endpoint.source == agent_endpoint.SOURCE_DATABASE
+
+
+# ------------------------------------------------------------------ TLS trust
+def test_verify_tls_defaults_to_true_when_the_row_does_not_carry_it() -> None:
+    """Rows written by 1.0.0/1.1.0 have no verify_tls; they must load as verifying.
+
+    Backward compatibility matters here in one direction only: an old row that silently
+    disabled certificate checks would be a downgrade nobody asked for.
+    """
+    from app.models import PanelSetting
+
+    with session_scope() as db:
+        db.add(
+            PanelSetting(
+                key=agent_endpoint.AGENT_ENDPOINT_KEY,
+                value='{"scheme": "https", "host": "legacy.example.com", "port": null}',
+            )
+        )
+        db.commit()
+        endpoint = agent_endpoint.effective(db, make_settings())
+        assert endpoint.source == agent_endpoint.SOURCE_DATABASE
+        assert endpoint.verify_tls is True
+
+
+def test_an_http_endpoint_always_reports_verification_on() -> None:
+    """Normalisation, not validation: http has no certificate, so false would be a lie.
+
+    The SPA renders this value, so returning false would show the operator a warning about an
+    insecure connection when the connection is merely unencrypted. Erroring would also be
+    wrong: nothing the operator asked for is impossible.
+    """
+    endpoint, problems = agent_endpoint.normalize("http", "panel.example.com", None, False)
+    assert problems == {}
+    assert endpoint.verify_tls is True
+
+
+def test_an_https_endpoint_can_store_a_self_signed_acceptance() -> None:
+    endpoint, problems = agent_endpoint.normalize("https", "panel.example.com", None, False)
+    assert problems == {}
+    assert endpoint.verify_tls is False
+    # The URL is unchanged by the TLS policy: the address stays pasteable and loggable.
+    assert endpoint.url == "https://panel.example.com"
+
+
+def test_save_and_clear_round_trip_the_tls_policy() -> None:
+    with session_scope() as db:
+        endpoint, problems = agent_endpoint.save(
+            db, "https", "self.example.com", None, verify_tls=False
+        )
+        assert problems == {}
+        assert endpoint.verify_tls is False
+        db.commit()
+        reloaded = agent_endpoint.effective(db, make_settings())
+        assert reloaded.source == agent_endpoint.SOURCE_DATABASE
+        assert reloaded.verify_tls is False
+        assert agent_endpoint.clear(db) is True
+        db.commit()
+        restored = agent_endpoint.effective(db, make_settings(panel_url="https://env.example.com"))
+        assert restored.source == agent_endpoint.SOURCE_ENVIRONMENT
+        # The env file has no TLS knob, so clearing the row returns the safe default.
+        assert restored.verify_tls is True
+
+
+def test_the_url_never_carries_the_tls_policy() -> None:
+    """Live, the URL is generated independently of verify_tls.
+
+    One test for one fact: the endpoint URL must stay a plain address whichever way the policy
+    points, because it is pasted into a router and appears in logs.
+    """
+    fresh, _ = agent_endpoint.normalize("https", "panel.example.com", None, True)
+    loose, _ = agent_endpoint.normalize("https", "panel.example.com", None, False)
+    assert fresh.url == loose.url
+    assert "insecure" not in loose.url
+    assert "verify" not in loose.url
+
+
+def test_an_unusable_stored_value_still_verifies() -> None:
+    """Anything unrecognised falls back to verifying, never to skipping the check."""
+    for value in (None, "banana", [], {}, 0.5):
+        endpoint, problems = agent_endpoint.normalize("https", "panel.example.com", None, value)
+        assert problems == {}
+        assert endpoint.verify_tls is True, value
+
+
+@pytest.mark.parametrize(("stored", "expected"), [("false", False), ("0", False), (False, False)])
+def test_a_json_row_spelling_false_is_honoured(stored, expected) -> None:
+    """A row written by an older panel could hold "false" or 0 rather than a JSON boolean."""
+    import json as _json
+
+    from app.models import PanelSetting
+
+    with session_scope() as db:
+        db.add(
+            PanelSetting(
+                key=agent_endpoint.AGENT_ENDPOINT_KEY,
+                value=_json.dumps(
+                    {
+                        "scheme": "https",
+                        "host": "legacy.example.com",
+                        "port": None,
+                        "verify_tls": stored,
+                    }
+                ),
+            )
+        )
+        db.commit()
+        assert agent_endpoint.effective(db, make_settings()).verify_tls is expected
+
+
+def test_probe_passes_verify_false_to_httpx(monkeypatch) -> None:
+    """The probe must test the policy that is about to be saved, not the strict default.
+
+    A probe that verified while the router will not would report "unreachable" for an endpoint
+    that works, and the operator would go and change a setting that was already correct.
+    """
+    seen: dict = {}
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"status": "ok", "version": "1.0.0"}
+
+    def fake_get(url, **kwargs):
+        seen["url"] = url
+        seen.update(kwargs)
+        return Response()
+
+    monkeypatch.setattr("httpx.get", fake_get)
+    result = agent_endpoint.probe("https://self.example.com", verify_tls=False)
+    assert result["ok"] is True
+    assert seen["verify"] is False
+    # And the strict default is still strict.
+    seen.clear()
+    agent_endpoint.probe("https://self.example.com")
+    assert seen["verify"] is True

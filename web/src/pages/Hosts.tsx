@@ -16,6 +16,7 @@ import type { ColumnId, Sort, SortKey } from '../components/HostsTable'
 import { EmptyState, ErrorState, InlineAlert, TableSkeleton } from '../components/States'
 import { ConfirmDialog, Modal } from '../components/Modal'
 import { useToast } from '../components/Toast'
+import { copyText } from '../lib/clipboard'
 
 const STATUS_FILTERS = [
   { value: 'all', label: 'All statuses' },
@@ -619,6 +620,7 @@ function ScriptDialog({
   onClose: () => void
   onInstall: (id: string) => void
 }) {
+  const toast = useToast()
   const scriptQuery = useQuery({
     queryKey: ['router-script', router?.id],
     queryFn: ({ signal }) => api.installScript(router!.id, signal),
@@ -650,11 +652,35 @@ function ScriptDialog({
         </InlineAlert>
       ) : scriptQuery.data ? (
         <div>
+          <div className="mb-1.5 flex items-center justify-between gap-2">
+            <span className="text-3xs text-faint">
+              Multi-line: run the whole block, not just the first line.
+            </span>
+            <Button
+              size="sm"
+              variant="secondary"
+              icon="copy"
+              onClick={async () => {
+                // The served string verbatim, newlines included - a command with a line dropped
+                // is a command that does something else.
+                const ok = await copyText(scriptQuery.data?.install_command ?? '')
+                if (ok) toast.success('Command copied.')
+                else toast.error('Clipboard unavailable - select and copy manually.')
+              }}
+            >
+              Copy
+            </Button>
+          </div>
           <pre className="max-h-64 overflow-auto rounded border border-border bg-bg p-3 font-mono text-2xs leading-relaxed text-text">
             <code>{scriptQuery.data.install_command}</code>
           </pre>
-          <p className="mt-2 text-2xs text-muted">
-            Expires {scriptQuery.data.bootstrap_expires_at ? new Date(scriptQuery.data.bootstrap_expires_at).toLocaleString() : '—'}
+          <p className="mt-2 text-2xs leading-relaxed text-muted">
+            Expires{' '}
+            {scriptQuery.data.bootstrap_expires_at
+              ? new Date(scriptQuery.data.bootstrap_expires_at).toLocaleString()
+              : '—'}
+            . The token is in the URL, so it stays in the router&apos;s shell history - it is
+            single-use, so it only ever buys one install.
           </p>
         </div>
       ) : null}

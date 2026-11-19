@@ -8,6 +8,110 @@ Panel and router are versioned separately: `agent/install.sh` carries its own
 `CLIENT_VERSION` (the bootstrap protocol the panel records per router), so a panel patch release
 does not require reinstalling every router.
 
+## [1.2.0] - 2026-11-19
+
+The release that makes the router install work on a stock router, and makes the panel reachable
+from one that does not trust its certificate. Both were measured on real OpenWrt images of every
+generation rather than reasoned about, and both changed the design.
+
+### Added
+
+- **An install command that works with no curl.** No official OpenWrt image ships curl, and
+  `/usr/bin/wget` there is a symlink to `uclient-fetch` — which only gained `--header` in 24.10
+  and does not retry a POST after a 401, so the old `curl -fsSL -H 'X-Bootstrap-Token' …` one-liner
+  could not work on the devices it was written for. The panel now emits one command that probes
+  for curl or wget itself, fetches the installer to `/tmp/tg-install.$$.sh`, greps it for the
+  installer's sentinel and only then runs it — because a 401 answers an empty body, and `| sh` on
+  an empty body is a silent success. The token rides as the **basic-auth username** with a
+  placeholder password: measured through a logging proxy, `uclient-fetch` sends
+  `base64(TOKEN:x)` and the panel answers 200, while an empty password sends `base64(TOKEN)` with
+  no colon and the panel answers 401. URL userinfo is gone: GNU wget 1.25 rejects it outright.
+- **Three token channels, and a challenge.** `X-Bootstrap-Token`, the HTTP Basic username, and a
+  `bootstrap_token` body field authenticate the exchange; `X-Api-Token`, the Basic username and an
+  `api_token` body field authenticate the heartbeat. Every 401 now carries
+  `WWW-Authenticate: Basic realm="tunnelgate"`, which is what makes a challenge-response client
+  retry at all. Bodies are parsed by hand rather than declared as pydantic models, because
+  `uclient-fetch` always posts `application/x-www-form-urlencoded` and a declared model answered
+  422 before the handler ran.
+- **"Ignore SSL self-signed certificates"** on the Agent endpoint card (Settings → Panel), stored
+  as `verify_tls` next to the endpoint. Off, the install command gains `curl -k` /
+  `wget --no-check-certificate` and one comment line saying so, the installer injects
+  `TG_TLS_VERIFY=0`, the agent writes `tunnelgate.main.tls_verify` and the heartbeat stops
+  verifying. On, every command is byte-identical to what it was. The setting is normalised rather
+  than rejected: `http` forces it true (there is no certificate to check), and an unreadable
+  stored value falls back to verifying — never the other way round.
+- **`tests/test_install_contract.py`** — the rendered installer, which nothing had ever tested.
+  It renders through `bootstrap.render_install_script`, runs the result, and asserts it gets past
+  its own self-check; it also proves a damaged body is still refused. Two of its tests failed when
+  first written, and the reason was a real defect (see Fixed).
+- **`tests/test_docs_config.py`**, **`tests/test_security.py`**, **`tests/test_heartbeat.py`** —
+  the documented setting count, the documented install command, the basic-auth parser, and the
+  heartbeat's TLS policy, each asserted instead of promised.
+- **`docs/CLI.md`**, **`docs/CONFIGURATION.md`** (all 61 settings, their defaults and the failure
+  each one prevents), **`docs/INDEX.md`** (a routed map of every document) and
+  **`CONTRIBUTING.md`**.
+- The router agent installs the OpenSSH client itself when the router has only dropbear, including
+  on images that use `apk`.
+
+### Fixed
+
+- **The installer never installed OpenSSH.** `ensure_openssh()` began with `command -v ssh`, which
+  on every stock image is a symlink to `/usr/sbin/dropbear` — so it logged "openssh-client
+  present" and installed nothing, the exact state its own comment said it could not tolerate
+  (`permitlisten` cannot be enforced per key by dropbear). Detection is now functional: `ssh -V`
+  must mention `OpenSSH_`, `ssh-keygen` must *generate* an OpenSSH-format key and read it back
+  (dropbear's cannot, and prints `Exited: String too long` while exiting 0), and `ssh-keyscan`
+  must exist. Each failed probe names the package that fixes it: `openssh-client` alone is not
+  enough, since `ssh-keygen` lives in `openssh-keygen` and `ssh-keyscan` in
+  `openssh-client-utils`.
+- **The served script was not executable.** The panel prepended its header *above* the installer's
+  `#!/bin/sh`, so line 1 was a comment: running the file directly got it interpreted by whatever
+  shell was current, silently, and `sh -n` passed. The served file is now shebang first, sentinel
+  second, injected assignments third.
+- **The installer's self-check rejected every real install.** It looked for its sentinel in the
+  first two lines, which the injected header had pushed to line 8 — so a correct download failed
+  with "does not look like the TunnelGate installer". The window is now 40 lines from the top
+  (not "anywhere in the file", which would let a captive-portal page vouch for itself).
+- **19.07 could not fetch the installer at all.** Its `uclient-fetch` is built without a TLS
+  library, so the first https request dies with `wget: SSL support not available`. The installer
+  detects a missing `libustream` and installs it for the requests it makes — but it cannot rescue
+  the download that fetches it, so the docs now say to install `libustream-wolfssl` first.
+- **`--purge` left two of the three OpenSSH packages behind**, and on 24.10 a leftover
+  `openssh-keygen` shadows dropbear's. The uninstaller removes exactly what the installer adds.
+- The development mock server emitted a six-month-old install command; it now emits the real one.
+- `doctor` no longer reports a warning as a failure when it cannot open nginx's pid file as an
+  unprivileged user.
+
+### Documentation
+
+- docs/INSTALL_ROUTER.md gains the sentinel check, the three-package OpenSSH table, the 19.07
+  libustream trap, "TLS verification, and how to turn it off for one panel", and a troubleshooting
+  row for the fetch that fails before any TunnelGate code runs.
+- docs/SECURITY.md, docs/API.md, docs/OPERATIONS.md, docs/ARCHITECTURE.md, docs/UI.md, README.md
+  and CONTRACT.md are brought in step with the token channels, `verify_tls` and the new command
+  shape. Every document that shows an install command now shows the real one, enforced by a test.
+
+### Testing
+
+837 tests. `ruff check` and `ruff format --check` clean, shellcheck plus `busybox sh -n` on the
+installer, uninstaller, heartbeat and both server scripts, and the five embedded heredocs asserted
+byte-identical to their standalone sources.
+
+The whole path was exercised against real stock images of **19.07.10, 22.03.7, 23.05.5 and
+24.10.1** in containers, against a disposable panel with a real sshd — including a bare 23.05.5
+with no curl, no `ssh-keygen` and no `ssh-keyscan`, which now installs itself and finishes with
+`OpenSSH 9.8`. The heartbeat's TLS policy was proven both ways in a 24.10.1 container, and the
+endpoint API's normalisation matrix was verified against the live panel.
+
+### Known limits
+
+- On **19.07** with `libustream`, `uclient-fetch` accepts a self-signed certificate outright, so
+  `tls_verify=1` there records a promise the fetcher cannot keep (a hostname mismatch is still
+  caught). The installer detects this and says so; 21.02 is the floor for real chain verification.
+- The token is visible on the router: as an argument in the shell history and in `ps` while the
+  command runs. It is single-use and expires in 15 minutes, and the alternative channel
+  (`--header`) does not exist on the fetchers these devices have.
+
 ## [1.1.0] - 2026-11-18
 
 The release that makes the documented install command work. 1.0.0's quick-install URL pointed at

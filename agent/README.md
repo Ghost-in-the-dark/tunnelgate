@@ -58,6 +58,13 @@ token in a URL would land it in the nginx access log, the shell history and `ps`
 `app/services/bootstrap.py` does the substitution; `tests/test_installer.py` performs
 the same substitution on the shipped file, so a broken marker breaks tests, not a router.
 
+Those two markers are what the file itself needs. The **served** file additionally carries
+`TG_OS_TYPE` and `TG_TLS_VERIFY`, which `render_install_script` injects above the body - four
+assignments in total, of which only the URL and the token are required (the other two have safe
+defaults: linux, verify). Anything that renders this script must keep the sentinel within
+`SELF_SCAN_LINES` lines of the top; see the regression tests that render through
+`bootstrap.render_install_script` rather than through `stage_installer`.
+
 ## Every path is overridable
 
 Each absolute path is a `${TG_*:-default}` assignment, so the real scripts run verbatim
@@ -74,9 +81,86 @@ in a temp tree during tests:
 | `TG_KEYS` | `/etc/dropbear/authorized_keys` |
 | `TG_SKIP_SERVICE` | `0` (set `1` to skip every init-system call) |
 | `TG_FORCE` | `0` (set `1` to skip the OpenWrt check) |
+| `TG_TLS_VERIFY` | injected by the panel; falls back to `uci get tunnelgate.main.tls_verify` |
+| `TG_TLS_WARN_FILE` | `/tmp/.tunnelgate-tls-warning` (once-per-boot warning sentinel) |
+
+## The fetcher, and where the token travels
+
+`install.sh` probes the fetcher **once** (`detect_fetcher`) and every request reuses the
+answer. The two are not interchangeable, and the reason is measured, not stylistic:
+
+* **No curl on stock OpenWrt.** No generation of the official images ships it.
+* **`/usr/bin/wget` is `uclient-fetch`.** Before 24.10 it has no `--header`, no `-S` and no
+  `-w`. An unknown option there is *not* a hard failure - it prints usage and exits 0, so a
+  header-carrying wget silently sends nothing and still reports success.
+* **Basic auth does not authenticate a POST on it.** uclient-fetch is a challenge-response
+  client: it sends no `Authorization` on the first request and does not retry a POST after the
+  401, so `--user`/`--password` cannot carry the credential on that path.
+* **URL userinfo is out.** GNU wget 1.25 rejects a userinfo URL outright (exit 6).
+
+So the token has one reliable channel on every generation: **the JSON request body**
+(`bootstrap_token` for the exchange, `api_token` for the heartbeat). The curl path *also*
+sends the legacy `X-Bootstrap-Token`/`X-Api-Token` header and `-u "$TOKEN:"`, because curl can
+and it costs nothing.
+
+The status is derived per fetcher: curl keeps `-w '%{http_code}'` (`000` means the request
+never completed - DNS, TLS, refused - not an HTTP status); the wget path runs **without `-q`**
+because the status exists only in the progress output, and parses three spellings
+(`HTTP error NNN` / `awaiting response... NNN` / `ERROR NNN`). Exit 0 with no status line counts
+as 200, and the body is still validated, so a captive-portal page cannot pass as an exchange
+response.
+
+The panel hands out a command that fetches to a file, greps `TunnelGate router agent installer`
+and only then runs it - a 401 answers an empty body and `| sh` on it would be a silent success.
+`install.sh` repeats that check on itself (`check_self`), so a body that loses its header line
+is refused even when it is run directly.
+
+## TLS verification
+
+The panel connection is verified unless the panel explicitly says otherwise. The switch is
+per-panel, in **Settings → Agent endpoint**, and reaches the router as `TG_TLS_VERIFY`
+(`1` / `0`) injected alongside the URL and the token. It becomes the UCI option
+`tunnelgate.main.tls_verify` so heartbeats keep the same policy after the installer exits,
+and so `uci set tunnelgate.main.tls_verify=1` survives a re-install.
+
+Resolution order, in both `install.sh` and `lib/heartbeat.sh`:
+
+1. `TG_TLS_VERIFY` when it is set (the panel injected it, or the operator overrode it);
+2. otherwise `uci get tunnelgate.main.tls_verify` (read with a `sed` fallback where `uci` is
+   absent, like every other option);
+3. otherwise **verify**.
+
+Only the exact string `0` turns verification off. `1`, `yes`, `2`, `false`, `TRUE`, an empty
+value and anything else mean verify - a value we do not understand must never silently
+downgrade the connection that carries the bootstrap token and, afterwards, the API token.
+
+The flags are `-k` (curl) and `--no-check-certificate` (wget), inserted as their own argv word
+so a reader can see the check being disabled in the command they paste. Nothing else in either
+script disables certificate checking, and `http_post`/`post()` are the only call sites.
+
+When verification is off the installer logs one warning naming the host and the fix, and the
+heartbeat warns **once per boot** (sentinel file `TG_TLS_WARN_FILE`) rather than every minute.
+
+### Where "verified" is not true: OpenWrt 19.07
+
+Measured on `openwrt/rootfs:x86-64-19.07.10` with `libustream-wolfssl20150806` + `ca-bundle`:
+`uclient-fetch` **accepts a self-signed certificate**. It fetched our self-signed test panel and
+reported the panel's `401`, where 21.02.7, 22.03.7, 23.05.5 and 24.10.1 all stop with
+`Connection error: Invalid SSL certificate`. A **hostname mismatch is still caught**
+(`Server hostname does not match SSL certificate`), so the gap is specifically the chain check.
+
+So `tls_verify=1` on that generation records a promise the fetcher cannot keep. `install.sh`
+detects it (`tls_stack_cannot_verify`: fetcher is wget and `DISTRIB_RELEASE` major < 21) and logs
+a second, different warning that says so in as many words. It is not a reason to refuse the
+install - people run 19.07 - but it is a reason never to describe such a connection as
+authenticated. 21.02 is the floor for real verification, which is why the docs state it as a
+requirement.
 
 ## Conventions
 
+* **Certificate verification is on unless the panel turned it off.** `tls_verify=0` is a
+  per-panel decision made in the UI, arrives as `TG_TLS_VERIFY`, and is persisted to UCI; only
+  the exact string `0` disables it, and a malformed value verifies.
 * **POSIX sh only.** No bashisms (no `$(( ))`, no `[[ ]]`, no `function`, no arrays,
   no `local`). Both `dash` and busybox ash run every script, and the test suite checks it.
 * **Log through `log()`.** It writes to syslog as `tunnelgate` and to stderr, so the
@@ -94,14 +178,20 @@ in a temp tree during tests:
 
 ## Testing
 
-    .venv/bin/python -m pytest tests/test_installer.py -q          # 39 tests, needs root
-    .venv/bin/python -m pytest tests/test_installer.py -m e2e -q  # needs a local sshd
+    .venv/bin/python -m pytest tests/test_installer.py -q              # 62 tests, needs root
+    .venv/bin/python -m pytest tests/test_installer.py -m e2e -q      # 4 tests, needs a local sshd
+    .venv/bin/python -m pytest tests/test_installer.py -k 'not e2e' -q # 58 tests, no sshd
 
 The suite drives the shipped scripts through the `TG_*` overrides against a mock panel
 (single-use token, heartbeat, console registration) and a throwaway sshd, so it proves the
 reverse forwards really open and the console key really lands. Static classes cover `sh -n`
 under dash and busybox, the absence of bashisms, the placeholder contract and the
 embedded/standalone drift check.
+
+The fetcher and TLS behaviour is proved by recording the **real argv** of each request, not by
+grepping the source: a wrapper around the real `curl`/`wget` appends `<name> $*` to a log and
+then execs it, so the assertions see exactly the words the process received. The wget cases run
+under a session-scoped PATH clone without `curl`, which is what a stock router looks like.
 
 The scripts are also linted:
 

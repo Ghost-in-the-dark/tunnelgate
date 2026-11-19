@@ -27,6 +27,9 @@ SELF_BIN=${TG_UNINSTALL_BIN:-/usr/bin/tunnelgate-uninstall}
 STATE_DIR=${TG_STATE_DIR:-/usr/lib/tunnelgate}
 KEY_PATH=${TG_KEY_PATH:-/root/.ssh/tunnelgate_ed25519}
 CONSOLE_MARK=tunnelgate-console
+# Exactly the set agent/install.sh installs (same spelling there, so the two can be diffed).
+# openssh-client alone is NOT enough - see the measurement table in agent/install.sh.
+OPENSSH_PKGS="openssh-client openssh-keygen openssh-client-utils"
 
 DRY_RUN=0
 PURGE=0
@@ -47,7 +50,8 @@ TunnelGate router agent uninstaller.
 
   Usage: tunnelgate-uninstall [--purge] [--dry-run]
 
-    --purge      also remove openssh-client and the dedicated console user
+    --purge      also remove openssh-client, openssh-keygen, openssh-client-utils and the
+                 dedicated console user
     --dry-run    print what would be removed, change nothing
 
   Requires root. Removes the init script, the UCI config, the supervisor scripts, the state
@@ -171,15 +175,20 @@ delete_files() {
 }
 
 delete_package() {
+    # Best effort, one package at a time: a package that was never installed is not an error,
+    # and a failed removal is logged instead of aborting the purge halfway through.
     if command -v apk >/dev/null 2>&1; then
-        log "removing openssh-client via apk"
-        apk del openssh-client >/dev/null 2>&1 || log "warning: apk could not remove openssh-client"
+        for _pkg in $OPENSSH_PKGS; do
+            log "removing $_pkg via apk"
+            apk del "$_pkg" >/dev/null 2>&1 || log "warning: apk could not remove $_pkg"
+        done
     elif command -v opkg >/dev/null 2>&1; then
-        log "removing openssh-client via opkg"
-        opkg remove openssh-client >/dev/null 2>&1 ||
-            log "warning: opkg could not remove openssh-client"
+        for _pkg in $OPENSSH_PKGS; do
+            log "removing $_pkg via opkg"
+            opkg remove "$_pkg" >/dev/null 2>&1 || log "warning: opkg could not remove $_pkg"
+        done
     else
-        log "no apk or opkg found; leaving openssh-client in place"
+        log "no apk or opkg found; leaving $OPENSSH_PKGS in place"
     fi
 }
 

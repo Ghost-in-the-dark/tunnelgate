@@ -64,10 +64,10 @@ pip install -r requirements.txt -r requirements-dev.txt
 ./scripts/dev.sh                        # init db, seed admin, run on :8080
 ```
 
-Open <http://127.0.0.1:8080> and log in as `admin` / `admin-t3st-pass` (development default;
-override with `TUNNELGATE_ADMIN_PASSWORD`). The default `proxy_driver` is `none` in development,
-so routers are reachable at `http://127.0.0.1:<tunnel_port>` directly - no nginx needed to try the
-whole flow.
+Open <http://127.0.0.1:8080> and log in as `admin` / `admin-changeme-now` - the default
+[`scripts/dev.sh`](scripts/dev.sh) exports; override it with `TUNNELGATE_ADMIN_PASSWORD`. The
+default `proxy_driver` is `none` in development, so routers are reachable at
+`http://127.0.0.1:<tunnel_port>` directly - no nginx needed to try the whole flow.
 
 ```bash
 pytest -q                     # backend + installer tests
@@ -101,7 +101,7 @@ router - read [docs/SECURITY.md §6.1](docs/SECURITY.md) before adding routers y
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Ghost-in-the-dark/tunnelgate/main/scripts/update.sh \
-  | sudo sh -s -- --ref v1.1.0
+  | sudo sh -s -- --ref v1.2.0
 ```
 
 Omit `--ref` for the latest release; `--check-only` prints installed vs available and changes
@@ -134,16 +134,27 @@ docker compose up -d          # panel + nginx, see docker-compose.yml
 1. **Choose OS** - the wizard produces `sh` (OpenWrt/Linux), a FreeBSD variant, or a PowerShell
    equivalent.
 2. **Details** - friendly name (required), group, integrations.
-3. **Copy the command** - one line, no secrets beyond a single-use token:
+3. **Copy the command** - one block that works on a stock OpenWrt image, where `curl` does
+   not exist. The token rides as the basic-auth username; nothing else is a secret:
    ```sh
-   curl -fsSL -H 'X-Bootstrap-Token: <token>' 'https://panel.example.com/api/v1/routers/install?os=linux' | sh
+   TK='<token>'; U='https://panel.example.com/api/v1/routers/install?os=linux'; F=/tmp/tg-install.$$.sh
+   if command -v curl >/dev/null 2>&1; then curl -fsSL -o "$F" -u "$TK:" "$U"
+   elif command -v wget >/dev/null 2>&1; then wget -q -O "$F" --user="$TK" --password=x "$U"
+   else echo 'TunnelGate: neither curl nor wget is installed on this router' >&2; exit 1; fi
+   grep -q 'TunnelGate router agent installer' "$F" 2>/dev/null || { echo "TunnelGate: the panel did not return the installer; mint a fresh install command and retry" >&2; rm -f "$F"; exit 1; }
+   sh "$F"
    ```
+   It is fetched to a file and checked before it runs, because an expired token answers an
+   empty body and piping that into `sh` is a silent success.
 4. **Watch it connect** - the wizard polls `/api/v1/routers/{id}/status` every 2 s through
    `Waiting for connection → Connected → Receiving initial report → Done`.
 
 Then **Open LuCI** or **Console** from the router list.
 
 ## Documentation
+
+New here? [docs/INDEX.md](docs/INDEX.md) is the map: a routed path for operators,
+integrators and contributors, plus a task-to-document table.
 
 | Document | Read it when |
 |---|---|

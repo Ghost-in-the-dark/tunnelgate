@@ -516,7 +516,7 @@ function StepCommand({
   onBack: () => void
   onNext: () => void
 }) {
-  const [variant, setVariant] = useState<CommandVariant['id']>('curl')
+  const [variant, setVariant] = useState<CommandVariant['id']>('install')
   const [copied, setCopied] = useState(false)
   const { secondsLeft } = useCountdown(created.bootstrap_expires_at)
   const toast = useToast()
@@ -547,11 +547,26 @@ function StepCommand({
         Paste the command into the router&apos;s shell (SSH or LuCI → System → Terminal). It installs
         the agent, exchanges its key once and starts the tunnel.
       </p>
+      <p className="mt-2 text-xs leading-relaxed text-muted">
+        It runs on a stock OpenWrt image with no extra packages. The command picks whichever
+        fetcher the router has and tells you if it has neither - you do not need curl.
+      </p>
 
       <InlineAlert tone="warning" className="mt-3" title="This command is shown only once">
-        It contains a single-use bootstrap token that is stored on the server as a SHA-256 hash - it
-        cannot be displayed again. It contains no private key and no port number. If you lose it,
-        rotate the key to mint a new one.
+        <p>
+          It contains a single-use bootstrap token that is stored on the server as a SHA-256 hash - it
+          cannot be displayed again. It contains no private key and no port number. If you lose it,
+          rotate the key to mint a new one.
+        </p>
+        <p className="mt-2">
+          The token travels in the URL rather than in a header, because the router&apos;s fetcher has to
+          work on every OpenWrt release and older ones cannot send one. So it is also kept in the
+          router&apos;s shell history (
+          <span className="font-mono text-text">~/.ash_history</span>) and shows up in
+          <span className="font-mono text-text"> ps</span> while the command runs - acceptable only
+          because the token is single-use and expires in minutes. On a shared router, delete that line
+          from the history file afterwards.
+        </p>
       </InlineAlert>
 
       <div className="mt-4 overflow-hidden rounded-lg border border-border bg-surface">
@@ -605,10 +620,17 @@ function StepCommand({
 
       {variant === 'manual' ? (
         <p className="mt-2 text-2xs leading-relaxed text-muted">
-          The raw script is served with the token already substituted, so the token never appears in a
-          URL. Downloading it to a file and running it is equivalent to the one-liner.
+          This URL carries no token, so it can be pasted or logged safely - on its own it will not
+          install anything. Use it when you want to download the script on a machine that is not the
+          router; without the one-time token from the command above the panel refuses the request.
         </p>
-      ) : null}
+      ) : (
+        <p className="mt-2 text-2xs leading-relaxed text-muted">
+          Run the whole block, not just the first line: it downloads the script to a temporary file,
+          checks that the panel really returned the installer, and only then runs it. A rejected token
+          answers with an empty body, which is why nothing is piped straight into a shell.
+        </p>
+      )}
 
       <ol className="mt-4 space-y-1.5 rounded border border-border bg-surface/50 p-3 text-2xs leading-relaxed text-muted">
         <li className="flex gap-2">

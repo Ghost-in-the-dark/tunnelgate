@@ -13,11 +13,22 @@ ordering is deliberate: a fresh install behaves exactly as documented by its env
 operator who moves the panel - new hostname, TLS terminating in front, a non-default port - can
 re-point already-issued install scripts from the UI without touching env files or restarting.
 
-The override is stored in "panel_settings" under AGENT_ENDPOINT_KEY as JSON with three fields:
-scheme ("http" or "https"), host (no scheme, no port, no path) and port (1..65535, or null for
-the scheme default). Validation happens on the way in AND on the way out: a row written by an
-older or buggier version must not be able to produce an unparsable agent URL, so a bad row is
+The override is stored in "panel_settings" under AGENT_ENDPOINT_KEY as JSON with four fields:
+scheme ("http" or "https"), host (no scheme, no port, no path), port (1..65535, or null for the
+scheme default) and verify_tls. Validation happens on the way in AND on the way out: a row written
+by an older or buggier version must not be able to produce an unparsable agent URL, so a bad row is
 ignored with a warning and the environment value is used instead.
+
+TLS trust is carried SEPARATELY from the URL, and deliberately so. A panel behind a self-signed
+certificate is otherwise unreachable for every router: curl has no -k and uclient-fetch has no
+--no-check-certificate by default, so both refuse the connection. Folding that into the URL (as
+https+insecure or a query flag) would make the URL unpasteable and unloggable; a boolean keeps the
+address a plain string and puts the policy where it can be shown and audited.
+
+verify_tls has one normalisation rule rather than a validation error: an "http" endpoint has no
+certificate to verify, so a stored or submitted false there is reported as true. Erroring would be
+pedantic (the operator did not ask for anything impossible) and returning false would be a lie the
+UI then renders as if the connection were insecure when it is merely unencrypted.
 """
 
 from __future__ import annotations
@@ -58,6 +69,9 @@ class AgentEndpoint:
     host: str
     port: int | None
     source: str = SOURCE_ENVIRONMENT
+    # True = verify the certificate. False only ever means "the operator accepted a self-signed
+    # panel"; it is never used to skip verification on a plain http endpoint.
+    verify_tls: bool = True
 
     @property
     def effective_port(self) -> int:
@@ -78,6 +92,7 @@ class AgentEndpoint:
             "host": self.host,
             "port": self.port,
             "source": self.source,
+            "verify_tls": self.verify_tls,
         }
 
 
@@ -133,13 +148,36 @@ def _port_problem(port: int | None, scheme: str) -> str | None:
     return None
 
 
+def _verify_tls_value(value: object, scheme: str) -> bool:
+    """The stored/submitted TLS policy, after the one normalisation rule.
+
+    Absent (or unusable) means verify: a row written before this field existed, or a client that
+    never sent it, must land on the safe side. http forces true because there is no certificate -
+    see the module docstring for why that is a normalisation and not a validation error.
+    """
+    if scheme == "http":
+        return True
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    # A JSON row could hold "false"/0 from a buggier writer. Accept the unambiguous spellings and
+    # fall back to verifying for anything else, never the other way round.
+    if isinstance(value, str):
+        return value.strip().lower() not in ("false", "0", "no", "off")
+    if isinstance(value, int):
+        return bool(value)
+    return True
+
+
 def normalize(
-    scheme: str | None, host: str | None, port: int | None
+    scheme: str | None, host: str | None, port: int | None, verify_tls: object = None
 ) -> tuple[AgentEndpoint | None, dict[str, str]]:
     """Validate an endpoint and return (endpoint, {field: message}).
 
     Field keys are the JSON body names ("scheme", "host", "port") because the SPA maps them
-    straight onto its inputs.
+    straight onto its inputs. verify_tls never produces a field error: it is normalised, not
+    validated (see _verify_tls_value).
     """
     problems: dict[str, str] = {}
     scheme_text = (scheme or "").strip().lower()
@@ -167,7 +205,15 @@ def normalize(
     normalized_port = None if port is None else int(port)
     if normalized_port == DEFAULT_PORTS[scheme_text]:
         normalized_port = None
-    return AgentEndpoint(scheme_text, cleaned_host, normalized_port), {}
+    return (
+        AgentEndpoint(
+            scheme_text,
+            cleaned_host,
+            normalized_port,
+            verify_tls=_verify_tls_value(verify_tls, scheme_text),
+        ),
+        {},
+    )
 
 
 def from_panel_url(panel_url: str) -> AgentEndpoint | None:
@@ -183,6 +229,8 @@ def from_panel_url(panel_url: str) -> AgentEndpoint | None:
     port = parts.port
     if port == DEFAULT_PORTS[parts.scheme]:
         port = None
+    # The env file has no TLS-trust knob: an operator who needs to accept a self-signed panel sets
+    # it in the UI, where the change is audited. verify_tls=True here is the documented default.
     return AgentEndpoint(parts.scheme, host, port, SOURCE_ENVIRONMENT)
 
 
@@ -198,11 +246,17 @@ def _load_row(db: Session) -> AgentEndpoint | None:
     if not isinstance(data, dict):
         log.warning("ignoring %s: stored value is not an object", AGENT_ENDPOINT_KEY)
         return None
-    endpoint, problems = normalize(data.get("scheme"), data.get("host"), data.get("port"))
+    endpoint, problems = normalize(
+        data.get("scheme"), data.get("host"), data.get("port"), data.get("verify_tls")
+    )
     if endpoint is None:
         log.warning("ignoring %s: stored value is invalid (%s)", AGENT_ENDPOINT_KEY, problems)
         return None
-    return AgentEndpoint(endpoint.scheme, endpoint.host, endpoint.port, SOURCE_DATABASE)
+    # A row written by 1.0.0/1.1.0 has no verify_tls, so normalize() has already resolved it to
+    # True. Rebuilding the endpoint here keeps source=DATABASE while carrying that decision.
+    return AgentEndpoint(
+        endpoint.scheme, endpoint.host, endpoint.port, SOURCE_DATABASE, endpoint.verify_tls
+    )
 
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
@@ -267,14 +321,20 @@ def save(
     host: str,
     port: int | None,
     *,
+    verify_tls: bool | None = None,
     user=None,
 ) -> tuple[AgentEndpoint | None, dict[str, str]]:
     """Persist an override. Returns (endpoint, field problems); nothing is written on error."""
-    endpoint, problems = normalize(scheme, host, port)
+    endpoint, problems = normalize(scheme, host, port, verify_tls)
     if endpoint is None:
         return None, problems
     payload = json.dumps(
-        {"scheme": endpoint.scheme, "host": endpoint.host, "port": endpoint.port},
+        {
+            "scheme": endpoint.scheme,
+            "host": endpoint.host,
+            "port": endpoint.port,
+            "verify_tls": endpoint.verify_tls,
+        },
         sort_keys=True,
     )
     row = db.get(PanelSetting, AGENT_ENDPOINT_KEY)
@@ -287,7 +347,12 @@ def save(
     row.updated_by_id = getattr(user, "id", None)
     row.updated_by_username = getattr(user, "username", None)
     db.flush()
-    return AgentEndpoint(endpoint.scheme, endpoint.host, endpoint.port, SOURCE_DATABASE), {}
+    return (
+        AgentEndpoint(
+            endpoint.scheme, endpoint.host, endpoint.port, SOURCE_DATABASE, endpoint.verify_tls
+        ),
+        {},
+    )
 
 
 def clear(db: Session) -> bool:
@@ -300,11 +365,16 @@ def clear(db: Session) -> bool:
     return True
 
 
-def probe(url: str, timeout: float = 5.0) -> dict:
-    """One unauthenticated GET against "<url>/api/v1/health" to prove a router could reach it.
+def probe(url: str, timeout: float = 5.0, *, verify_tls: bool = True) -> dict:
+    """One unauthorised GET against "<url>/api/v1/health" to prove a router could reach it.
 
     Returns the shape the SPA's test button renders: ok, checked_url, status_code, latency_ms,
     error. Never raises: an unreachable endpoint is the answer, not a failure.
+
+    verify_tls is honoured here on purpose. The probe exists to answer "will a router reach this
+    panel", and a router configured to accept a self-signed certificate will. Verifying anyway
+    would report "unreachable" for an endpoint that works - a worse answer than no probe at all,
+    because the operator would go and change a setting that was already right.
     """
     import time
 
@@ -313,7 +383,9 @@ def probe(url: str, timeout: float = 5.0) -> dict:
     target = url.rstrip("/") + "/api/v1/health"
     started = time.monotonic()
     try:
-        response = httpx.get(target, timeout=timeout, follow_redirects=False)
+        response = httpx.get(
+            target, timeout=timeout, follow_redirects=False, verify=bool(verify_tls)
+        )
     except Exception as exc:  # network, DNS, TLS, proxy - all the same answer to the operator
         return {
             "ok": False,

@@ -11,10 +11,13 @@ because FastAPI matches routes in registration order and `/{router_id}` would ot
 
 from __future__ import annotations
 
+import json
 import logging
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Header, Request, Response
 from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel, ValidationError
 
 from ..config import utcnow
 from ..deps import DbSession, SettingsDep, client_ip
@@ -27,7 +30,13 @@ from ..schemas import (
     TunnelSpec,
     iso,
 )
-from ..security import RateLimiter, hash_token, key_fingerprint
+from ..security import (
+    WWW_AUTHENTICATE_BASIC,
+    RateLimiter,
+    basic_auth_username,
+    hash_token,
+    key_fingerprint,
+)
 from ..services import agent_endpoint
 from ..services import bootstrap as bootstrap_service
 from ..services import keys as keys_service
@@ -55,6 +64,80 @@ SCRIPT_WINDOW_SECONDS = 15 * 60
 SCRIPT_LIMITER = RateLimiter(limit=SCRIPT_LIMIT, window_seconds=SCRIPT_WINDOW_SECONDS)
 
 SCRIPT_MEDIA_TYPE = "text/x-shellscript"
+
+
+# Every 401 raised by the router-facing bootstrap routes must carry the Basic challenge, but a
+# 401 can also come from deep inside the token service (unknown, used and expired tokens all raise
+# invalid_token there). Rather than trust each call site to remember the header, the handlers
+# fail closed: any 401 leaving install_script or exchange is re-raised with the challenge added.
+def with_challenge(exc: ApiError) -> ApiError:
+    """Attach the Basic challenge to a 401 that was raised without one."""
+    if exc.status != 401 or "WWW-Authenticate" in exc.headers:
+        return exc
+    return ApiError(
+        exc.status,
+        exc.code,
+        exc.message,
+        exc.details,
+        headers={**exc.headers, "WWW-Authenticate": WWW_AUTHENTICATE_BASIC},
+    )
+
+
+def token_from_request(header_value: str | None, request: Request) -> str | None:
+    """The bootstrap token from whichever channel the caller could use.
+
+    First match wins, and the order matters: the explicit header is unambiguous, while a Basic
+    header is the only channel uclient-fetch has on OpenWrt before 24.10. The token has to be
+    resolved BEFORE anything is throttled or consumed, because the per-token quota keys on it.
+    """
+    from_header = (header_value or "").strip()
+    if from_header:
+        return from_header
+    return basic_auth_username(request.headers.get("authorization"))
+
+
+def json_object(raw: bytes) -> dict[str, Any]:
+    """Parse a request body as a JSON object, or return {} for anything that is not one.
+
+    The declared pydantic model is not used here on purpose. uclient-fetch always POSTs with
+    Content-Type: application/x-www-form-urlencoded and Transfer-Encoding: chunked, and body
+    bytes are otherwise untouched - but a body model sees that content type and answers 422
+    before the handler runs, which would make the POST path unusable on the very firmware this
+    endpoint exists to serve. Reading the bytes and decoding them ourselves accepts both the
+    declared JSON and that form-encoded wrapper, and turns every malformed body into "no report"
+    rather than a validation error.
+
+    The body is a credential channel (it may carry the token) and is never logged anywhere.
+    """
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def validated_fields(body: dict[str, Any], model: type[BaseModel]) -> dict[str, Any]:
+    """Validate the fields of `model` out of a lenient body, dropping anything that does not fit.
+
+    An over-long hostname or a negative uptime must not reject the exchange: the router is
+    reporting, not ordering, and a 422 here strands a device that already burned its token. The
+    fields that validate are kept; the rest degrade to "not reported".
+    """
+    if not body:
+        return {}
+    known = {key: body[key] for key in model.model_fields if key in body}
+    try:
+        return model.model_validate(known).model_dump(exclude_none=True)
+    except ValidationError:
+        kept: dict[str, Any] = {}
+        for key, value in known.items():
+            try:
+                kept.update(model.model_validate({key: value}).model_dump(exclude_none=True))
+            except ValidationError:
+                continue
+        return kept
 
 
 def _throttle_token(token_hash: str) -> None:
@@ -116,22 +199,32 @@ def install_script(
     request: Request,
     db: DbSession,
     settings: SettingsDep,
-    x_bootstrap_token: str | None = Header(default=None, alias="X-Bootstrap-Token"),
+    x_bootstrap_token: Annotated[str | None, Header(alias="X-Bootstrap-Token")] = None,
     os: str = "linux",
 ) -> Response:
     """Serve the installer with the panel URL and the token substituted into it.
 
     `os` selects the dialect only; the body is POSIX sh either way, which busybox ash accepts.
+
+    The token is accepted as the X-Bootstrap-Token header or as the HTTP Basic username. Stock
+    OpenWrt has no curl and its uclient-fetch only learned --header in 24.10, so for most devices
+    Basic is the only channel that exists - and every 401 here carries the challenge that makes
+    uclient-fetch retry with the credentials it already has.
     """
     ip = client_ip(request)
     _throttle(ip, "install")
-    router_row = bootstrap_service.resolve_router_for_script(db, x_bootstrap_token)
+    token = token_from_request(x_bootstrap_token, request)
+    try:
+        router_row = bootstrap_service.resolve_router_for_script(db, token)
+    except ApiError as exc:
+        raise with_challenge(exc) from None
     if os not in ("linux", "freebsd", "windows"):
         raise ApiError(400, "validation_error", "os must be one of linux, freebsd, windows")
     # Only after the token proved usable: an unknown token must not burn quota that belongs to
-    # a real one, and the digest never leaves this process.
-    _throttle_token(hash_token((x_bootstrap_token or "").strip()))
-    body = bootstrap_service.render_install_script(x_bootstrap_token or "", os, settings, db=db)
+    # a real one, and the digest never leaves this process. This keys on the RESOLVED token, so a
+    # caller cannot dodge the quota by switching from the header to Basic auth.
+    _throttle_token(hash_token(token or ""))
+    body = bootstrap_service.render_install_script(token or "", os, settings, db=db)
     db.commit()
     log.info("served install script for router %s to %s", router_row.slug, ip)
     return PlainTextResponse(
@@ -161,19 +254,31 @@ async def exchange(
     request: Request,
     db: DbSession,
     settings: SettingsDep,
-    report: BootstrapReport | None = None,
     x_bootstrap_token: str | None = Header(default=None, alias="X-Bootstrap-Token"),
 ) -> BootstrapExchangeOut:
     """Consume the token, hand the router its private key and coordinates, once."""
     ip = client_ip(request)
     _throttle(ip, "exchange")
-    router_row, private_key = bootstrap_service.exchange_token(
-        db,
-        x_bootstrap_token,
-        (report.model_dump() if report else {}),
-        ip,
-        settings=settings,
+    # The body is read once, here, because it may carry BOTH the token and the report. Parsing it
+    # by hand instead of declaring a model is deliberate: uclient-fetch always sends a form content
+    # type, and a declared model would answer 422 before this handler ever runs.
+    body = json_object(await request.body())
+    # Only a string can be a token: a JSON object in that field is a malformed request, and
+    # str()-ing it would invent a credential out of its repr.
+    body_token = body.get("bootstrap_token")
+    token = token_from_request(x_bootstrap_token, request) or (
+        body_token.strip() if isinstance(body_token, str) else None
     )
+    try:
+        router_row, private_key = bootstrap_service.exchange_token(
+            db,
+            token or None,
+            validated_fields(body, BootstrapReport),
+            ip,
+            settings=settings,
+        )
+    except ApiError as exc:
+        raise with_challenge(exc) from None
     audit_record(
         db,
         "router.exchange",

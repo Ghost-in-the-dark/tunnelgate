@@ -1,9 +1,12 @@
 """Bootstrap tokens and the install script: the router onboarding half of the API.
 
-The plaintext token exists exactly twice: in the HTTP response that created it and in the
-script body served back to the router. Everywhere else - the database, the logs, the audit
-trail - only sha256(token) appears, and the token is consumed in the same transaction that
-generates the router key pair, so two simultaneous exchanges cannot both win.
+The plaintext token exists in exactly three places, all of them the same onboarding response:
+the JSON body that created it, the "install_command" the operator pastes on the router, and the
+script body served back to the router. The install command carries it as a basic-auth username,
+because no stock OpenWrt has curl and its uclient-fetch had no --header before 24.10. Everywhere else -
+the database, the logs, the audit trail - only sha256(token) appears, and the token is consumed
+in the same transaction that generates the router key pair, so two simultaneous exchanges
+cannot both win.
 """
 
 from __future__ import annotations
@@ -28,6 +31,23 @@ log = logging.getLogger(__name__)
 AGENT_DIR = Path(__file__).resolve().parent.parent.parent / "agent"
 INSTALL_SCRIPT_PATH = AGENT_DIR / "install.sh"
 SCRIPT_CONTENT_TYPE = "text/x-shellscript; charset=utf-8"
+
+# The installer's own second line, in agent/install.sh. The install command greps the fetched
+# body for it before running anything: a 401, a captive portal or an "nginx welcome" page all
+# answer a body that is not the installer, and piping that into sh is silently a no-op. This is
+# a cross-file contract - agent/install.sh must keep the line, and the panel test that reads the
+# shipped script asserts it does.
+INSTALL_SENTINEL = "TunnelGate router agent installer"
+
+# $$ is the shell's own PID, so two installs running on one router cannot clobber each other.
+INSTALL_TMP_PATH = "/tmp/tg-install.$$.sh"
+
+# A NON-EMPTY, obviously-fake password for the wget branch. uclient-fetch builds its Authorization
+# payload by joining user and password with a colon, and drops the colon entirely when the password
+# is empty - it then sends base64(TOKEN) with no colon, which every RFC 7617 parser may reject. The
+# panel never looks at the password half (app/security.py::basic_auth_username) so this value is a
+# formality, not a secret; it is deliberately short and meaningless so nobody mistakes it for one.
+INSTALL_AUTH_PASSWORD = "x"
 
 PURPOSE_INSTALL = "install"
 PURPOSE_ROTATE = "rotate"
@@ -171,18 +191,86 @@ def _agent_base(db=None, settings: Settings | None = None) -> str:
     return agent_endpoint.agent_url(db, settings or get_settings())
 
 
-def build_install_command(token: str, settings: Settings | None = None, *, db=None) -> str:
-    """The one-liner an operator pastes on the router.
+def install_script_url(settings: Settings | None = None, *, db=None) -> str:
+    """The bare, token-less installer URL: the manual path, and what the UI shows as the source.
 
-    The token travels in a header, never in the URL: a URL ends up in access logs, in shell
-    history and in ps output, and this token is a one-shot credential to become a router.
+    Handing this out with no token is deliberate - it is a pointer to the endpoint, not a
+    credential, so it is safe for the operator to read, paste or log.
+    """
+    return f"{_agent_base(db, settings)}/api/v1/routers/install?os=linux"
+
+
+def _tls_verifying(db=None, settings: Settings | None = None) -> bool:
+    """Whether the router should verify the panel certificate: the effective endpoint's policy.
+
+    Defaults to True when no endpoint can be resolved, because the safe side of this switch is
+    verifying: a missing setting must never silently turn certificate checks off.
+    """
+    endpoint = agent_endpoint.effective(db, settings or get_settings())
+    return True if endpoint is None else endpoint.verify_tls
+
+
+def build_install_command(token: str, settings: Settings | None = None, *, db=None) -> str:
+    """The command an operator pastes on the router: probe the fetcher, fetch, verify, run.
+
+    Why this shape, and not the obvious "curl -fsSL -H ... | sh":
+
+    * curl does not exist on stock OpenWrt of any generation, and its /usr/bin/wget is a symlink
+      to uclient-fetch, which had no --header before 24.10. A header-carrying curl one-liner
+      therefore cannot work on a stock router at all.
+    * The token rides as the basic-auth USERNAME for both fetchers, with a non-empty placeholder
+      password. This is not a style choice, it is what a stock router demands: uclient-fetch is a
+      challenge-response client that sends no Authorization on the first request, retries only
+      after our 401 + WWW-Authenticate challenge, and drops the user:password colon when the
+      password is empty or absent. Measured on 19.07.10 / 22.03.7 / 23.05.5 / 24.10.1 through a
+      logging proxy: an empty password sends base64(TOKEN) with no colon and the panel answers
+      401; a non-empty one sends base64(TOKEN:x) and the panel answers 200 with the installer.
+    * NOT URL userinfo any more: GNU wget 1.25 rejects a userinfo URL outright (exit 6), and both
+      fetchers already accept --user, so the token has one channel instead of two.
+    * The fetcher is chosen with if/elif, never "curl ... || wget ...": a failed curl must not
+      fire a second request, because every render burns the same per-token quota.
+    * The body is fetched to a file, grepped for the installer's sentinel and only then run. A
+      401 answers an empty body, and "| sh" on it is a silent success that leaves the operator
+      staring at a router that never dials in. uclient-fetch exits 0 on an HTTP error, so the
+      sentinel check - not the fetch status - is what distinguishes the installer from any body.
+    * When the panel is behind a self-signed certificate the operator has explicitly accepted
+      (Settings > Agent endpoint), the fetchers get -k / --no-check-certificate and the command
+      opens with one comment line saying so. Without it the very first fetch fails and the
+      router can never be installed. The flags are written explicitly rather than as -fsSLk:
+      a reader must be able to see the certificate check being switched off in the command they
+      paste, and copy back exactly what they ran when they ask for help.
     """
     url = f"{_agent_base(db, settings)}/api/v1/routers/install?os=linux"
-    return f"curl -fsSL -H 'X-Bootstrap-Token: {token}' '{url}' | sh"
-
-
-def install_script_url(settings: Settings | None = None, *, db=None) -> str:
-    return f"{_agent_base(db, settings)}/api/v1/routers/install?os=linux"
+    verify_tls = _tls_verifying(db, settings)
+    # curl: -k is its own argument so it is greppable; wget/uclient-fetch wants the long form.
+    curl_flags = "-fsSL -k" if not verify_tls else "-fsSL"
+    wget_flags = "-q --no-check-certificate" if not verify_tls else "-q"
+    lines = []
+    if not verify_tls:
+        lines.append(
+            "# TLS certificate verification is OFF for this panel (Settings > Agent endpoint)."
+        )
+    # The token is quoted for the shell, not spliced into the URL: it must survive as one word
+    # even if a future token alphabet brought in a quote or a space.
+    lines += [
+        f"TK={keys_service.shell_quote(token)}; U={keys_service.shell_quote(url)};"
+        f" F={INSTALL_TMP_PATH}",
+        # One probe, one request. An "else" that merely warns is not enough: the operator
+        # needs to know the router has neither fetcher, which is unusual but possible on a
+        # stripped image, so this exits non-zero with a next step.
+        # curl's "TOKEN:" sends base64(TOKEN:) - preemptively, no challenge round trip.
+        f'if command -v curl >/dev/null 2>&1; then curl {curl_flags} -o "$F" -u "$TK:" "$U"',
+        # The placeholder password exists only to keep uclient-fetch's colon; see
+        # INSTALL_AUTH_PASSWORD. --user alone would also drop it.
+        f'elif command -v wget >/dev/null 2>&1; then wget {wget_flags} -O "$F"'
+        f' --user="$TK" --password={INSTALL_AUTH_PASSWORD} "$U"',
+        "else echo 'TunnelGate: neither curl nor wget is installed on this router' >&2; exit 1; fi",
+        f"grep -q '{INSTALL_SENTINEL}' \"$F\" 2>/dev/null || {{"
+        ' echo "TunnelGate: the panel did not return the installer; mint a fresh install'
+        ' command and retry" >&2; rm -f "$F"; exit 1; }',
+        'sh "$F"',
+    ]
+    return "\n".join(lines)
 
 
 def load_install_script() -> str:
@@ -213,14 +301,25 @@ def render_install_script(
     """
     body = load_install_script()
     base = _agent_base(db, settings)
+    # Always emitted, never omitted when it is 1: the agent reads TG_TLS_VERIFY unconditionally,
+    # so its absence would be indistinguishable from "the panel is older than this field".
+    tls_verify = "1" if _tls_verifying(db, settings) else "0"
     header = "\n".join(
         [
             "# --- injected by the panel ---",
             f"TG_PANEL_URL={keys_service.shell_quote(base)}",
             f"TG_BOOTSTRAP_TOKEN={keys_service.shell_quote(token)}",
             f"TG_OS_TYPE={keys_service.shell_quote(os_type)}",
+            f"TG_TLS_VERIFY={keys_service.shell_quote(tls_verify)}",
             "# ------------------------------",
             "",
         ]
     )
-    return header + body
+    # The shebang (line 1) and the installer's identifying comment (line 2) must stay the file's
+    # first two lines: the kernel only honours a shebang at offset 0, so a served script that
+    # starts with the injected block is not executable as a file - and the failure is silent,
+    # because the caller's shell happily interprets it. Putting the header after those two lines
+    # also keeps the installer's own head-check (agent/install.sh::check_self) correct by
+    # construction: the sentinel it greps for is then on line 2, not buried under the header.
+    shebang, ident, rest = body.split("\n", 2)
+    return f"{shebang}\n{ident}\n{header}{rest}"

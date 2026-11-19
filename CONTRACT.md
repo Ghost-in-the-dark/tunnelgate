@@ -31,7 +31,7 @@ Each module exposes `router = APIRouter(...)`. `app/main.py` already imports the
 |---|---|---|
 | `app/api/auth.py` | `/api/auth` | `POST /login`, `POST /logout`, `GET /me`, `POST /password` |
 | `app/api/routers.py` | `/api/v1/routers` | `POST /`, `GET /`, `GET /{router_id}`, `PATCH /{router_id}`, `DELETE /{router_id}`, `POST /{router_id}/rotate-key`, `GET /{router_id}/status`, `GET /{router_id}/script` |
-| `app/api/bootstrap.py` | `/api/v1/routers` | `POST /bootstrap/exchange` (header `X-Bootstrap-Token`), `GET /install` (header `X-Bootstrap-Token`, query `os=linux`) |
+| `app/api/bootstrap.py` | `/api/v1/routers` | `POST /bootstrap/exchange`, `GET /install` (query `os=linux`); both take the token as `X-Bootstrap-Token`, the HTTP Basic username, or a body field - see the module docstring for why all three exist |
 | `app/api/heartbeat.py` | `/api/v1/routers` | `POST /{router_id}/heartbeat` (header `X-Api-Token`) |
 | `app/api/audit.py` | `/api/v1/audit` | `GET /` (filters router_id, actor, action, limit, offset) |
 | `app/api/users.py` | `/api/v1/users` | `GET /`, `POST /`, `PATCH /{user_id}`, `DELETE /{user_id}` (admin only) |

@@ -3,8 +3,20 @@
 #
 # This script is served BY THE PANEL and is the only thing an operator runs on the router:
 #
-#   wget -qO- --header='X-Bootstrap-Token: <token>' \
-#       https://panel.example.com/api/v1/routers/install | sh
+#   TK='<token>'; U='https://panel.example.com/api/v1/routers/install?os=linux'; F=/tmp/tg-install.$$.sh
+#   if command -v curl >/dev/null 2>&1; then curl -fsSL -o "$F" -u "$TK:" "$U"
+#   elif command -v wget >/dev/null 2>&1; then wget -q -O "$F" --user="$TK" --password=x "$U"
+#   else echo 'TunnelGate: neither curl nor wget is installed on this router' >&2; exit 1; fi
+#   grep -q 'TunnelGate router agent installer' "$F" || { rm -f "$F"; exit 1; }
+#   sh "$F"
+#
+# Fetch to a file and check it before running it: piping straight into sh would turn the empty
+# body of a 401 into a silent success. The token rides as the basic-auth USERNAME, which is the
+# only credential channel both fetchers honour (stock /usr/bin/wget is uclient-fetch: no
+# --header before 24.10, and no retry of a challenged POST, so --password alone cannot carry
+# it). The placeholder password exists to keep the colon in base64(TOKEN:x) - uclient-fetch drops
+# it when the password is empty or absent. The token does land in the router shell history; it
+# is single-use and short-lived.
 #
 # The server substitutes two placeholder lines before serving it. They must appear exactly
 # once each, alone on their line, and are the ONLY channel through which the panel URL and
@@ -16,6 +28,11 @@
 #
 # The exchange response carries the router's new ed25519 PRIVATE key exactly once. It is
 # written straight to a 0600 file and never echoed, logged or passed on a command line.
+#
+# TLS: the panel injects TG_TLS_VERIFY together with the URL and the token (1 = verify,
+# 0 = accept a certificate that does not chain to a trusted CA, i.e. a self-signed panel
+# certificate). It is the ONLY source of -k / --no-check-certificate in this script: nothing
+# here disables certificate checking globally, and a value that is not exactly "0" verifies.
 #
 # Why the agent does not use autossh: another package on top of a firmware upgrade, and no
 # control over the reconnect policy. procd already supervises processes, so a plain loop with
@@ -41,12 +58,59 @@ UNINSTALL_BIN="${TG_UNINSTALL_BIN:-/usr/bin/tunnelgate-uninstall}"
 SKIP_SERVICE="${TG_SKIP_SERVICE:-0}"
 DEF_RESPONSE="/tmp/tunnelgate-exchange.$$"
 DEF_BODY="/tmp/tunnelgate-report.$$"
+# Where http_post leaves the fetcher's complaint (it runs in a command substitution, so it
+# cannot return a variable); do_exchange turns that line into an actionable error.
+HTTP_ERR_FILE="/tmp/tunnelgate-fetch-err.$$"
 
 MODE="install"
 DRY_RUN=0
 PURGE=0
 RESPONSE_FILE="$DEF_RESPONSE"
 BODY_FILE="$DEF_BODY"
+
+# The HTTP fetcher, probed ONCE (http_post explains why the two are not interchangeable).
+# Values: curl | wget | none. Stock OpenWrt has no curl at all and its wget is uclient-fetch;
+# "none" is a stripped image that cannot reach the panel on its own.
+FETCHER=""
+detect_fetcher() {
+    if command -v curl >/dev/null 2>&1; then
+        FETCHER=curl
+    elif command -v wget >/dev/null 2>&1; then
+        FETCHER=wget
+    else
+        FETCHER=none
+    fi
+}
+
+# TLS policy for the panel connection.
+#
+# The panel injects TG_TLS_VERIFY as a shell assignment (1 = verify, 0 = the panel's certificate
+# cannot be validated against the system CA store). A saved script re-run by hand has the value
+# baked in; when it is absent, the UCI option this installer wrote is used instead, so
+# 'uci set tunnelgate.main.tls_verify=0' survives a re-install.
+#
+# ONLY the exact string "0" turns verification off. "1", "yes", "2", "false", "" and anything
+# else mean VERIFY: a value we do not understand must never silently downgrade the connection
+# that carries the bootstrap token and, afterwards, the API token.
+TLS_VERIFY=1
+
+# The raw option from the config file (empty when it is not there yet).
+config_tls_verify() {
+    sed -n "s/^[[:space:]]*option[[:space:]]*tls_verify[[:space:]]*'\(.*\)'[[:space:]]*$/\1/p" \
+        "$CONFIG" 2>/dev/null | head -n 1
+}
+
+resolve_tls_verify() {
+    _v=${TG_TLS_VERIFY:-}
+    if [ -z "$_v" ]; then
+        _v=$(config_tls_verify)
+    fi
+    if [ "$_v" = "0" ]; then
+        TLS_VERIFY=0
+    else
+        TLS_VERIFY=1
+    fi
+}
 
 log() {
     logger -t tunnelgate "$*" 2>/dev/null
@@ -69,7 +133,8 @@ TunnelGate router installer.
     --status      print service state and the installed UCI configuration
     --restart     restart both procd instances
     --uninstall   stop and remove the agent (keeps the panel-side router record)
-    --purge       with --uninstall: also remove openssh-client
+    --purge       with --uninstall: also remove openssh-client, openssh-keygen and
+                  openssh-client-utils (the packages this script may have installed)
     --dry-run     print what would happen; touches neither the filesystem nor the API
 
   Requires root. TG_FORCE=1 skips the OpenWrt check (development/testing only).
@@ -80,7 +145,8 @@ USAGE
 }
 
 cleanup() {
-    rm -f "$DEF_RESPONSE" "$DEF_BODY"
+    rm -f "$DEF_RESPONSE" "$DEF_BODY" "$HTTP_ERR_FILE"
+    rm -rf "${TMPDIR:-/tmp}/tg-probe.$$" 2>/dev/null
 }
 
 trap cleanup EXIT INT TERM
@@ -124,6 +190,28 @@ check_openwrt() {
     fi
     [ -r /etc/openwrt_release ] ||
         err "this does not look like OpenWrt (/etc/openwrt_release is missing); set TG_FORCE=1 only for testing"
+}
+
+# A body that is not this script (a 401 page, a captive-portal splash, an HTML error page) must
+# never be half-executed. The panel's install command fetches to a file and greps for the
+# sentinel before running it; this is the same guard from inside the file. Piped into a shell
+# there is nothing to read back and $0 names the shell itself, so that case is skipped.
+#
+# The sentinel is NOT on line 2 of a served script: app/services/bootstrap.py::render_install_script
+# prepends a header of TG_* assignments (six lines today, and it may grow), which pushes this
+# file's own header down. Scanning a fixed two lines therefore rejected every real install -
+# the panel-side grep searched the whole body and passed, and then the script refused itself.
+# Scan a generous window of the TOP of the file instead: it stays cheap on a router, it does not
+# care how many lines the panel injects, and a line far down a captive-portal page cannot vouch
+# for the file (the whole point is that the installer starts with its own header).
+SELF_SCAN_LINES=40
+check_self() {
+    case "$0" in
+    "" | sh | -sh | dash | ash | bash | busybox) return 0 ;;
+    esac
+    [ -r "$0" ] || return 0
+    head -n "$SELF_SCAN_LINES" "$0" 2>/dev/null | grep -q 'TunnelGate router agent installer' && return 0
+    err "$0 does not look like the TunnelGate installer (its header line is missing): the panel did not return the script, so mint a fresh install command and retry"
 }
 
 # The two placeholder lines are substituted by the server. When they are still verbatim
@@ -181,27 +269,215 @@ run_cmd() {
 # dropbear cannot enforce per-key permitlisten restrictions and its -R handling is
 # unreliable, so the agent runs OpenSSH's client. (The console channel goes the other way:
 # the panel connects INTO dropbear, which needs nothing from us beyond a public key.)
+# dropbear cannot enforce per-key permitlisten restrictions and its -R handling is
+# unreliable, so the agent runs OpenSSH's client. (The console channel goes the other way:
+# the panel connects INTO dropbear, which needs nothing from us beyond a public key.)
+#
+# DETECTING it is the hard part, because a stock OpenWrt lies about it - measured on
+# openwrt/rootfs:x86-64 19.07.10 / 22.03.7 / 23.05.5 / 24.10.1 / SNAPSHOT:
+#
+#   /usr/bin/ssh        -> /usr/sbin/dropbear   on ALL of them
+#   /usr/bin/ssh-keygen -> /usr/sbin/dropbear   on 24.10 and SNAPSHOT (absent on the older ones)
+#   /usr/bin/ssh-keyscan                        absent on all of them
+#
+# so "command -v ssh" succeeds everywhere and proves nothing, and even "command -v ssh-keygen"
+# is satisfied by dropbear on 24.10. Worse, dropbear's ssh-keygen impersonation cannot read an
+# OpenSSH private key - it prints "Exited: String too long" AND EXITS 0, so an exit-code check
+# reports success on a key that nothing can use.
+#
+# Hence one probe per capability the agent actually needs, and the keygen one is FUNCTIONAL:
+# real OpenSSH prints "ssh-ed25519 ..." for the known key below, dropbear prints nothing.
+#
+# ALSO: "opkg install openssh-client" is NOT enough. Measured file lists on 23.05.5:
+#   openssh-client       -> /usr/libexec/ssh-openssh, /etc/ssh/ssh_config  (no keygen, no keyscan)
+#   openssh-keygen       -> /usr/libexec/ssh-keygen-openssh               (repoints /usr/bin/ssh-keygen)
+#   openssh-client-utils -> /usr/bin/ssh-keyscan, ssh-agent, ssh-keysign, ssh-add
+# apk (24.10-era SNAPSHOT and later, apk-tools 3.0.5) carries the same three packages with the
+# same split. With only openssh-client installed, the install dies later at pin_host_key
+# ("ssh-keyscan is missing") and at install_private_key ("not usable by ssh-keygen").
+
+# probe_openssh <capability>: 0 when the capability really works. No output, no leftovers.
+# ssh-keygen is probed by GENERATING a key, never by testing a fixture we ship: this script is
+# served to every router, so it must not carry key material (a test enforces that), and
+# generation is a stronger test anyway. On every stock image /usr/bin/ssh-keygen is a symlink to
+# dropbear, which cannot write an OpenSSH-format key; OpenSSH's own can. Reading the result back
+# with -y proves the read path install_private_key() depends on, and grepping the header pins the
+# FORMAT so a non-OpenSSH keygen that happens to emit PKCS#8 still fails.
+probe_openssh() {
+    case "$1" in
+    ssh)
+        ssh -V 2>&1 | grep -q 'OpenSSH_'
+        return $?
+        ;;
+    ssh-keygen)
+        _probe_dir="${TMPDIR:-/tmp}/tg-probe.$$"
+        _probe_ok=1
+        if mkdir -p "$_probe_dir" 2>/dev/null &&
+            (umask 077; ssh-keygen -q -t ed25519 -N '' -f "$_probe_dir/probe") >/dev/null 2>&1 &&
+            head -n 1 "$_probe_dir/probe" 2>/dev/null | grep -q 'OPENSSH PRIVATE KEY' &&
+            ssh-keygen -y -f "$_probe_dir/probe" 2>/dev/null | grep -q '^ssh-ed25519 '; then
+            _probe_ok=0
+        fi
+        rm -rf "$_probe_dir" 2>/dev/null
+        return "$_probe_ok"
+        ;;
+    ssh-keyscan)
+        command -v ssh-keyscan >/dev/null 2>&1
+        return $?
+        ;;
+    esac
+    return 1
+}
+
+# The capabilities that do not hold, each already naming the package that supplies it.
+# Empty output means the OpenSSH client is fully usable.
+openssh_gaps() {
+    _gaps=""
+    probe_openssh ssh ||
+        _gaps="ssh is not OpenSSH (it is dropbear) - needs openssh-client"
+    probe_openssh ssh-keygen ||
+        _gaps="${_gaps:+${_gaps}; }ssh-keygen cannot read an OpenSSH private key - needs openssh-keygen"
+    probe_openssh ssh-keyscan ||
+        _gaps="${_gaps:+${_gaps}; }ssh-keyscan is missing - needs openssh-client-utils"
+    printf '%s' "$_gaps"
+}
+
 ensure_openssh() {
-    if command -v ssh >/dev/null 2>&1; then
-        log "openssh-client present"
+    _gaps=$(openssh_gaps)
+    if [ -z "$_gaps" ]; then
+        log "OpenSSH client present (ssh, ssh-keygen and ssh-keyscan all work)"
         return 0
     fi
     _pkg=$(detect_pkg_manager)
+    if [ "$DRY_RUN" = "1" ]; then
+        log "dry-run: OpenSSH is not usable ($_gaps); would install openssh-client openssh-keygen openssh-client-utils via $_pkg"
+        return 0
+    fi
+    log "OpenSSH is not usable: $_gaps"
     case "$_pkg" in
     apk)
-        log "installing openssh-client via apk"
-        run_cmd apk add --no-cache openssh-client || err "apk failed to install openssh-client"
+        log "installing openssh-client openssh-keygen openssh-client-utils via apk"
+        run_cmd apk add --no-cache openssh-client openssh-keygen openssh-client-utils ||
+            log "warning: apk reported a failure; re-probing before giving up"
         ;;
     opkg)
-        log "installing openssh-client via opkg"
+        # /var/lock and /var/run are tmpfs on a booted router; a bare container (or an image
+        # being repaired over a serial console) has neither, and opkg then dies before
+        # downloading anything: "opkg_conf_load: Could not create lock file /var/lock/opkg.lock".
+        mkdir -p /var/lock /var/run 2>/dev/null || true
+        log "installing openssh-client openssh-keygen openssh-client-utils via opkg"
         run_cmd opkg update || log "warning: opkg update failed, trying the install anyway"
-        run_cmd opkg install openssh-client || err "opkg failed to install openssh-client"
+        run_cmd opkg install openssh-client openssh-keygen openssh-client-utils ||
+            log "warning: opkg reported a failure; re-probing before giving up"
         ;;
-    *) err "no apk or opkg found; cannot install openssh-client" ;;
+    *)
+        err "no apk or opkg found; cannot install the OpenSSH client ($_gaps)"
+        ;;
     esac
-    [ "$DRY_RUN" = "1" ] || command -v ssh >/dev/null 2>&1 ||
-        err "openssh-client installed but ssh is still missing"
-    log "openssh-client ready"
+    # Re-probe rather than trust the package manager: only the probes know whether the
+    # binaries now on PATH can do the work.
+    _gaps=$(openssh_gaps)
+    [ -z "$_gaps" ] ||
+        err "OpenSSH is still not usable after installing the packages: $_gaps. Install the named package by hand and re-run the installer"
+    log "OpenSSH client ready (ssh, ssh-keygen and ssh-keyscan all work)"
+}
+
+# Stock wget is uclient-fetch, and uclient-fetch does TLS through a SEPARATE package:
+# /lib/libustream-ssl.so, shipped by one of libustream-wolfssl / libustream-openssl /
+# libustream-mbedtls (suffixed with the ABI date on 19.07: libustream-wolfssl20150806).
+# Without it uclient-fetch still parses a URL, still lists --no-check-certificate in its help -
+# and then fails the only request that matters:
+#
+#   wget: SSL support not available, please install one of the libustream-.*[ssl|tls] packages
+#
+# Measured: 19.07.10 ships no libustream at all; 22.03.7 / 23.05.5 / 24.10.1 / SNAPSHOT do.
+# On 19.07, "opkg install libustream-wolfssl" (the UNVERSIONED name) resolves to the
+# versioned package and makes https work - measured, and true on 22.03 through SNAPSHOT too,
+# so the unversioned name is used first and a glob is the fallback rather than the reverse.
+#
+# This cannot rescue the panel-minted command itself (that fetch runs before this file is
+# downloaded), so the installer only guarantees the same capability for everything it starts:
+# the exchange over https and, more importantly, the heartbeat that runs forever afterwards.
+# 0 when https will fail because the fetcher has no TLS library behind it, i.e. when there is
+# something to install. Returns 1 (nothing to do) for plain http, for fetchers that link their
+# own TLS, and - importantly - when a libustream variant is ALREADY installed: images ship
+# libustream-mbedtls, and installing libustream-wolfssl next to it is a file clash, not an
+# improvement.
+needs_tls_lib() {
+    case "${TG_PANEL_URL:-}" in
+    https://*) ;;
+    *) return 1 ;; # plain http needs no certificate at all
+    esac
+    case "$FETCHER" in
+    wget) ;;
+    # curl and GNU wget link their own TLS; uclient-fetch does not. Only wget is in question,
+    # and only because on OpenWrt wget IS uclient-fetch.
+    *) return 1 ;;
+    esac
+    if [ -r /lib/libustream-ssl.so ] || [ -r /usr/lib/libustream-ssl.so ]; then
+        return 1 # a TLS-capable libustream is already there; any variant is enough
+    fi
+    return 0
+}
+
+ensure_tls_lib() {
+    needs_tls_lib || return 0
+    # Only reachable when the panel URL is https, the fetcher is uclient-fetch and the
+    # library is absent - i.e. the one state measured on 19.07.
+    _tls_pkg=$(detect_pkg_manager)
+    if [ "$DRY_RUN" = "1" ]; then
+        log "dry-run: uclient-fetch has no TLS support; would install libustream via $_tls_pkg"
+        return 0
+    fi
+    log "wget on this router is uclient-fetch without a TLS package: installing libustream so https works"
+    case "$_tls_pkg" in
+    opkg)
+        mkdir -p /var/lock /var/run 2>/dev/null || true
+        run_cmd opkg update || log "warning: opkg update failed, trying the install anyway"
+        # Unversioned first: it resolves on 19.07 (20150806) and on 21.02+ (20201210).
+        if ! run_cmd opkg install libustream-wolfssl; then
+            _tls_name=$(opkg list 2>/dev/null | sed -n 's/^\(libustream-[a-z]*\)[0-9].*/\1/p' | head -n 1)
+            if [ -n "$_tls_name" ]; then
+                run_cmd opkg install "$_tls_name" ||
+                    log "warning: could not install $_tls_name"
+            else
+                log "warning: opkg offers no libustream package; https will not work on this image"
+            fi
+        fi
+        ;;
+    apk)
+        run_cmd apk add --no-cache libustream-wolfssl ||
+            log "warning: could not install libustream-wolfssl"
+        ;;
+    *)
+        log "warning: no apk or opkg found; cannot install a TLS package for uclient-fetch"
+        ;;
+    esac
+    if needs_tls_lib; then
+        err "wget on this router still has no TLS support, so ${TG_PANEL_URL:-the panel} cannot be reached over https: install one of the libustream-*ssl packages (opkg install libustream-wolfssl, which is libustream-wolfssl20150806 on 19.07) and re-run. Alternatively set the panel agent endpoint to http"
+    fi
+}
+
+# 0 when this image's uclient-fetch CANNOT validate a certificate chain, whatever tls_verify
+# says. MEASURED, not assumed: on 19.07.10 with libustream-wolfssl20150806 + ca-bundle installed,
+# uclient-fetch ACCEPTS a self-signed certificate (it fetched our self-signed test panel and
+# answered 401, where 21.02.7, 22.03.7, 23.05.5 and 24.10.1 all answer "Connection error: Invalid
+# SSL certificate"), while a hostname mismatch IS still caught. So on that generation
+# tls_verify=1 does not mean "the chain was checked", and saying it does would be a lie. 19.07 is
+# below the supported floor (21.02) but people run it, so say what is true rather than refuse.
+tls_stack_cannot_verify() {
+    case "$FETCHER" in
+    wget) ;;
+    *) return 1 ;; # curl links its own SSL and does validate
+    esac
+    _rel=$(detect_openwrt_version)
+    [ -n "$_rel" ] || return 1
+    _major=${_rel%%.*}
+    case "$_major" in
+    [0-9]*) ;;
+    *) return 1 ;;
+    esac
+    [ "$_major" -lt 21 ] 2>/dev/null
 }
 
 # --------------------------------------------------------------------------------------
@@ -578,6 +854,9 @@ write_heartbeat_bin() {
 #     UCI is behind the serial shipped by the panel, rewrite the tunnelgate-console line in
 #     /etc/dropbear/authorized_keys, bump the stored serial and report console_installed.
 #
+# TLS: the panel connection is verified unless tls_verify is exactly "0" (a self-signed panel
+# certificate). Only that option adds -k / --no-check-certificate.
+#
 # The console key pair is created lazily by the panel the first time an operator opens a
 # console, so the installer cannot know the public half - this loop is the delivery channel.
 
@@ -590,6 +869,15 @@ DEFAULT_KEYS=${TG_KEYS:-/etc/dropbear/authorized_keys}
 TMP_BODY=/tmp/tunnelgate-heartbeat-body.$$
 RESPONSE=/tmp/tunnelgate-heartbeat-response.$$
 CONSOLE_MARK=tunnelgate-console
+
+# The fetcher is probed once, for the same reason as in install.sh: stock OpenWrt has no curl,
+# and its uclient-fetch has no --header before 24.10.
+FETCHER=""
+if command -v curl >/dev/null 2>&1; then
+    FETCHER=curl
+elif command -v wget >/dev/null 2>&1; then
+    FETCHER=wget
+fi
 
 umask 077
 trap 'rm -f "$TMP_BODY" "$RESPONSE"' EXIT INT TERM
@@ -630,6 +918,24 @@ else
     json_get() { return 2; }
 fi
 
+# TLS policy for the panel connection (see docs/INSTALL_ROUTER.md).
+#
+# TG_TLS_VERIFY wins when the installer started this process; at runtime the UCI option the
+# installer wrote is the source of truth, so 'uci set tunnelgate.main.tls_verify=0' plus
+# '/etc/init.d/tunnelgate restart' changes the behaviour without re-installing.
+#
+# ONLY the exact string "0" disables verification: "1", "yes", "2", "false", "" and anything
+# else mean VERIFY, because a value we do not understand must not downgrade the connection that
+# carries the API token.
+TLS_VERIFY=1
+_tls_value=${TG_TLS_VERIFY:-}
+if [ -z "$_tls_value" ]; then
+    _tls_value=$(cfg_get tls_verify)
+fi
+if [ "$_tls_value" = "0" ]; then
+    TLS_VERIFY=0
+fi
+
 cfg_set() {
     if command -v uci >/dev/null 2>&1; then
         uci -q set "tunnelgate.main.$1=$2" && uci -q commit tunnelgate
@@ -656,20 +962,57 @@ json_quote() {
 
 # post <url> <token> <body-file> <output-file> -> HTTP status on stdout ("" when unreachable)
 post() {
-    if command -v curl >/dev/null 2>&1; then
-        curl -q -sS -o "$4" -w '%{http_code}' --max-time 30 -X POST \
+    _tg_url=$1
+    _tg_token=$2
+    _tg_body=$3
+    _tg_out=$4
+
+    rm -f "$_tg_out" 2>/dev/null
+
+    case "$FETCHER" in
+    curl)
+        # -k only when tls_verify is exactly 0; there is no global switch.
+        _tg_k=""
+        if [ "$TLS_VERIFY" = "0" ]; then
+            _tg_k="-k"
+        fi
+        _tg_code=$(curl -q -sS ${_tg_k:+"$_tg_k"} -o "$_tg_out" -w '%{http_code}' --max-time 30 -X POST \
             -H "Content-Type: application/json" \
-            -H "X-Api-Token: $2" \
-            --data-binary "@$3" \
-            "$1" 2>/dev/null
+            -H "X-Api-Token: $_tg_token" \
+            -u "$_tg_token:" \
+            --data-binary "@$_tg_body" \
+            "$_tg_url" 2>/dev/null)
+        case "$_tg_code" in
+        000 | "") return 0 ;;
+        *)
+            printf '%s' "$_tg_code"
+            return 0
+            ;;
+        esac
+        ;;
+    wget)
+        _tg_err="$_tg_out.err.$$"
+        _tg_ncc=""
+        if [ "$TLS_VERIFY" = "0" ]; then
+            _tg_ncc="--no-check-certificate"
+        fi
+        wget -O "$_tg_out" ${_tg_ncc:+"$_tg_ncc"} --post-file="$_tg_body" --timeout=30 "$_tg_url" 2>"$_tg_err"
+        _tg_rc=$?
+        _tg_code=$(sed -n \
+            -e 's/.*HTTP error \([0-9][0-9][0-9]\).*/\1/p' \
+            -e 's/.*awaiting response\.\.\. \([0-9][0-9][0-9]\).*/\1/p' \
+            -e 's/.*ERROR \([0-9][0-9][0-9]\).*/\1/p' \
+            "$_tg_err" 2>/dev/null | tail -n 1)
+        rm -f "$_tg_err"
+        if [ -n "$_tg_code" ]; then
+            printf '%s' "$_tg_code"
+            return 0
+        fi
+        [ "$_tg_rc" = "0" ] && printf '200'
         return 0
-    fi
-    wget -q -O "$4" \
-        --header "Content-Type: application/json" \
-        --header "X-Api-Token: $2" \
-        --post-file="$3" \
-        --timeout=30 -S "$1" 2>&1 |
-        sed -n 's/.*HTTP\/1\.[01] \([0-9][0-9][0-9]\).*/\1/p' | tail -n 1
+        ;;
+    esac
+    return 1
 }
 
 # send_heartbeat [console_installed_flag] -> prints HTTP status
@@ -693,6 +1036,8 @@ send_heartbeat() {
         printf ',"client_version":%s' "$(json_quote "$CLIENT_VERSION")"
         [ -n "$_tunnel_pid" ] && printf ',"tunnel_pid":%s' "$_tunnel_pid"
         [ "$1" = "1" ] && printf ',"console_installed":true'
+        # The credential in the body: the only channel a pre-24.10 uclient-fetch can use.
+        printf ',"api_token":%s' "$(json_quote "$api_token")"
         printf '}\n'
     } >"$TMP_BODY"
 
@@ -708,6 +1053,21 @@ keys_path=$(cfg_get console_authorized_keys_path)
 if [ -z "$heartbeat_url" ] || [ -z "$api_token" ]; then
     log "heartbeat disabled: heartbeat_url or api_token missing in $CONFIG_FILE"
     exit 0
+fi
+
+if [ -z "$FETCHER" ]; then
+    log "heartbeat disabled: neither curl nor wget is installed, so $heartbeat_url cannot be reached"
+    exit 0
+fi
+
+# One warning per boot, not one per minute: this process is restarted every 60 s and a warning
+# that shouts every minute is a warning nobody reads.
+if [ "$TLS_VERIFY" = "0" ]; then
+    _tls_warned=${TG_TLS_WARN_FILE:-/tmp/.tunnelgate-tls-warning}
+    if [ ! -e "$_tls_warned" ]; then
+        log "WARNING: TLS certificate verification is OFF for $heartbeat_url (tunnelgate.main.tls_verify=0). Anyone who can answer for that host receives the API token. Restore it with: uci set tunnelgate.main.tls_verify=1 && uci commit tunnelgate && /etc/init.d/tunnelgate restart"
+        : >"$_tls_warned" 2>/dev/null
+    fi
 fi
 
 http_code=$(send_heartbeat 0)
@@ -843,6 +1203,9 @@ SELF_BIN=${TG_UNINSTALL_BIN:-/usr/bin/tunnelgate-uninstall}
 STATE_DIR=${TG_STATE_DIR:-/usr/lib/tunnelgate}
 KEY_PATH=${TG_KEY_PATH:-/root/.ssh/tunnelgate_ed25519}
 CONSOLE_MARK=tunnelgate-console
+# Exactly the set agent/install.sh installs (same spelling there, so the two can be diffed).
+# openssh-client alone is NOT enough - see the measurement table in agent/install.sh.
+OPENSSH_PKGS="openssh-client openssh-keygen openssh-client-utils"
 
 DRY_RUN=0
 PURGE=0
@@ -863,7 +1226,8 @@ TunnelGate router agent uninstaller.
 
   Usage: tunnelgate-uninstall [--purge] [--dry-run]
 
-    --purge      also remove openssh-client and the dedicated console user
+    --purge      also remove openssh-client, openssh-keygen, openssh-client-utils and the
+                 dedicated console user
     --dry-run    print what would be removed, change nothing
 
   Requires root. Removes the init script, the UCI config, the supervisor scripts, the state
@@ -987,15 +1351,20 @@ delete_files() {
 }
 
 delete_package() {
+    # Best effort, one package at a time: a package that was never installed is not an error,
+    # and a failed removal is logged instead of aborting the purge halfway through.
     if command -v apk >/dev/null 2>&1; then
-        log "removing openssh-client via apk"
-        apk del openssh-client >/dev/null 2>&1 || log "warning: apk could not remove openssh-client"
+        for _pkg in $OPENSSH_PKGS; do
+            log "removing $_pkg via apk"
+            apk del "$_pkg" >/dev/null 2>&1 || log "warning: apk could not remove $_pkg"
+        done
     elif command -v opkg >/dev/null 2>&1; then
-        log "removing openssh-client via opkg"
-        opkg remove openssh-client >/dev/null 2>&1 ||
-            log "warning: opkg could not remove openssh-client"
+        for _pkg in $OPENSSH_PKGS; do
+            log "removing $_pkg via opkg"
+            opkg remove "$_pkg" >/dev/null 2>&1 || log "warning: opkg could not remove $_pkg"
+        done
     else
-        log "no apk or opkg found; leaving openssh-client in place"
+        log "no apk or opkg found; leaving $OPENSSH_PKGS in place"
     fi
 }
 
@@ -1052,29 +1421,95 @@ require_field() {
 # --------------------------------------------------------------------------------------
 # HTTP
 # --------------------------------------------------------------------------------------
-# http_post <url> <header-name> <header-value> <body-file> <output-file>
+# http_post <url> <header-name> <token> <body-file> <output-file> [timeout-seconds]
 # Prints the HTTP status code; empty when the request never completed.
+#
+# Two fetchers, and they are NOT interchangeable:
+#
+#   curl - everything is there: -o/-w for the status, a real Authorization header.
+#   wget - on stock OpenWrt this is uclient-fetch. Before 24.10 it has NO --header and no -S,
+#          and an unknown option there is not even a hard failure (it prints usage and exits
+#          0), so a header on this path is worse than useless - it silently sends nothing and
+#          still reports success. uclient-fetch also will not retry a challenged POST with the
+#          credentials given to --user, so Basic auth cannot authenticate the exchange.
+#          Therefore: no --header at all, the credential rides in the JSON BODY (the panel
+#          accepts bootstrap_token / api_token there on every generation), and the status is
+#          parsed out of the progress output, all a pre-24.10 uclient-fetch offers.
 http_post() {
-    if command -v curl >/dev/null 2>&1; then
-        curl -q -sS -o "$5" -w '%{http_code}' --max-time 60 -X POST \
+    _tg_url=$1
+    _tg_hname=$2
+    _tg_token=$3
+    _tg_body=$4
+    _tg_out=$5
+    _tg_timeout=${6:-60}
+
+    rm -f "$_tg_out" 2>/dev/null
+    # Why the last fetch failed, when the fetcher said something useful. It has to go through a
+    # FILE: the caller runs this function in a command substitution, i.e. in a subshell, so a
+    # variable set here would never reach it.
+    rm -f "$HTTP_ERR_FILE" 2>/dev/null
+
+    case "$FETCHER" in
+    curl)
+        # -k only when the panel explicitly turned verification off (TLS_VERIFY above). It is
+        # not folded into -sS, and nothing can switch it on for anything but this request.
+        _tg_k=""
+        if [ "$TLS_VERIFY" = "0" ]; then
+            _tg_k="-k"
+        fi
+        # -q first: never read ~/.curlrc. 000 is what -w prints when the request never
+        # completed (DNS, TLS, refused) - not an HTTP status, so report "no status".
+        _tg_errf="$_tg_out.err.$$"
+        _tg_code=$(curl -q -sS ${_tg_k:+"$_tg_k"} -o "$_tg_out" -w '%{http_code}' --max-time "$_tg_timeout" -X POST \
             -H "Content-Type: application/json" \
-            -H "$2: $3" \
-            --data-binary "@$4" \
-            "$1" 2>/dev/null
+            -H "$_tg_hname: $_tg_token" \
+            -u "$_tg_token:" \
+            --data-binary "@$_tg_body" \
+            "$_tg_url" 2>"$_tg_errf")
+        tail -n 1 "$_tg_errf" 2>/dev/null | tr -d '\r' >"$HTTP_ERR_FILE" 2>/dev/null
+        rm -f "$_tg_errf"
+        case "$_tg_code" in
+        000 | "") return 0 ;;
+        *)
+            printf '%s' "$_tg_code"
+            return 0
+            ;;
+        esac
+        ;;
+    wget)
+        # No -q: the status only exists in the progress output. No --header, no -S (see above).
+        # GNU wget (a development host) and uclient-fetch word the same fact differently, so
+        # all three spellings are parsed.
+        _tg_err="$_tg_out.err.$$"
+        _tg_ncc=""
+        if [ "$TLS_VERIFY" = "0" ]; then
+            _tg_ncc="--no-check-certificate"
+        fi
+        wget -O "$_tg_out" ${_tg_ncc:+"$_tg_ncc"} --post-file="$_tg_body" --timeout="$_tg_timeout" "$_tg_url" 2>"$_tg_err"
+        _tg_rc=$?
+        tail -n 1 "$_tg_err" 2>/dev/null | tr -d '\r' >"$HTTP_ERR_FILE" 2>/dev/null
+        _tg_code=$(sed -n \
+            -e 's/.*HTTP error \([0-9][0-9][0-9]\).*/\1/p' \
+            -e 's/.*awaiting response\.\.\. \([0-9][0-9][0-9]\).*/\1/p' \
+            -e 's/.*ERROR \([0-9][0-9][0-9]\).*/\1/p' \
+            "$_tg_err" 2>/dev/null | tail -n 1)
+        rm -f "$_tg_err"
+        if [ -n "$_tg_code" ]; then
+            printf '%s' "$_tg_code"
+            return 0
+        fi
+        # No status line and a clean exit: answer 200. The caller still validates the body (a
+        # missing router_id fails the run), so a captive-portal page cannot slip through.
+        [ "$_tg_rc" = "0" ] && printf '200'
         return 0
-    fi
-    if command -v wget >/dev/null 2>&1; then
-        wget -q -O "$5" \
-            --header "Content-Type: application/json" \
-            --header "$2: $3" \
-            --post-file="$4" \
-            --timeout=60 -S "$1" 2>&1 |
-            sed -n 's/.*HTTP\/1\.[01] \([0-9][0-9][0-9]\).*/\1/p' | tail -n 1
-        return 0
-    fi
-    return 1
+        ;;
+    *) return 1 ;;
+    esac
 }
 
+# api_error_message <status>: the panel's error envelope, or a plain status when there is no
+# body left. On the wget path a 4xx/5xx body is never written, so the fallback is the normal
+# case there, not an edge case.
 api_error_message() {
     _code=$(get error.code)
     _msg=$(get error.message)
@@ -1102,6 +1537,8 @@ build_report() {
         [ -n "$_mac" ] && printf ',"mac":%s' "$(json_quote "$_mac")"
         printf ',"uptime_seconds":%s' "$_uptime"
         printf ',"client_version":%s' "$(json_quote "$CLIENT_VERSION")"
+        # The credential in the body: the only channel a pre-24.10 uclient-fetch can offer.
+        printf ',"bootstrap_token":%s' "$(json_quote "$TG_BOOTSTRAP_TOKEN")"
         printf '}\n'
     } >"$BODY_FILE" || err "cannot write $BODY_FILE"
 }
@@ -1113,12 +1550,31 @@ do_exchange() {
 
     if [ "$DRY_RUN" = "1" ]; then
         log "dry-run: would POST this report to $_url:"
-        cat "$BODY_FILE"
+        # The report carries the token now, and dry-run output goes to a terminal and to
+        # whatever captures it - print the shape, never the credential.
+        sed "s/$TG_BOOTSTRAP_TOKEN/***/g" "$BODY_FILE"
         return 0
     fi
 
+    [ "$FETCHER" != "none" ] ||
+        err "neither curl nor wget is installed on this router, so the panel cannot be reached; install one of them and re-run"
+
     _status=$(http_post "$_url" "X-Bootstrap-Token" "$TG_BOOTSTRAP_TOKEN" "$BODY_FILE" "$RESPONSE_FILE")
     if [ -z "$_status" ]; then
+        # A TLS-less uclient-fetch and a dead panel fail identically (no status code); the fetcher
+        # message is the only thing that tells them apart, and the 19.07 cure is a package that
+        # nobody would guess. Name it here rather than in a FAQ.
+        _ferr=""
+        [ -r "$HTTP_ERR_FILE" ] && _ferr=$(cat "$HTTP_ERR_FILE" 2>/dev/null)
+        case "$_ferr" in
+        *"SSL support not available"*)
+            err "the fetcher on this router has no TLS support, so $_url cannot be reached: install a libustream TLS package (opkg install libustream-wolfssl; on 19.07 the exact name is libustream-wolfssl20150806) and re-run. This is a property of the image, not of the panel"
+            ;;
+        esac
+        if [ -n "$_ferr" ]; then
+            err "cannot reach the panel at $_url: $_ferr
+DNS, TLS, firewall or a wrong panel URL could each do this. Check 'nslookup', the router clock (https needs a sane date: 'date') and whether tls_verify matches the panel's certificate."
+        fi
         err "cannot reach the panel at $_url (DNS, TLS, firewall or a wrong panel URL). Check 'nslookup' and the router clock: https needs a sane date, see 'date'"
     fi
     case "$_status" in
@@ -1165,8 +1621,11 @@ install_private_key() {
     ( umask 077; printf '%s\n' "$_key" >"$KEY_PATH" ) || err "cannot write $KEY_PATH"
     chmod 0600 "$KEY_PATH"
     chmod 0700 "$_key_dir"
-    if ! ssh-keygen -y -f "$KEY_PATH" >/dev/null 2>&1; then
-        err "the private key written to $KEY_PATH is not usable by ssh-keygen; re-run the installer"
+    # Read the key back with ssh-keygen and require the public half. Do NOT test the exit code:
+    # the dropbear build prints "Exited: String too long" for an OpenSSH key and exits 0, so an
+    # exit-code check would call a key nothing can use perfectly usable.
+    if ! ssh-keygen -y -f "$KEY_PATH" 2>/dev/null | grep -q '^ssh-ed25519 '; then
+        err "the private key written to $KEY_PATH is not usable by ssh-keygen: ssh-keygen on PATH is probably the dropbear build (this is what openssh-keygen fixes). Re-run the installer after installing it"
     fi
     log "private key installed at $KEY_PATH (0600)"
 }
@@ -1187,8 +1646,12 @@ pin_host_key() {
         return 0
     fi
 
-    command -v ssh-keyscan >/dev/null 2>&1 || err "ssh-keyscan is missing (install openssh-client)"
-    command -v ssh-keygen >/dev/null 2>&1 || err "ssh-keygen is missing (install openssh-client)"
+    # Real package names: ssh-keyscan ships in openssh-client-utils and OpenSSH ssh-keygen in
+    # openssh-keygen; "install openssh-client" alone leaves both of these errors in place.
+    command -v ssh-keyscan >/dev/null 2>&1 ||
+        err "ssh-keyscan is missing: install openssh-client-utils (ssh-keyscan lives there, not in openssh-client)"
+    probe_openssh ssh-keygen ||
+        err "ssh-keygen cannot read an OpenSSH private key (it is the dropbear build, or missing): install openssh-keygen and re-run"
 
     _scanned=/tmp/tunnelgate-keyscan.$$
     _pool=""
@@ -1326,6 +1789,9 @@ write_config() {
     [ -n "$_console_keys" ] || _console_keys=/etc/dropbear/authorized_keys
     _console_user=$(get console.ssh_user)
     [ -n "$_console_user" ] || _console_user=root
+    # Persisted so the heartbeat keeps the same policy once this installer exits, and so the
+    # operator can flip it later with 'uci set tunnelgate.main.tls_verify=0' + a restart.
+    _tls_verify=$TLS_VERIFY
 
     if [ "$DRY_RUN" = "1" ]; then
         log "dry-run: would write $CONFIG (panel $_ssh_host:$_ssh_port, tunnel port $_remote_port, console enabled=$_console_enabled)"
@@ -1358,6 +1824,7 @@ config tunnelgate 'main'
 	option console_user '$(uci_quote_raw "$_console_user")'
 	option console_authorized_keys_path '$(uci_quote_raw "$_console_keys")'
 	option console_serial '0'
+	option tls_verify '$_tls_verify'
 EOF_UCI
     chmod 0600 "$CONFIG"
     log "configuration written to $CONFIG (0600: it holds the API token)"
@@ -1506,10 +1973,14 @@ do_status() {
     if [ -f "$CONFIG" ]; then
         printf 'config          : %s\n' "$CONFIG"
         if command -v uci >/dev/null 2>&1; then
-            for _k in panel_url ssh_host ssh_port tunnel_port local_port console_enabled console_port router_id; do
+            for _k in panel_url ssh_host ssh_port tunnel_port local_port console_enabled console_port router_id tls_verify; do
                 printf '  %-15s %s\n' "$_k" "$(uci -q get "tunnelgate.main.$_k" 2>/dev/null)"
             done
         fi
+        case "$(config_tls_verify)" in
+        0) printf '  %-15s %s\n' 'tls policy' 'OFF - the panel certificate is NOT verified' ;;
+        *) printf '  %-15s %s\n' 'tls policy' 'verify (default)' ;;
+        esac
     else
         printf 'config          : missing (not installed)\n'
     fi
@@ -1604,13 +2075,27 @@ main() {
     esac
 
     check_root
+    check_self
     check_openwrt
     check_placeholders
+    detect_fetcher
+    resolve_tls_verify
+    if [ "$TLS_VERIFY" = "0" ]; then
+        log "WARNING: TLS certificate verification is OFF for ${TG_PANEL_URL:-the panel} (tls_verify=0). Anyone who can answer for that host receives the bootstrap token and the API token. Turn it back on with: uci set tunnelgate.main.tls_verify=1"
+    fi
 
     if [ "$DRY_RUN" = "1" ]; then
-        log "dry-run: would check/install openssh-client"
+        log "dry-run: would check/install the OpenSSH client"
+        log "dry-run: would check/install a libustream TLS package when https needs one"
     else
         ensure_openssh
+        # After the OpenSSH work and before the exchange: on 19.07 the exchange itself is the
+        # first https request this router makes, and it fails with a message about uclient-fetch.
+        ensure_tls_lib
+        # Say this out loud, once, when the setting cannot deliver what its name promises.
+        if [ "$TLS_VERIFY" = "1" ] && tls_stack_cannot_verify; then
+            log "WARNING: on OpenWrt $(detect_openwrt_version) the fetcher cannot check a certificate chain: it accepts self-signed certificates (a wrong hostname is still caught). tls_verify=1 is recorded, but it is not being enforced. 21.02 or newer is required for real verification"
+        fi
     fi
 
     write_json_lib

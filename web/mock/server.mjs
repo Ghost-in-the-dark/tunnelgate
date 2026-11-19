@@ -413,17 +413,23 @@ function statsEnvelope() {
   }
 }
 
+/* The real command is built by app/services/bootstrap.py::build_install_command; this is a copy
+   of its shape, kept so the SPA can be developed without a panel. Being a copy it can drift -
+   the mock is a development fixture, never a source of truth. Two things about the shape are
+   load-bearing and must survive any edit: the token rides as the basic-auth USERNAME (no stock
+   OpenWrt has curl, and uclient-fetch had no --header before 24.10), and the body is fetched to a
+   file and grepped for the installer's sentinel before it runs (a 401 answers an empty body, and
+   piping that into sh is a silent success that leaves an operator staring at a dead router). */
 function installCommand(router, token) {
-  return (
-    'curl -fsSL ' +
-    config.panel_url +
-    '/install | TUNNELGATE_TOKEN=' +
-    token +
-    ' TUNNELGATE_PANEL=' +
-    config.panel_url +
-    ' sh -s -- --slug ' +
-    router.slug
-  )
+  const url = config.panel_url + '/api/v1/routers/install?os=linux'
+  return [
+    'TK=' + token + '; U=' + url + '; F=/tmp/tg-install.$$.sh',
+    "if command -v curl >/dev/null 2>&1; then curl -fsSL -o \"$F\" -u \"$TK:\" \"$U\"",
+    "elif command -v wget >/dev/null 2>&1; then wget -q -O \"$F\" --user=\"$TK\" --password=x \"$U\"",
+    "else echo 'TunnelGate: neither curl nor wget is installed on this router' >&2; exit 1; fi",
+    "grep -q 'TunnelGate router agent installer' \"$F\" 2>/dev/null || { echo 'TunnelGate: the panel did not return the installer; mint a fresh install command and retry' >&2; rm -f \"$F\"; exit 1; }",
+    'sh "$F"',
+  ].join('\n')
 }
 
 function mintToken() {

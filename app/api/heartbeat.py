@@ -4,6 +4,12 @@ This endpoint is authenticated with `X-Api-Token`, a value the router can comput
 public key and that the panel derives the same way. It is *not* a session and it carries no CSRF:
 nothing here touches panel state beyond the router own row.
 
+The token is accepted on three channels, in this order: the `X-Api-Token` header, the HTTP Basic
+username, and an `api_token` field in the JSON body. Only the first is available to curl; stock
+OpenWrt has no curl and its uclient-fetch only learned `--header` in 24.10, so Basic is what
+those devices actually use. Every 401 carries a Basic challenge, without which uclient-fetch never
+retries with the credentials it was given.
+
 The important constraint from the contract: **a heartbeat can never mark a router online**. Only
 an observed reverse listener can (the monitor owns that). A router that simply claims to be alive
 must not turn green in the UI, or "online" would mean "the client said so".
@@ -12,6 +18,7 @@ must not turn green in the UI, or "online" would mean "the client said so".
 from __future__ import annotations
 
 import logging
+from typing import Annotated
 
 from fastapi import APIRouter, Header, Request
 
@@ -22,6 +29,7 @@ from ..models import STATUS_AWAITING, STATUS_OFFLINE, STATUS_ONLINE, Router
 from ..schemas import HeartbeatIn, HeartbeatOut, iso
 from ..services import agent_endpoint
 from ..services import keys as keys_service
+from .bootstrap import json_object, token_from_request, validated_fields, with_challenge
 
 log = logging.getLogger(__name__)
 
@@ -33,13 +41,14 @@ def _authenticate(db, router_id: str, supplied: str | None) -> Router:
 
     A revoked router fails here too: its public key is gone, so no token can match it. That is
     the whole revocation mechanism for the heartbeat channel - no denylist needed.
+
+    Both failure modes raise the same challenge-carrying 401: a caller must not be able to tell
+    "no such router" from "wrong token", and the challenge is what makes a device retry.
     """
     item = db.get(Router, router_id)
-    if item is None:
-        raise ApiError(401, "invalid_api_token", "Unknown router or invalid api token")
-    if not keys_service.api_token_matches(item, supplied):
-        raise ApiError(401, "invalid_api_token", "Unknown router or invalid api token")
-    return item
+    if item is not None and keys_service.api_token_matches(item, supplied):
+        return item
+    raise with_challenge(ApiError(401, "invalid_api_token", "Unknown router or invalid api token"))
 
 
 def _heartbeat_url(item: Router, db, settings) -> str:
@@ -48,37 +57,32 @@ def _heartbeat_url(item: Router, db, settings) -> str:
     return f"{base}/api/v1/routers/{item.id}/heartbeat"
 
 
-async def _console_installed_flag(request: Request) -> bool:
-    """Read the router's "I installed the console key" flag off the raw body.
-
-    `HeartbeatIn` is frozen and does not declare `console_installed`, so the flag is read from
-    the cached request body instead of widening the shared schema. Anything unparsable simply
-    means "no claim", which is the safe default: it just leaves the registration pending.
-    """
-    try:
-        body = await request.json()
-    except Exception:
-        return False
-    if not isinstance(body, dict):
-        return False
-    value = body.get("console_installed")
-    return value is True
-
-
 @router.post("/{router_id}/heartbeat", response_model=HeartbeatOut)
 async def heartbeat(
     router_id: str,
     request: Request,
     db: DbSession,
     settings: SettingsDep,
-    payload: HeartbeatIn | None = None,
-    x_api_token: str | None = Header(default=None, alias="X-Api-Token"),
+    x_api_token: Annotated[str | None, Header(alias="X-Api-Token")] = None,
 ) -> HeartbeatOut:
-    """Refresh metadata, echo the observed tunnel state, hand over the console key once."""
-    item = _authenticate(db, router_id, x_api_token)
+    """Refresh metadata, echo the observed tunnel state, hand over the console key once.
+
+    The body is read once and parsed by hand, for two reasons: it may carry the token as a third
+    authentication channel, and uclient-fetch always sends a form content type - a declared body
+    model would answer 422 before this handler runs. A body that does not parse is simply "the
+    router reported nothing", never an error.
+    """
+    body = json_object(await request.body())
+    # Only a string can be a token: a JSON object or list in that field is a malformed request, and
+    # str()-ing it would invent a credential out of its repr.
+    body_token = body.get("api_token")
+    token = token_from_request(x_api_token, request) or (
+        body_token.strip() if isinstance(body_token, str) else None
+    )
+    item = _authenticate(db, router_id, token or None)
     now = utcnow()
 
-    data = payload.model_dump(exclude_none=True) if payload else {}
+    data = validated_fields(body, HeartbeatIn)
     for field in ("hostname", "model", "openwrt_version", "mac", "client_version"):
         value = data.get(field)
         if value:
@@ -105,7 +109,7 @@ async def heartbeat(
     elif not tunnel_present and item.status == STATUS_ONLINE:
         item.status = STATUS_OFFLINE
 
-    console_installed = await _console_installed_flag(request)
+    console_installed = data.get("console_installed") is True
     registration = keys_service.console_key_registration(item)
     if console_installed:
         # The router just told us it wrote the key; stop advertising it on the next poll.

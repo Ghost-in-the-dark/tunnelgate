@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import base64
+import json
+from pathlib import Path
+
 from app.models import AuditLog, Router, RouterRuntime
 from app.services import keys as keys_service
 
@@ -370,3 +374,384 @@ def test_exchange_is_not_affected_by_the_script_limiter(api, client):
 
     r = _exchange(client, token)
     assert r.status_code == 200, r.text
+
+
+# ------------------------------------------------- token channels (contract sections 1-2)
+def _basic(token: str) -> dict[str, str]:
+    """The credential uclient-fetch sends for --user=TOKEN --password=""."""
+    encoded = base64.b64encode(f"{token}:".encode()).decode()
+    return {"Authorization": f"Basic {encoded}"}
+
+
+def test_install_accepts_the_token_as_the_basic_username(api, client):
+    """Stock OpenWrt has no curl and no --header before 24.10, so Basic is the only channel."""
+    created = api.create_router("Basic Install")
+    r = client.get("/api/v1/routers/install?os=linux", headers=_basic(created["bootstrap_token"]))
+    assert r.status_code == 200, r.text
+    assert "TG_BOOTSTRAP_TOKEN=" in r.text
+
+
+def test_install_ignores_the_password_half_of_basic_auth(api, client):
+    """The protocol is user=token; the password is a placeholder a device may fill with anything."""
+    created = api.create_router("Basic Password")
+    encoded = base64.b64encode(f"{created['bootstrap_token']}:hunter2".encode()).decode()
+    r = client.get("/api/v1/routers/install", headers={"Authorization": f"Basic {encoded}"})
+    assert r.status_code == 200, r.text
+
+
+def test_basic_and_header_share_one_render_quota(api, client):
+    """Switching channels must not reset the per-token budget."""
+    from app.api import bootstrap as bootstrap_api
+
+    bootstrap_api.SCRIPT_LIMITER.clear()
+    created = api.create_router("Channel Swap")
+    token = created["bootstrap_token"]
+
+    for _ in range(bootstrap_api.SCRIPT_LIMIT):
+        assert _fetch_script(client, token).status_code == 200
+    # Same token, different channel: still exhausted.
+    assert client.get("/api/v1/routers/install", headers=_basic(token)).status_code == 429
+
+
+def test_malformed_authorization_is_a_401_not_a_server_error(client):
+    """A garbage header runs before authentication, so it must never raise."""
+    for header in (
+        "Basic !!!not-base64",
+        "Basic bm9jb2xvbg==",  # "nocolon"
+        "Digest username=admin",
+        "Basic",
+        "Basic ",
+        "",
+    ):
+        r = client.get("/api/v1/routers/install", headers={"Authorization": header})
+        assert r.status_code == 401, (header, r.status_code, r.text)
+
+
+def test_install_401_carries_the_basic_challenge(client):
+    """Without the challenge uclient-fetch never retries with the credentials it was given."""
+    r = client.get("/api/v1/routers/install")
+    assert r.status_code == 401
+    assert r.headers["www-authenticate"] == 'Basic realm="tunnelgate"'
+
+
+def test_install_unknown_token_401_also_carries_the_challenge(client):
+    r = client.get("/api/v1/routers/install", headers=_basic("not-a-real-token"))
+    assert r.status_code == 401
+    assert r.headers["www-authenticate"] == 'Basic realm="tunnelgate"'
+
+
+# ------------------------------------------------- exchange: three channels, lenient body
+def test_exchange_accepts_the_token_as_the_basic_username(api, client):
+    created = api.create_router("Basic Exchange")
+    r = client.post(
+        "/api/v1/routers/bootstrap/exchange",
+        headers=_basic(created["bootstrap_token"]),
+        json={"hostname": "openwrt-lab"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["api_token"].startswith("tg_")
+
+
+def test_exchange_accepts_the_token_in_the_body(api, client):
+    created = api.create_router("Body Token")
+    r = client.post(
+        "/api/v1/routers/bootstrap/exchange",
+        json={"bootstrap_token": created["bootstrap_token"], "hostname": "openwrt-lab"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["router_id"] == created["id"]
+
+
+def test_exchange_reports_fields_sent_alongside_the_body_token(api, client, db):
+    created = api.create_router("Body Report")
+    r = client.post(
+        "/api/v1/routers/bootstrap/exchange",
+        json={
+            "bootstrap_token": created["bootstrap_token"],
+            "hostname": "from-body",
+            "openwrt_version": "23.05.5",
+        },
+    )
+    assert r.status_code == 200, r.text
+    db.expire_all()
+    assert db.get(Router, created["id"]).hostname == "from-body"
+
+
+def test_exchange_accepts_a_form_content_type(api, client):
+    """uclient-fetch always sends this content type with unchanged JSON body bytes."""
+    created = api.create_router("Form Typed")
+    r = client.post(
+        "/api/v1/routers/bootstrap/exchange",
+        content=json.dumps({"hostname": "openwrt-lab"}).encode(),
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            **_basic(created["bootstrap_token"]),
+        },
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_exchange_accepts_a_chunked_form_post(api, client):
+    """uclient-fetch also always uses chunked transfer encoding."""
+    created = api.create_router("Chunked")
+    r = client.post(
+        "/api/v1/routers/bootstrap/exchange",
+        content=json.dumps({"hostname": "openwrt-lab"}).encode(),
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Transfer-Encoding": "chunked",
+            **_basic(created["bootstrap_token"]),
+        },
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_exchange_treats_an_unparsable_body_as_no_report(api, client):
+    """A body that does not parse is "the router told us nothing", never a 422."""
+    created = api.create_router("Garbage Body")
+    r = client.post(
+        "/api/v1/routers/bootstrap/exchange",
+        content=b"\x00\xff this is not json",
+        headers=_basic(created["bootstrap_token"]),
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_exchange_treats_a_non_object_body_as_no_report(api, client):
+    created = api.create_router("Array Body")
+    r = client.post(
+        "/api/v1/routers/bootstrap/exchange",
+        content=b'["not", "an", "object"]',
+        headers=_basic(created["bootstrap_token"]),
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_exchange_degrades_an_invalid_field_instead_of_rejecting(api, client, db):
+    """One out-of-range field must not burn the token: keep the fields that fit."""
+    created = api.create_router("Partial Report")
+    r = client.post(
+        "/api/v1/routers/bootstrap/exchange",
+        content=json.dumps({"hostname": "kept", "uptime_seconds": -5}).encode(),
+        headers=_basic(created["bootstrap_token"]),
+    )
+    assert r.status_code == 200, r.text
+    db.expire_all()
+    row = db.get(Router, created["id"])
+    assert row.hostname == "kept"
+    assert row.uptime_seconds in (None, 0)
+
+
+def test_exchange_401_carries_the_basic_challenge(api, client):
+    r = client.post("/api/v1/routers/bootstrap/exchange", json={})
+    assert r.status_code == 401
+    assert r.headers["www-authenticate"] == 'Basic realm="tunnelgate"'
+
+    created = api.create_router("Used Token")
+    api.exchange(created["bootstrap_token"])
+    again = client.post(
+        "/api/v1/routers/bootstrap/exchange",
+        headers=_basic(created["bootstrap_token"]),
+        json={},
+    )
+    assert again.status_code == 401
+    assert again.headers["www-authenticate"] == 'Basic realm="tunnelgate"'
+
+
+# ------------------------------------------------- body token must be a string
+def test_exchange_ignores_a_non_string_body_token(api, client):
+    """A JSON object in the token field is malformed input, not a credential to stringify."""
+    api.create_router("Object Token")
+    r = client.post(
+        "/api/v1/routers/bootstrap/exchange",
+        json={"bootstrap_token": {"$ne": None}, "hostname": "x"},
+    )
+    assert r.status_code == 401
+    assert r.headers["www-authenticate"] == 'Basic realm="tunnelgate"'
+
+
+# ------------------------------------- wire shapes measured on stock OpenWrt (Lead's capture)
+def _basic_raw(payload: str) -> dict[str, str]:
+    """A Basic header from a raw payload, colon or not - exactly what the device put on the wire."""
+    return {"Authorization": "Basic " + base64.b64encode(payload.encode()).decode()}
+
+
+def test_install_accepts_the_colon_less_basic_payload(api, client):
+    """The real shape uclient-fetch sends: base64(TOKEN) with NO colon.
+
+    Captured from OpenWrt 19.07.10/22.03.7/23.05.5/24.10.1. Before this was accepted the
+    parser discarded the payload as "no token" and every stock device got 401 forever.
+    """
+    created = api.create_router("Colonless Install")
+    r = client.get("/api/v1/routers/install", headers=_basic_raw(created["bootstrap_token"]))
+    assert r.status_code == 200, r.text
+    assert "TG_BOOTSTRAP_TOKEN=" in r.text
+
+
+def test_exchange_accepts_the_colon_less_basic_payload(api, client):
+    created = api.create_router("Colonless Exchange")
+    r = client.post(
+        "/api/v1/routers/bootstrap/exchange",
+        headers=_basic_raw(created["bootstrap_token"]),
+        json={"hostname": "openwrt-lab"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["api_token"].startswith("tg_")
+
+
+def test_install_rejects_a_basic_payload_with_only_a_password(client):
+    """:pass" has an empty username - a device authenticating as nobody."""
+    r = client.get("/api/v1/routers/install", headers=_basic_raw(":tunnelgate"))
+    assert r.status_code == 401
+    assert r.headers["www-authenticate"] == 'Basic realm="tunnelgate"'
+
+
+# ------------------------------------------------------- the TLS policy in the installer header
+def _rendered_header(verify_tls: bool, settings) -> str:
+    """Render the installer with a chosen TLS policy, without touching the database.
+
+    The policy is read from the effective endpoint, so patching that resolver is the narrowest
+    way to drive the branch: no row to write and no HTTP involved.
+    """
+    from app.services import agent_endpoint as agent_endpoint_service
+    from app.services import bootstrap as bootstrap_service
+    from app.services.agent_endpoint import AgentEndpoint
+
+    original = agent_endpoint_service.effective
+    agent_endpoint_service.effective = lambda db=None, s=None: AgentEndpoint(
+        "https", "panel.example.com", None, "database", verify_tls
+    )
+    try:
+        script = bootstrap_service.render_install_script("tok-abc", "linux", settings)
+    finally:
+        agent_endpoint_service.effective = original
+    return script.split("# ------------------------------")[0]
+
+
+def test_the_installer_header_carries_tg_tls_verify_1(settings) -> None:
+    """Always emitted, never omitted when it is 1.
+
+    The agent reads TG_TLS_VERIFY unconditionally, so a missing line would be indistinguishable
+    from "the panel predates this field" and the agent would have to guess.
+    """
+    header = _rendered_header(True, settings)
+    assert "TG_TLS_VERIFY='1'" in header
+
+
+def test_the_installer_header_carries_tg_tls_verify_0(settings) -> None:
+    header = _rendered_header(False, settings)
+    assert "TG_TLS_VERIFY='0'" in header
+
+
+def test_the_tls_line_is_a_shell_assignment_next_to_the_others(settings) -> None:
+    """Same shape as the other three injected values: quoted, one word, inside the header block."""
+    header = _rendered_header(False, settings)
+    lines = header.splitlines()
+    tls_lines = [ln for ln in lines if ln.startswith("TG_TLS_VERIFY=")]
+    assert len(tls_lines) == 1
+    assert tls_lines[0].startswith("TG_TLS_VERIFY='")
+    assert "TG_PANEL_URL=" in header
+    assert "TG_BOOTSTRAP_TOKEN=" in header
+    assert "TG_OS_TYPE=" in header
+
+
+def test_the_served_script_starts_with_the_shebang_then_the_sentinel(settings) -> None:
+    """Line 1 must be the shebang and line 2 the installer's own identifying comment.
+
+    Order matters mechanically, not cosmetically. The kernel only honours a shebang at offset 0,
+    so a served script whose first line is the injected comment block is not executable as a
+    file: the caller's shell interprets it instead, which is why `sh -n` and every
+    "does it parse" test kept passing while the real install was broken. Keeping the sentinel on
+    line 2 matters for the same reason one level down - the installer's own head-check
+    (agent/install.sh::check_self) greps a bounded window for it, and a header that grows must not
+    be able to push it out of that window.
+    """
+    from app.services.bootstrap import render_install_script
+
+    script = render_install_script("tok-abc", "linux", settings)
+    lines = script.splitlines()
+    assert lines[0] == "#!/bin/sh", (
+        "line 1 must be the shebang: a shebang anywhere else is a comment"
+    )
+    assert "TunnelGate router agent installer" in lines[1], (
+        "line 2 must be the installer's sentinel comment, ahead of the injected block"
+    )
+    # And the injected block really did land after those two lines, not instead of them.
+    assert lines[2] == "# --- injected by the panel ---"
+    assert any(ln.startswith("TG_PANEL_URL=") for ln in lines[2:9])
+
+
+def test_the_served_script_is_executable_directly_not_just_under_sh(
+    settings, tmp_path: Path
+) -> None:
+    """The check that would have caught the shipped bug: exec the file, do not hand it to sh.
+
+    Under `sh <file>` the shebang is irrelevant - the shell is already chosen. Only a direct
+    exec proves the kernel found the interpreter, which is the thing an operator gets when they
+    download the script and run it. The host is not OpenWrt, so the expected failure is the
+    OpenWrt guard; "Exec format error" or the install-self-check error both mean the ordering
+    regressed.
+    """
+    import subprocess
+
+    from app.services.bootstrap import render_install_script
+
+    script = render_install_script("tok-abc", "linux", settings)
+    path = tmp_path / "install.sh"
+    path.write_text(script, encoding="utf-8")
+    path.chmod(0o755)
+    try:
+        result = subprocess.run([str(path)], capture_output=True, text=True, timeout=120)
+    except OSError as exc:
+        raise AssertionError(
+            f"the served script cannot be executed as a file ({exc}): the shebang is not on line 1"
+        ) from exc
+    combined = result.stdout + result.stderr
+    assert "Exec format error" not in combined, f"the shebang is not on line 1: {combined!r}"
+    assert "does not look like the TunnelGate installer" not in combined, (
+        f"the installer rejected its own served copy: {combined!r}"
+    )
+    assert "not look like OpenWrt" in combined, (
+        f"expected the OpenWrt guard to be the first objection, got: {combined!r}"
+    )
+
+
+def test_the_rendered_installer_still_parses_in_both_modes(settings) -> None:
+    """A new header line must not break busybox ash, and the body after it must stay intact."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    from app.services import agent_endpoint as agent_endpoint_service
+    from app.services import bootstrap as bootstrap_service
+    from app.services.agent_endpoint import AgentEndpoint
+
+    shell = shutil.which("sh")
+    assert shell
+    original = agent_endpoint_service.effective
+    try:
+        for verify_tls in (True, False):
+            agent_endpoint_service.effective = lambda db=None, s=None, v=verify_tls: AgentEndpoint(
+                "https", "panel.example.com", None, "database", v
+            )
+            script = bootstrap_service.render_install_script("tok-abc", "linux", settings)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = tmpdir + "/install.sh"
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(script)
+                result = subprocess.run([shell, "-n", path], capture_output=True, text=True)
+            assert result.returncode == 0, (verify_tls, result.stderr)
+    finally:
+        agent_endpoint_service.effective = original
+
+
+def test_install_serves_the_tls_policy_it_rendered(api, client) -> None:
+    """End to end: a fresh install with verification on announces 1, not 0 or nothing."""
+    created = api.create_router("TLS Header")
+    r = client.get(
+        "/api/v1/routers/install?os=linux",
+        headers={"X-Bootstrap-Token": created["bootstrap_token"]},
+    )
+    assert r.status_code == 200, r.text
+    assert "TG_TLS_VERIFY='1'" in r.text
+    assert "TG_TLS_VERIFY='0'" not in r.text

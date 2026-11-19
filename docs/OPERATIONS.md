@@ -146,7 +146,35 @@ back to it from the UI.
 | `no_free_port` on create | pool exhausted (deleted routers leak) | `GET /api/v1/stats` `ports_free` | delete stale routers; `app.cli doctor` reports leaks |
 | Everything 500s after upgrade | schema drift (no migration engine) | `app.cli check-schema` | apply the printed `ALTER TABLE`s |
 | Every router sits at `awaiting`/`offline` while `/api/v1/health` answers `ok`, and `ss -ltnp` on the host clearly shows the listeners | the panel cannot run `ss`, so it refuses to guess and treats the tunnels as unobservable | `journalctl -u tunnelgate \| grep "ss is not installed"`; `app.cli doctor` fails under `socket inventory` | install `iproute2` in whatever runs the panel (the container image ships it; a hand-rolled image often does not) |
+| A router reports a TLS or certificate error against the panel (log: `SSL certificate problem`, `BADCERT_CN_MISMATCH`, `certificate has expired`; or the heartbeat fails with no HTTP status while the panel's own browser is fine) | the router does not trust the panel's certificate: self-signed, expired, or issued for a name other than the agent endpoint | `GET /api/v1/settings/agent-endpoint` for the `agent_url` routers actually dial; `openssl s_client -connect <host>:443 -servername <host> </dev/null` from another LAN host; on the router `logread \| grep -i 'certificate\|tls'` | issue a certificate for **that** name (`docs/INSTALL_SERVER.md` §6), or fix the endpoint if the name is wrong. Stopgap only: **Settings → Agent endpoint → Ignore SSL self-signed certificates**, then re-run the installer - see below |
 | `app.cli doctor` dies with `PermissionError` on the database or `/var/lib/tunnelgate`, or reports "routes dir not writable" for files it should own | doctor is running as a different uid than the panel - typical with `docker exec` (uid 10001) against a host-owned data dir, or `sudo` vs the service user | `ls -ln /var/lib/tunnelgate` compared with the uid in the unit/container | run doctor as the service user, or `chown -R 10001:10001 /var/lib/tunnelgate` for the container path |
+
+### A router does not trust the panel's certificate
+
+Diagnose before changing anything: the common cause is not "TLS is broken" but a **name mismatch** -
+the router dials the `agent_url` (agent endpoint), which is not necessarily the name you typed into
+the browser, and a certificate valid for `panel.example.com` says nothing about
+`192.168.1.10`. `openssl s_client` from the router's side of the network answers the question the
+router is asking.
+
+Two fixes, in order of preference:
+
+1. **Give the endpoint a certificate it can verify.** Free, and the shipped nginx path already
+   does certbot with a wildcard - see `docs/INSTALL_SERVER.md` §6. If the endpoint is a bare IP,
+   change it to a name that has a certificate rather than waving the check through.
+2. **Turn verification off for this panel** - Settings → Agent endpoint → Ignore SSL self-signed
+   certificates (`verify_tls`). Acceptable only for a panel on a network you control; read
+   `docs/SECURITY.md` §7 first, because this is the flag that lets an impostor collect a router's
+   API token.
+
+The scope of that switch is easy to get wrong: **it changes new install commands and installer
+re-runs only.** It does not re-point or re-configure routers that are already installed - their
+policy is the `tunnelgate.main.tls_verify` UCI option written when each one was installed, and the
+heartbeat's `desired` payload carries the address and nothing else. To apply it to an existing
+router, re-run the installer there (or set the option by hand:
+`uci set tunnelgate.main.tls_verify=0 && uci commit tunnelgate && /etc/init.d/tunnelgate restart`).
+Tightening it back works the same way, in reverse: fix the certificate, flip each router to `1`
+(or re-run the installer), then clear the checkbox so future installs verify again.
 
 ### Collecting a diagnosis bundle
 

@@ -28,7 +28,7 @@ bootstrap flow, or anything in `app/security.py`.
 | A5 | Panel user without rights | Touch routers they should not | RBAC (`viewer` cannot create/rotate/delete or open a console); audit of every mutation |
 | A6 | Panel user tampering with another router's URL | Access a router they were not authorised for | The `router_id` is injected by nginx from the matched `server` block, never taken from the request |
 | A7 | CSRF from a malicious site | Perform panel mutations with the operator's cookie | Double-submit CSRF header on every mutating request + `SameSite=Lax` cookie |
-| A8 | MITM during onboarding | Learn the private key | TLS to the panel; `ssh-keyscan` fingerprint is compared with the value returned by the API over TLS before `known_hosts` is written; `StrictHostKeyChecking=yes` afterwards |
+| A8 | MITM during onboarding | Learn the private key | TLS to the panel - and note this row assumes the agent **verifies** the certificate: with the agent endpoint's `verify_tls` off (§7) the next link in the chain, the bootstrap token, is handed to an impostor instead; `ssh-keyscan` fingerprint is compared with the value returned by the API over TLS before `known_hosts` is written; `StrictHostKeyChecking=yes` afterwards |
 | A9 | Dump of the panel database | Replay credentials | Passwords are scrypt-hashed; session and bootstrap tokens are stored as SHA-256; only public keys are stored in plaintext |
 | A10 | Operator error (deleting the wrong router) | Outage | Delete is key revocation + port release, reversible by re-creating the router (the router keeps retrying/needs a reinstall) |
 | A11 | Compromised **router** (or anything that can read the traffic reaching its LuCI) | Take over the panel: every router, every console, every mutation - not just the one device | The panel cookie is **host-only by default** (`TUNNELGATE_COOKIE_DOMAIN` unset), so the browser never sends `tg_session` to `<slug>.<suffix>`; every panel-generated router vhost additionally drops the header, in both drivers (`proxy_set_header Cookie "";` / `"delete": ["Cookie"]`); the console WS re-validates the session cookie on `console.<suffix>`, a host the browser reaches only over TLS. What a router *does* get is `tg_luci`: a signed, Host-scoped cookie for that one device, obtainable only from a single-use ticket minted by an authenticated panel request (`/__tg/launch` -> `/__tg/enter`), so it grants that router's LuCI and nothing else, and nginx forwards it to the gate in a dedicated header instead of `$http_cookie`. Replaying it against the panel is worthless: `/api/*` reads only `tg_session` from the panel host, which the browser never sends there. Enabling `COOKIE_DOMAIN` collapses this control - see §6. **In path mode's merged layout this row is weakened**: the router's page is same-origin with the panel, so it does not need to *receive* `tg_session` to use it - the browser sends it on same-origin requests the router's script issues, and `/api/auth/me` hands out the CSRF token. The cookie strip and the host-only default still hold against exfiltration; nothing holds against same-origin abuse. See §6.1 |
@@ -355,6 +355,50 @@ misconfiguration, not a silent widening.
 * Docker image: non-root user, no build tools in the runtime layer, healthcheck on
   `/api/v1/health`.
 
+### When to turn certificate verification off
+
+The agent endpoint has one explicit escape hatch: **Settings → Agent endpoint → Ignore SSL
+self-signed certificates** (`verify_tls: false` on `PUT /api/v1/settings/agent-endpoint`). It is
+off by default, and turning it on does exactly one thing: the installer fetches without verifying
+the panel's certificate (`curl -k`, `wget --no-check-certificate`) and the agent accepts the same
+certificate on every heartbeat afterwards.
+
+Understand what that gives away. Certificate verification is the only thing that lets a router tell
+**your panel** apart from anything else that can answer for its address. With it off, a rogue AP,
+a spoofed DNS answer or an on-path box that answers on the panel's name is believed, and what it
+receives is not just a heartbeat: during the bootstrap exchange the router posts its **bootstrap
+token**, and it then stores and sends the **long-lived API token** on every heartbeat for the life
+of the install. Both are credentials for this panel. A router that accepted an impostor is not a
+router that "looks fine, just with a warning" - it is a spent credential and a key rotation.
+
+So the honest framing:
+
+* **Acceptable** - a panel on a LAN you control, with a self-signed certificate you generated
+  yourself, where the transport is a cable or your own Wi-Fi and the alternative would be no
+  encryption at all. This is the home-lab panel the flag exists for.
+* **Not acceptable** - anything a router reaches across the internet, across a network you do not
+  administer, or by a name you do not control. The certificate is not the hard part: Let's Encrypt
+  or any ACME client issues one for free, and `docs/INSTALL_SERVER.md` §6 wires up certbot with a
+  DNS-01 wildcard. Turning verification off is a stopgap, not a deployment.
+
+Costs are visible on purpose: the setting adds a comment line to every install command it
+changes, the installer logs a warning, and the heartbeat logs one warning per boot
+(`TG_TLS_VERIFY=0` / `tunnelgate.main.tls_verify=0`). Silence is not the expected state here.
+
+The agent's runtime policy is its own UCI option, written once by the installer:
+
+```sh
+uci set tunnelgate.main.tls_verify=1
+uci commit tunnelgate
+/etc/init.d/tunnelgate restart
+```
+
+Changing the panel setting does **not** reach a router that is already installed - the heartbeat's
+`desired` payload carries the address and nothing else - so the two sides must be moved together
+when you tighten this back up: fix the certificate, flip each installed router with the commands
+above, then clear the checkbox so future installs verify again. Only the exact value `0` disables
+verification; a missing option, `1`, or anything the agent does not understand means verify, so a
+damaged config fails closed rather than open.
 ### Who is the client? (reverse-proxy trust model)
 
 The panel decides "who did this" from the request's **peer address**, and every security control
@@ -448,7 +492,7 @@ Every mutation and every access to a router UI or shell is recorded:
 | `luci.open` | an authenticated user hit a router vhost (throttled to 1/min/user/router) |
 | `console.start` / `console.open` / `console.close` | shell lifecycle |
 | `user.*` | user administration |
-| `settings.agent_endpoint.save` / `.reset` / `.test` | the agent endpoint was changed, dropped, or probed from the panel |
+| `settings.agent_endpoint.save` / `.reset` / `.test` | the agent endpoint was changed, dropped, or probed from the panel. All three carry `verify_tls` in `detail`, so a downgrade of the TLS policy is a row in this table, not a change nobody saw |
 
 The audit table is append-only in the application (there is no update or delete path) and each
 row carries actor, role-derived username, router, IP and optional detail. Recommended retention:
@@ -475,6 +519,9 @@ ship to a log store you cannot rewrite (`journald` + off-host forwarding); the s
       `127.0.0.1` and confirm that a request with a forged `X-Forwarded-For` from another host
       still audits the real peer address
 - [ ] Port ranges 20000-30000 bound to loopback only (verify with `ss -ltn`)
+- [ ] The agent endpoint verifies certificates: `GET /api/v1/settings/agent-endpoint` reports
+      `verify_tls: true`, and no router has `tunnelgate.main.tls_verify=0` unless the §7
+      trade-off was accepted deliberately
 - [ ] Wildcard DNS `*.<domain>` points at the VPS; the certificate covers it
 - [ ] Backups include the SQLite file **and** `authorized_keys` (they must stay consistent)
 - [ ] Rotate every router key at least once after the initial rollout to prove the flow

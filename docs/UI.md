@@ -201,6 +201,23 @@ internal panel URL - so the two are shown separately and never conflated.
   "Reachable: HTTP 200 in 42 ms" or "Not reachable: <error>", followed by the
   URL that was checked. The button is disabled when the panel has no address it
   could probe from.
+- **Ignore SSL self-signed certificates** sits under the port field, phrased as
+  an opt-out because the safe default must never read as "the router does not
+  check". It is off by default and stays off. Ticking it reveals a warning that
+  names what is actually lost - the router can no longer tell the panel from an
+  impostor, and the bootstrap token in the install command plus every later API
+  token travel over that unverified connection - and it changes two things at
+  once: the install command gains `curl -k` / `wget --no-check-certificate`
+  behind a leading comment line, and every later heartbeat inherits the same
+  `TG_TLS_VERIFY=0`. Over `http` there is no certificate, so the checkbox is
+  disabled with "Not applicable: plain HTTP has no certificate to check." and
+  the request the form sends still carries `verify_tls: true`; switching back to
+  `https` restores whatever the operator had chosen. The choice is part of the
+  form's identity, so a change made elsewhere reseeds the checkbox exactly like
+  the protocol, host and port - it is never silently kept or silently dropped.
+  A viewer sees the resolved state instead: a "Certificate" row reading
+  "verified" or "not verified" and, when verification is off, the same warning
+  without the control.
 - When the panel has no usable endpoint at all (`TUNNELGATE_PANEL_URL` is not a
   valid http(s) URL and nothing is stored) the card explains that no install
   command can point anywhere and, for an admin, still renders the empty form so

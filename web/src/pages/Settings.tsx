@@ -887,6 +887,12 @@ function AgentEndpointCard({
   const [scheme, setScheme] = useState<AgentScheme>(endpoint?.scheme ?? 'https')
   const [host, setHost] = useState(endpoint?.host ?? '')
   const [port, setPort] = useState(endpoint?.port === null || endpoint?.port === undefined ? '' : String(endpoint.port))
+  // The checkbox is phrased as "ignore", so this holds the operator's intent; the wire field is
+  // its inverse (verify_tls). Kept separate from `scheme` so switching to http and back does not
+  // silently flip a decision the operator made deliberately.
+  // `=== false` rather than `!verify_tls`: absent means verified (the documented default for a
+  // row written by 1.0.0/1.1.0), so a missing field must not render as "verification is off".
+  const [ignoreTls, setIgnoreTls] = useState(endpoint ? endpoint.verify_tls === false : false)
   const [fieldError, setFieldError] = useState<Record<string, string>>({})
   const [savedUrl, setSavedUrl] = useState<string | null>(null)
   const [testResult, setTestResult] = useState<AgentEndpointTest | null>(null)
@@ -895,13 +901,16 @@ function AgentEndpointCard({
   // Seeds from the server every time the effective endpoint identity changes, so a
   // save/revert elsewhere (or a reload) resets the form instead of stranding edits.
   const seededRef = useRef<string>('')
-  const seedKey = endpoint ? `${endpoint.source}:${endpoint.scheme}:${endpoint.host}:${endpoint.port}` : ''
+  const seedKey = endpoint
+    ? `${endpoint.source}:${endpoint.scheme}:${endpoint.host}:${endpoint.port}:${endpoint.verify_tls}`
+    : ''
   useEffect(() => {
     if (!endpoint || seededRef.current === seedKey) return
     seededRef.current = seedKey
     setScheme(endpoint.scheme)
     setHost(endpoint.host)
     setPort(endpoint.port === null ? '' : String(endpoint.port))
+    setIgnoreTls(endpoint.verify_tls === false)
     setFieldError({})
     setSavedUrl(null)
     setTestResult(null)
@@ -916,26 +925,35 @@ function AgentEndpointCard({
       ? agentUrl(scheme, host, parsedPort === 'invalid' ? null : parsedPort)
       : null
 
+  // Over plain http there is no certificate, so "ignore it" is not a setting - it is a claim the
+  // router could not act on. The server normalises verify_tls back to true for http; the form
+  // shows the checkbox unchecked and disabled instead of pretending otherwise.
+  const tlsApplies = scheme === 'https'
+  const tlsOff = tlsApplies && ignoreTls
+
   const pristine =
     endpoint !== null &&
     scheme === endpoint.scheme &&
     host.trim() === endpoint.host &&
-    (parsedPort === 'invalid' ? null : parsedPort) === endpoint.port
+    (parsedPort === 'invalid' ? null : parsedPort) === endpoint.port &&
+    !tlsOff === (endpoint.verify_tls !== false)
 
   const payload = (): AgentEndpointInput => ({
     scheme,
     host: host.trim(),
     port: parsedPort === 'invalid' ? null : parsedPort,
+    verify_tls: !tlsOff,
   })
 
   const applyResult = (res: AgentEndpointResult) => {
     queryClient.setQueryData<PanelConfig>(['config'], (old) =>
       old ? { ...old, agent_url: res.agent_url, agent_endpoint: res.agent_endpoint } : old,
     )
-    seededRef.current = `${res.agent_endpoint.source}:${res.agent_endpoint.scheme}:${res.agent_endpoint.host}:${res.agent_endpoint.port}`
+    seededRef.current = `${res.agent_endpoint.source}:${res.agent_endpoint.scheme}:${res.agent_endpoint.host}:${res.agent_endpoint.port}:${res.agent_endpoint.verify_tls}`
     setScheme(res.agent_endpoint.scheme)
     setHost(res.agent_endpoint.host)
     setPort(res.agent_endpoint.port === null ? '' : String(res.agent_endpoint.port))
+    setIgnoreTls(res.agent_endpoint.verify_tls === false)
     setFieldError({})
     // Only a database override is a save; after a revert the badge would lie.
     setSavedUrl(res.agent_endpoint.source === 'database' ? res.agent_url : null)
@@ -1046,6 +1064,7 @@ function AgentEndpointCard({
                     ? `${DEFAULT_PORTS[endpoint.scheme]} (scheme default)`
                     : String(endpoint.port),
                 ],
+                ['Certificate', endpoint.verify_tls === false ? 'not verified' : 'verified'],
               ].map(([label, value]) => (
                 <div key={label} className="flex items-start gap-3 px-3 py-1.5">
                   <dt className="w-24 shrink-0 text-2xs text-muted">{label}</dt>
@@ -1054,7 +1073,17 @@ function AgentEndpointCard({
               ))}
             </dl>
           ) : null}
-          {missing}
+          {endpoint && endpoint.verify_tls === false ? (
+            <InlineAlert tone="warning" className="mt-3" title="Certificate verification is off">
+              Routers accept this panel&apos;s certificate without checking who issued it, so an impostor
+              that can intercept the connection would go unnoticed. Install commands and heartbeat
+              tokens travel over that same connection. An administrator can change it in Agent
+              endpoint.
+            </InlineAlert>
+          ) : null}
+          {/* Pre-existing bug fixed here: `missing` was rendered unconditionally, so a viewer saw
+              "No agent endpoint is configured" directly under a fully configured endpoint. */}
+          {endpoint ? null : missing}
           <InlineAlert tone="info" className="mt-3" title="Only an admin can change where routers dial">
             Ask an administrator if this address is wrong - every pending install command points at it.
           </InlineAlert>
@@ -1133,6 +1162,52 @@ function AgentEndpointCard({
             }}
           />
         </div>
+
+        {/* Phrased as an explicit opt-out, because that is what it is: the default must never
+            read as "the router does not check". Disabled over http - there is no certificate. */}
+        <div className="mt-3 rounded border border-border px-3 py-2" aria-disabled={!tlsApplies}>
+          <label
+            htmlFor="f-ignore_tls"
+            className={cn(
+              'flex items-start gap-2 text-2xs',
+              tlsApplies ? 'cursor-pointer text-text' : 'cursor-not-allowed text-faint',
+            )}
+          >
+            <input
+              id="f-ignore_tls"
+              name="ignore_tls"
+              type="checkbox"
+              checked={tlsOff}
+              disabled={!tlsApplies || saveMutation.isPending}
+              aria-describedby={tlsApplies ? (tlsOff ? 'tls-off-warning' : 'tls-hint') : 'tls-hint'}
+              onChange={(e) => {
+                setIgnoreTls(e.target.checked)
+                setTestResult(null)
+              }}
+              className="mt-0.5 h-3.5 w-3.5 shrink-0 cursor-pointer rounded-sm border-border-strong bg-surface-2 accent-[rgb(var(--tg-accent))] disabled:cursor-not-allowed"
+            />
+            <span>
+              Ignore SSL self-signed certificates
+              <span className="mt-0.5 block font-normal text-muted" id="tls-hint">
+                {tlsApplies
+                  ? 'Leave this off unless the panel uses a certificate this router cannot verify. It changes the install command and every later heartbeat.'
+                  : 'Not applicable: plain HTTP has no certificate to check.'}
+              </span>
+            </span>
+          </label>
+        </div>
+
+        {tlsOff ? (
+          <InlineAlert tone="warning" className="mt-2.5" title="Routers will stop checking who answers">
+            <span id="tls-off-warning" className="text-2xs">
+              The router can no longer tell this panel from an impostor: anything that can intercept
+              the connection could answer in its place and the router would believe it. The bootstrap
+              token in the install command and every API token the router then sends ride on that
+              connection. Use this only for a panel on a self-signed certificate you control, and turn
+              it back on once the certificate is trusted.
+            </span>
+          </InlineAlert>
+        ) : null}
 
         {previewUrl ? (
           <p className="mt-2.5 text-2xs text-muted">
@@ -1265,6 +1340,17 @@ function ConfigList({ config }: { config: PanelConfig }) {
     ['Agent URL', config.agent_url, 'What routers dial (editable above).'],
     ['Internal panel URL', config.panel_url, 'How the proxy reaches the panel on this host.'],
     ['Route mode', config.route_mode, pathMode ? 'One gateway host, and a path per router.' : 'One host per router.'],
+    [
+      'Certificate check',
+      config.agent_endpoint
+        ? config.agent_endpoint.verify_tls
+          ? 'verified'
+          : 'ignored (self-signed)'
+        : '',
+      config.agent_endpoint
+        ? 'What the router does with the panel certificate (editable above).'
+        : 'Unknown until the panel has an agent endpoint.',
+    ],
     ...(pathMode
       ? ([
           [

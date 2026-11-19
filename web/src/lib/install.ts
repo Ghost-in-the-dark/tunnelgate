@@ -1,4 +1,4 @@
-/** The install-wizard model: options, step machine and the curl/wget command variants. */
+/** The install-wizard model: options, step machine and the install command variants. */
 
 export interface OsOption {
   id: 'linux' | 'freebsd' | 'windows'
@@ -42,7 +42,7 @@ export const OS_OPTIONS: OsOption[] = [
 export const WIZARD_STEPS = [
   { id: 1, label: 'Choose OS', description: 'Platform' },
   { id: 2, label: 'Router details', description: 'Name and grouping' },
-  { id: 3, label: 'Copy command', description: 'One-liner' },
+  { id: 3, label: 'Copy command', description: 'No curl needed' },
   { id: 4, label: 'Connection', description: 'Watch it come up' },
 ]
 
@@ -68,33 +68,35 @@ export const EMPTY_DRAFT: WizardDraft = {
 export const SUGGESTED_INTEGRATIONS = ['singbox', 'openwisp', 'wireguard', 'dhcp-leases', 'firmware-report', 'ddns']
 
 export interface CommandVariant {
-  id: 'curl' | 'wget' | 'manual'
+  id: 'install' | 'manual'
   label: string
 }
 
+/**
+ * Two ways to install, and the panel chooses the fetcher in neither of them.
+ *
+ * The server emits a single command that probes for curl or wget itself, because stock
+ * OpenWrt ships neither: /usr/bin/wget there is a symlink to uclient-fetch and the busybox
+ * wget applet is absent, and uclient-fetch only gained --header in 24.10. The panel used to
+ * rewrite a curl one-liner into a wget one; that rewrite could not work on the routers it
+ * targeted, so the command is now shown exactly as served and never edited here.
+ */
 export const COMMAND_VARIANTS: CommandVariant[] = [
-  { id: 'curl', label: 'curl | sh' },
-  { id: 'wget', label: 'wget | sh' },
-  { id: 'manual', label: 'manual' },
+  { id: 'install', label: 'one command' },
+  { id: 'manual', label: 'script URL' },
 ]
 
 /**
- * The server hands us one canonical command. We derive the wget form from it rather
- * than inventing a second endpoint: the only difference is the fetcher.
+ * The command to put in front of the operator.
+ *
+ * 'install' returns the served string VERBATIM - no substitution, no line dropped, no
+ * fetcher swapped. The served text is the only version tested end to end, and a command the
+ * panel rewrites is a command nobody tested: that is exactly how the old curl->wget rewrite
+ * shipped a one-liner that could not work on a stock OpenWrt. 'manual' returns the bare,
+ * token-less script URL for an operator who would rather fetch the installer by hand.
  */
 export function commandFor(variant: CommandVariant['id'], installCommand: string, scriptUrl: string): string {
-  switch (variant) {
-    case 'wget':
-      return installCommand
-        .replace(/curl -fsSL/g, 'uclient-fetch -qO-')
-        .replace(/curl -fsS/g, 'uclient-fetch -qO-')
-        .replace(/curl -fsSLk/g, 'uclient-fetch -qO-')
-        .replace(/\bcurl -sSL\b/g, 'uclient-fetch -qO-')
-    case 'manual':
-      return scriptUrl
-    default:
-      return installCommand
-  }
+  return variant === 'manual' ? scriptUrl : installCommand
 }
 
 export const PHASES = ['waiting', 'connected', 'reporting', 'done'] as const
@@ -135,7 +137,7 @@ export const TROUBLESHOOTING: Array<{ title: string; body: string }> = [
   },
   {
     title: 'The command ran but nothing happened',
-    body: 'Look for "no such file" (no curl or wget installed), and check the clock: a skewed router clock can make the signed request look expired.',
+    body: 'Read what the command printed. "Neither curl nor wget is installed on this router" means the image has no fetcher at all; "the panel did not return the installer" means the token was rejected, so mint a fresh command. Then check the clock - a skewed router clock makes the request look expired.',
   },
   {
     title: 'Port forwarding refused',

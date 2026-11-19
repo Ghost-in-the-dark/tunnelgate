@@ -88,6 +88,51 @@ def tokens_equal(a: str, b: str) -> bool:
     return hmac.compare_digest(a, b)
 
 
+# --------------------------------------------------------------------------- basic auth
+# The challenge every router-facing 401 must carry. uclient-fetch (OpenWrt's wget) only retries
+# with credentials after it has seen a challenge, so without this header the operator sees a bare
+# 401 and the credential it was already configured with is never sent.
+WWW_AUTHENTICATE_BASIC = 'Basic realm="tunnelgate"'
+
+
+def basic_auth_username(authorization: str | None) -> str | None:
+    """The username of an HTTP Basic Authorization header, or None if there is not one.
+
+    The bootstrap and api tokens travel as this username with an empty password, because that is
+    the only credential channel that works on every stock OpenWrt image: curl is absent there and
+    uclient-fetch only grew --header in 24.10, while --user/--password works on all of them.
+
+    A colon-less payload is ACCEPTED as "username with an empty password". RFC 7617 specifies
+    user-id ":" password, but real clients drop the colon when the password is empty: this was
+    measured on stock OpenWrt 19.07.10 / 22.03.7 / 23.05.5 / 24.10.1 through a logging proxy, and
+    every one of them sends base64(TOKEN) with no colon for both the URL-userinfo retry and
+    --user=TOKEN --password=''. Rejecting that payload made the router answer 401 forever, so the
+    acceptance is not leniency - it is the difference between the channel working and not. A
+    colon-less payload and "TOKEN:" decode to the same username and are treated identically; the
+    password half is never checked either way.
+
+    Defensive by contract: a header that is missing, is not Basic, or is not valid base64 is
+    simply "no token" and must never raise. This runs before authentication, so an exception here
+    would be a 500 reachable by anyone.
+    """
+    if not authorization:
+        return None
+    try:
+        scheme, _, encoded = authorization.partition(" ")
+        if scheme.strip().lower() != "basic":
+            return None
+        # validate=True rejects the newlines and stray whitespace that base64.b64decode ignores,
+        # so a header mangled in transit is a clean "no token" instead of a corrupt credential.
+        decoded = base64.b64decode(encoded.strip(), validate=True).decode("utf-8", "strict")
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return None
+    # partition() returns sep == "" when there is no colon, which is the uclient-fetch shape:
+    # the whole payload is then the username and the password is implicitly empty.
+    username, _sep, _password = decoded.partition(":")
+    # An empty username is not a token; it means the device authenticated as nobody.
+    return username.strip() or None
+
+
 # --------------------------------------------------------------------------- ssh key material
 @dataclass(slots=True)
 class KeyPair:

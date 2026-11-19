@@ -129,6 +129,15 @@ export interface AgentEndpoint {
   /** null means "the scheme default" (80 for http, 443 for https). */
   port: number | null
   source: 'environment' | 'database'
+  /**
+   * True = the router verifies the panel's certificate. False = the operator accepted a
+   * self-signed one, so the router cannot tell the panel from an impostor.
+   *
+   * The server forces this to true on an http endpoint: there is no certificate to check, and
+   * a stored false there would be a claim the router could not act on. The UI therefore never
+   * sends false over http - see the checkbox in Settings.
+   */
+  verify_tls: boolean
 }
 
 /** Body of PUT/DELETE/POST /api/v1/settings/agent-endpoint. */
@@ -136,6 +145,8 @@ export interface AgentEndpointInput {
   scheme: AgentScheme
   host: string
   port: number | null
+  /** Sent on save AND on the probe: the probe must test the policy about to be saved. */
+  verify_tls: boolean
 }
 
 /** 200 body of the save and the reset. */

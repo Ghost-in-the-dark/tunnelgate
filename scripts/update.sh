@@ -6,7 +6,7 @@ set -eu
 # refuse to run ahead of the database, restart, and verify.
 #
 #   curl -fsSL https://raw.githubusercontent.com/Ghost-in-the-dark/tunnelgate/main/scripts/update.sh \
-#     | sudo sh -s -- --ref v1.2.0
+#     | sudo sh -s -- --ref v1.1.2
 #
 # "curl ... | sudo sh" is the supported form, so stdin IS this script: every
 # prompt reads /dev/tty, never stdin (a plain read would eat the next line of
@@ -106,9 +106,9 @@ usage() {
 TunnelGate update - fetch a release, rebuild, check the schema, restart, verify.
 
   curl -fsSL https://raw.githubusercontent.com/Ghost-in-the-dark/tunnelgate/main/scripts/update.sh \
-    | sudo sh -s -- --ref v1.2.0
+    | sudo sh -s -- --ref v1.1.2
 
-  sudo ./scripts/update.sh --ref v1.2.0 --source .     from a checkout
+  sudo ./scripts/update.sh --ref v1.1.2 --source .     from a checkout
   sudo ./scripts/update.sh --check-only                what is installed, what is new
 
 WHAT IT CHANGES

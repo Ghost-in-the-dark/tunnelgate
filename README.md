@@ -101,7 +101,7 @@ router - read [docs/SECURITY.md §6.1](docs/SECURITY.md) before adding routers y
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Ghost-in-the-dark/tunnelgate/main/scripts/update.sh \
-  | sudo sh -s -- --ref v1.2.0
+  | sudo sh -s -- --ref v1.1.2
 ```
 
 Omit `--ref` for the latest release; `--check-only` prints installed vs available and changes

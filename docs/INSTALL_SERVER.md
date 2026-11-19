@@ -33,8 +33,8 @@ directory, installs the panel and removes that directory afterwards. Using the t
 `main` pins a version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Ghost-in-the-dark/tunnelgate/v1.2.0/scripts/quick-install.sh \
-  | sudo sh -s -- --host gate.example.com --ref v1.2.0
+curl -fsSL https://raw.githubusercontent.com/Ghost-in-the-dark/tunnelgate/v1.1.2/scripts/quick-install.sh \
+  | sudo sh -s -- --host gate.example.com --ref v1.1.2
 ```
 
 Piping a shell script to `sh` is only reasonable when you can read it first, so the script
@@ -1071,7 +1071,7 @@ One command, on the panel host:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Ghost-in-the-dark/tunnelgate/main/scripts/update.sh \
-  | sudo sh -s -- --ref v1.2.0
+  | sudo sh -s -- --ref v1.1.2
 ```
 
 Drop `--ref` to take the latest GitHub release. `--check-only` prints the installed and the
@@ -1108,7 +1108,7 @@ stale (it is reconciled on startup).
 
 ```bash
 cd /opt/tunnelgate
-git fetch --tags && git checkout v1.2.0
+git fetch --tags && git checkout v1.1.2
 .venv/bin/pip install -r requirements.txt
 (cd web && npm ci && npm run build)   # required: web/dist is not in the repo
 .venv/bin/python -m app.cli check-schema

@@ -62,7 +62,7 @@ read the output.
 | Scripts, monitoring, ticket attachments | `doctor --json`, `check-schema --json`, `console-url --json` |
 
 ```bash
-python -m app.cli --version      # tunnelgate 1.2.0  (argparse "version" action, exit 0)
+python -m app.cli --version      # tunnelgate 1.1.2  (argparse "version" action, exit 0)
 python -m app.cli                # prints help, exit 2
 ```
 
@@ -168,7 +168,7 @@ exit code, or on `"ok": false` in the JSON.
 
 ```console
 $ .venv/bin/python -m app.cli doctor
-OK   python: 3.13.5 / tunnelgate 1.2.0
+OK   python: 3.13.5 / tunnelgate 1.1.2
 WARN secret key: not set (dev mode)
       -> fine for development; production refuses to start without it
 OK   cookie flags: secure=False
@@ -189,10 +189,10 @@ The machine-readable shape is `Report.render(as_json=True)`:
 
 ```json
 {
-  "version": "1.2.0",
+  "version": "1.1.2",
   "ok": false,
   "checks": [
-    {"name": "python", "status": "ok", "detail": "3.13.5 / tunnelgate 1.2.0", "fix": ""},
+    {"name": "python", "status": "ok", "detail": "3.13.5 / tunnelgate 1.1.2", "fix": ""},
     {"name": "secret key", "status": "warn", "detail": "not set (dev mode)",
      "fix": "fine for development; production refuses to start without it"}
   ]
@@ -211,7 +211,7 @@ often not the function name.
 
 #### `_check_runtime` - "python", "secret key", "cookie flags"
 
-- `_check_version` emits `OK python: 3.13.5 / tunnelgate 1.2.0` - the interpreter triplet
+- `_check_version` emits `OK python: 3.13.5 / tunnelgate 1.1.2` - the interpreter triplet
   plus `app.__version__`. It never fails; a wrong Python fails at import instead.
 - **secret key**: `TUNNELGATE_SECRET_KEY` set is `OK`. Unset in `TUNNELGATE_ENV=production`
   is a **failure** (the app refuses to start and stored console keys cannot be decrypted);

@@ -8,11 +8,17 @@ Panel and router are versioned separately: `agent/install.sh` carries its own
 `CLIENT_VERSION` (the bootstrap protocol the panel records per router), so a panel patch release
 does not require reinstalling every router.
 
-## [1.2.0] - 2026-11-19
+## [1.1.2] - 2026-11-19
 
 The release that makes the router install work on a stock router, and makes the panel reachable
 from one that does not trust its certificate. Both were measured on real OpenWrt images of every
 generation rather than reasoned about, and both changed the design.
+
+Numbered as a patch release at the maintainer's request. It carries two feature-level changes
+(the fetcher-probing installer and the TLS-trust toggle), which would normally be a minor bump,
+and it supersedes the never-published 1.2.0: that tag was cut, found to contain the defects
+listed under Security below, and withdrawn before anyone could install from it. There is no
+1.2.0 to upgrade from and no 1.1.1.
 
 ### Added
 

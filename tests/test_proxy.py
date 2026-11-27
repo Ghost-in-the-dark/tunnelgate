@@ -1330,7 +1330,15 @@ def _two_vhost_parse(
     routes.write_text(locations)
     port = "127.0.0.1:18443"
     problem = ""
-    panel_text = panel.read_text()
+
+    # The shipped templates log to /var/log/nginx, which an unprivileged test run cannot
+    # open even for "nginx -t" (it tries to open every log file). CI caught this as a
+    # Permission denied that a root shell here never sees, so the paths are redirected into
+    # the temporary prefix. Only the destination changes - the directive shapes stay shipped.
+    def _logs_into_prefix(text: str) -> str:
+        return text.replace("/var/log/nginx/", f"{prefix}/logs/")
+
+    panel_text = _logs_into_prefix(panel.read_text())
     if "include /etc/nginx/tunnelgate/routes.conf;" not in panel_text:
         problem = "the panel vhost no longer has the routes include the installer rewrites\n"
     panel_text = panel_text.replace(
@@ -1339,7 +1347,7 @@ def _two_vhost_parse(
     panel_text = panel_text.replace("listen 80 default_server;", f"listen {port} default_server;")
     panel_text = panel_text.replace("listen [::]:80 default_server;", "")
     (prefix / "panel.conf").write_text(panel_text)
-    gateway_text = gateway.read_text()
+    gateway_text = _logs_into_prefix(gateway.read_text())
     gateway_text = gateway_text.replace(
         "server_name gateway.example.com;", "server_name gate.panel.test;"
     )

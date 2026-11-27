@@ -202,7 +202,9 @@ This is the option to pick when the domain is a free dynamic-DNS name (a wildcar
 usually not available there) or when you have no DNS control at all.
 
 Path mode has **two layouts**, and the panel picks one by comparing `TUNNELGATE_GATEWAY_HOST`
-with `TUNNELGATE_PANEL_HOST`. There is no separate flag.
+with `TUNNELGATE_PANEL_HOST`. There is no separate flag. A third shape - separate, but with TLS
+terminating in front of a plain-HTTP nginx - is the one `scripts/quick-install.sh
+--gateway-host` installs, and it is described at the end of this section.
 
 | | separate (recommended) | merged |
 |---|---|---|
@@ -215,8 +217,9 @@ with `TUNNELGATE_PANEL_HOST`. There is no separate flag.
 different origin, so a compromised router cannot act inside the panel. **Merged** is for the case
 where one public name is all you have - a free dynamic-DNS name with no wildcard, a single
 certificate, or a panel on a bare IP. It costs origin isolation: whatever a router serves runs in
-the panel's origin and can use the operator's session, including reading the CSRF token. Read
-docs/SECURITY.md §6.1 before choosing it.
+the panel's origin and can use the operator's session and read the other routers' LuCI. Read
+docs/SECURITY.md §6.1 before choosing it, and note that `scripts/quick-install.sh` now refuses to
+install it without an explicit `--allow-shared-origin`.
 
 In the merged layout the include moves into the panel vhost:
 
@@ -251,6 +254,30 @@ half of the story - the bad half is that the error names `routes.conf`, not the 
 included it. `app.cli doctor` runs `nginx -t` under `routes include` and, on failure, tells you
 which context the layout in effect wants; it warns under `gateway host` for the merged layout
 itself.
+
+**Separate on a plain-HTTP hop.** If nginx does not terminate TLS itself - it listens on a plain
+port and your proxy in front serves https, which is what `scripts/quick-install.sh` installs -
+then the gateway's `server` block cannot live in `routes.conf`: the panel rewrites that file on
+every router or port change, so a listen port written into it would be lost, and no setting names
+that port. Set `TUNNELGATE_PROXY_PLAIN_HTTP=true` and the renderer emits locations only (the
+merged file shape) for a gateway on its own name; the gateway's server block lives in the
+installer's vhost (`deploy/nginx/tunnelgate-gateway-behind-proxy.conf`, installed on the same
+plain port as the panel vhost) and includes `routes.conf` inside it:
+
+```nginx
+server {
+    listen 80;
+    server_name gate.example.com;
+    include /etc/nginx/tunnelgate/routes.conf;   # locations only
+    location / { return 404; }
+}
+```
+
+In this shape the **panel** vhost must not include `routes.conf` - that is the one mistake that
+parses, works, and quietly puts every `/<slug>/` back on the panel's origin. `app.cli doctor`
+reports the shape as OK under `gateway host` (it is a separate origin); `routes include` names
+the gateway vhost if the include is in the wrong file, and `nginx -t` passes either way, so
+check it there and not by eye.
 
 In practice merged mode means editing the shipped `deploy/nginx/tunnelgate.conf`: it places the
 routes include in the http context (just after the upgrade map) for subdomain and separate mode,

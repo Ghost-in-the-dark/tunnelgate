@@ -3,6 +3,13 @@
 The last active admin is protected: demoting or deleting them would leave a panel with nobody
 able to manage users, which is unrecoverable through the UI. The check runs inside the request
 transaction so two concurrent demotions cannot both see "there are two admins".
+
+The per-router grant routes at the bottom live here rather than in app/api/routers.py because a
+grant is a property of a USER, not of a router: an access review starts from "what may this
+person reach", and the question "who can reach this router" is answered by the same table from
+the audit trail. Everything under /api/v1/users is admin-only, which is also what a permission
+change deserves - an operator who could grant themselves routers would make app/services/access.py
+pointless.
 """
 
 from __future__ import annotations
@@ -14,12 +21,13 @@ from fastapi import APIRouter, Request, Response
 from sqlalchemy import func, select
 
 from ..config import utcnow
-from ..deps import AdminUser, CsrfGuard, DbSession, client_ip
+from ..deps import AdminUser, CsrfGuard, DbSession, SettingsDep, client_ip
 from ..errors import ApiError
-from ..models import PanelSession, User
-from ..schemas import UserCreate, UserOut, UserUpdate
+from ..models import PanelSession, Router, RouterGrant, User
+from ..schemas import UserCreate, UserOut, UserRouterGrantsIn, UserUpdate
 from ..security import hash_password, password_problem, verify_password
 from ..services.audit import record as audit_record
+from .routers import router_out
 
 log = logging.getLogger(__name__)
 
@@ -188,5 +196,158 @@ async def delete_user(
         detail={"username": username},
     )
     db.delete(item)
+    db.commit()
+    return Response(status_code=204)
+
+
+# --------------------------------------------------------------------------- router grants
+# Per-router permissions. Admin and operator never need a row here - app/services/access.py
+# says why - so these routes exist to hand a viewer one router at a time and to let an access
+# review read back exactly what was handed out. Replacing the whole set (PUT) rather than
+# adding/removing single rows is deliberate: a set operation is idempotent, so a UI retry after
+# a timeout cannot double-grant, and the audit row then records the state that resulted instead
+# of a delta nobody can replay against an unknown starting point.
+def _granted_router_ids(db, user_id: int) -> set[str]:
+    rows = db.execute(select(RouterGrant.router_id).where(RouterGrant.user_id == user_id))
+    return set(rows.scalars().all())
+
+
+@router.get("/{user_id}/routers", response_model=dict)
+async def list_user_routers(
+    user_id: int,
+    db: DbSession,
+    admin: AdminUser,
+    settings: SettingsDep,
+) -> dict:
+    """The routers granted to one user, in the list shape the router screens already use."""
+    item = _get_user(db, user_id)
+    rows = (
+        db.execute(
+            select(Router)
+            .join(RouterGrant, RouterGrant.router_id == Router.id)
+            .where(RouterGrant.user_id == item.id)
+            .order_by(Router.created_at.desc())
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        "items": [router_out(row, settings=settings) for row in rows],
+        "total": len(rows),
+    }
+
+
+@router.put("/{user_id}/routers", response_model=dict)
+async def replace_user_routers(
+    user_id: int,
+    payload: UserRouterGrantsIn,
+    request: Request,
+    db: DbSession,
+    admin: AdminUser,
+    _csrf: Annotated[None, CsrfGuard],
+    settings: SettingsDep,
+) -> dict:
+    """Replace the set of routers this user may reach. Unknown ids are a 400, not a silent skip.
+
+    Silently ignoring an id that no longer exists would be the worst of both worlds: the caller
+    believes a grant exists, no row was written, and nobody finds out until that person cannot
+    open the router. Naming the ids in the error lets the UI show which one went stale.
+
+    Role changes and grants are deliberately independent. Promoting a user to admin or operator
+    leaves their grant rows in place - they are redundant then, harmless, and if the role falls
+    back to viewer they become the whole permission again. Demoting an admin or operator to
+    viewer does NOT create grants and does not delete anything: they simply stop reaching
+    routers until an admin grants them, one at a time. Deleting a user or a router does cascade
+    the rows away (ondelete CASCADE), so "no rows" always means "no grants", never an orphan.
+    """
+    item = _get_user(db, user_id)
+    wanted = payload.router_ids
+    if wanted:
+        found = set(db.execute(select(Router.id).where(Router.id.in_(wanted))).scalars().all())
+        missing = [router_id for router_id in wanted if router_id not in found]
+        if missing:
+            raise ApiError(
+                400,
+                "validation_error",
+                "Unknown router id in router_ids: " + ", ".join(sorted(missing)),
+                {
+                    "fields": [
+                        {"loc": ["body", "router_ids"], "msg": f"unknown router {i}"}
+                        for i in missing
+                    ]
+                },
+            )
+    current = _granted_router_ids(db, item.id)
+    target = set(wanted)
+    removed = sorted(current - target)
+    added = sorted(target - current)
+    for router_id in removed:
+        grant = db.execute(
+            select(RouterGrant).where(
+                RouterGrant.user_id == item.id, RouterGrant.router_id == router_id
+            )
+        ).scalar_one()
+        db.delete(grant)
+    for router_id in added:
+        db.add(RouterGrant(user_id=item.id, router_id=router_id, created_by_id=admin.id))
+    db.flush()
+    audit_record(
+        db,
+        "user.grants.update",
+        actor=admin,
+        ip=client_ip(request),
+        user_agent=request.headers.get("user-agent"),
+        detail={
+            "username": item.username,
+            "router_ids": sorted(target),
+            "added": added,
+            "removed": removed,
+        },
+    )
+    db.commit()
+    rows = (
+        db.execute(
+            select(Router).where(Router.id.in_(sorted(target))).order_by(Router.created_at.desc())
+        )
+        .scalars()
+        .all()
+        if target
+        else []
+    )
+    return {
+        "items": [router_out(row, settings=settings) for row in rows],
+        "total": len(rows),
+    }
+
+
+@router.delete("/{user_id}/routers/{router_id}", status_code=204)
+async def revoke_user_router(
+    user_id: int,
+    router_id: str,
+    request: Request,
+    db: DbSession,
+    admin: AdminUser,
+    _csrf: Annotated[None, CsrfGuard],
+) -> Response:
+    """Remove ONE grant. 404 when there was none: a delete that reports success while doing
+    nothing teaches the caller that the router was protected when it was not."""
+    item = _get_user(db, user_id)
+    grant = db.execute(
+        select(RouterGrant).where(
+            RouterGrant.user_id == item.id, RouterGrant.router_id == router_id
+        )
+    ).scalar_one_or_none()
+    if grant is None:
+        raise ApiError(404, "not_found", "This user has no grant for that router")
+    db.delete(grant)
+    audit_record(
+        db,
+        "user.grants.revoke",
+        actor=admin,
+        router_id=router_id,
+        ip=client_ip(request),
+        user_agent=request.headers.get("user-agent"),
+        detail={"username": item.username, "router_ids": [router_id]},
+    )
     db.commit()
     return Response(status_code=204)

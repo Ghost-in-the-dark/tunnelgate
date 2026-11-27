@@ -83,25 +83,28 @@ ACME client:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Ghost-in-the-dark/tunnelgate/main/scripts/quick-install.sh \
-  | sudo sh -s -- --host gate.example.com
+  | sudo sh -s -- --host panel.example.com --gateway-host gate.example.com
 ```
 
 It downloads the sources into a temporary directory (removed when it finishes), asks one
 question - which account the panel service runs as: a dedicated `tunnelgate` account
 (recommended, the default) or `root` (not recommended) - and serves plain HTTP on one port.
-Path routing in the merged layout means every router is `<your-public-url>/<slug>/` on the
-panel's own name - one ordinary name (a free dynamic-DNS one included) and no wildcard
-certificate are enough. It then prints the `proxy_set_header` lines your edge has to
-replicate. Run with `--help` for the flags, `--dry-run` to see the plan, and
-read [docs/INSTALL_SERVER.md](docs/INSTALL_SERVER.md#quick-install-tls-terminated-by-your-own-proxy)
-for what it does and the traps it handles. Merged layout shares the panel's origin with every
-router - read [docs/SECURITY.md §6.1](docs/SECURITY.md) before adding routers you do not control.
+Path routing means every router is `<gateway>/<slug>/`: `--gateway-host` gives the routers a
+name of their own, so they are a different origin from the panel and a compromised router page
+cannot act as the operator. It costs one ordinary DNS name and one extra name on the certificate
+you already have - **not** a wildcard. With only one name available, `--allow-shared-origin`
+accepts routers on the panel's own origin instead (the script asks first, and refuses when there
+is no terminal to ask on; read [docs/SECURITY.md §6.1](docs/SECURITY.md) before choosing it).
+Either way it prints the `proxy_set_header` lines your edge has to replicate. Run with `--help`
+for the flags, `--dry-run` to see the plan, and read
+[docs/INSTALL_SERVER.md](docs/INSTALL_SERVER.md#quick-install-tls-terminated-by-your-own-proxy)
+for what it does and the traps it handles.
 
 ### Upgrading an installed panel
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Ghost-in-the-dark/tunnelgate/main/scripts/update.sh \
-  | sudo sh -s -- --ref v1.1.2
+  | sudo sh -s -- --ref v1.3.0
 ```
 
 Omit `--ref` for the latest release; `--check-only` prints installed vs available and changes
@@ -228,7 +231,11 @@ CHANGELOG.md          what changed in each release, and why
    never stored. Mitigate by keeping the panel minimal and ringing it with a network policy.
 2. **scrypt parameters** (`n=2^14`) are tuned for login latency, not for offline resistance.
 3. **No MFA/TOTP** on panel login (the design allows adding it in front of `/api/auth/login`).
-4. **No per-router ACL** - groups are labels; every operator may reach every router.
+4. **Per-router access is grant-based, not group-based.** `admin` and `operator` reach every
+   router; a `viewer` reaches only the routers an admin grants them
+   (`GET/PUT /api/v1/users/{id}/routers`). Groups stay labels. There is no cross-tenant mode:
+   every `operator` is trusted with the whole fleet, and in the merged path layout a router page
+   can read its neighbours with the operator's session (docs/SECURITY.md §6.2).
 5. **Windows/MacOS router-side script is experimental** - only the POSIX path is tested in CI.
 6. **FreeBSD client support is best-effort** (`pkg` + `autossh`) and not covered by tests.
 7. **No graceful handing-off of live SSH sessions on panel restart** - consoles drop and the user

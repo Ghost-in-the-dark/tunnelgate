@@ -12,7 +12,13 @@ from app.security import hash_password
 def _login(client, username: str, password: str) -> str:
     r = client.post("/api/auth/login", json={"username": username, "password": password})
     assert r.status_code == 200, r.text
-    return r.json()["csrf_token"]
+    # The token is no longer in the body; login writes it to the csrf cookie and mutating
+    # routes need it back in the header as well (double submit).
+    from app.config import get_settings
+
+    token = r.cookies[get_settings().csrf_cookie_name]
+    client.headers[get_settings().csrf_header] = token
+    return token
 
 
 def _viewer(username: str = "audit-viewer") -> int:

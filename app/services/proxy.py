@@ -149,6 +149,27 @@ def _client_max_body(settings) -> str:
     )
 
 
+def _plain_http_hop(settings) -> bool:
+    """Whether the nginx this panel renders into serves plain HTTP behind a TLS proxy.
+
+    Deliberately NOT public_scheme(): that answers "what scheme does a BROWSER use", and on
+    the deployment this is for the answer is https (the operator's proxy terminates TLS).
+    What the renderer needs to know is the hop nginx itself serves - plain, on a port nothing
+    in Settings names - because that decides who may own the gateway's server{} block: the
+    installer's vhost, never a file the panel rewrites at runtime.
+
+    Read from settings first, then TUNNELGATE_PROXY_PLAIN_HTTP, matching the other optional
+    render knobs (_reload_timeout, _client_max_body). Default false: every existing
+    deployment keeps the rendering it had.
+    """
+    raw = getattr(settings, "proxy_plain_http", None)
+    if raw is None:
+        raw = os.environ.get("TUNNELGATE_PROXY_PLAIN_HTTP")
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return bool(raw)
+
+
 def panel_endpoint(settings) -> tuple[str, str]:
     """Split settings.panel_url into (scheme, host:port) for proxy_pass."""
     parts = urlsplit(str(settings.panel_url).strip())
@@ -707,8 +728,65 @@ def _path_router_locations(
     return out
 
 
+def _locations_only_header(settings, gateway: str, routes_path: str, merged: bool) -> list[str]:
+    """The comment block that tells the operator which vhost includes this file.
+
+    Merged and plain-HTTP-separate both render locations only, and getting the include into
+    the wrong file is the one mistake in this layout that fails QUIETLY in the wrong
+    direction: an include inside the panel vhost in separate mode puts every router path back
+    on the panel's origin, which is precisely the origin sharing the separate layout exists to
+    remove - and it keeps working, so nothing surfaces it except a reader of this file. The
+    text therefore names the file to edit in each case rather than sharing one paragraph.
+    """
+    if merged:
+        return [
+            "# MERGED LAYOUT: " + gateway + " is the panel's own host, so this file holds",
+            "# LOCATIONS ONLY - it declares no server{} block (a second block for the same",
+            "# name would be served first and would answer 404 on every panel page).",
+            "#",
+            "# Include it INSIDE the panel server block, after that block's TLS settings",
+            "# and before (or instead of relying on) its own location /:",
+            "#",
+            "#     server {",
+            "#         listen 443 ssl;",
+            "#         server_name " + gateway + ";",
+            "#         ...",
+            "#         include " + routes_path + ";",
+            "#         location / { proxy_pass http://127.0.0.1:8080; ... }",
+            "#     }",
+            "#",
+            "# The router locations reuse the $connection_upgrade map the panel vhost",
+            "# already declares for its own /api/ websocket block. A map is illegal inside",
+            "# a server block, so it cannot live in this file - and nginx allows only one",
+            "# map per target variable, so reusing that name is the only option anyway.",
+            "",
+        ]
+    return [
+        "# SEPARATE LAYOUT ON A PLAIN-HTTP HOP: the gateway is " + gateway + ", not the",
+        "# panel's host, but the nginx that reads this file serves plain HTTP behind a",
+        "# reverse proxy that terminates TLS. This file still holds LOCATIONS ONLY: the",
+        "# gateway's server{} block belongs to its own vhost, because a listen port written",
+        "# here would be lost the next time the router set changes (this file is",
+        "# regenerated) and Settings names no such port.",
+        "#",
+        "# Include it INSIDE the gateway server block - in the file",
+        "# scripts/quick-install.sh installs with --gateway-host, that is",
+        "#     include " + routes_path + ";",
+        "# inside the server{ listen <port>; server_name " + gateway + "; } block. Do NOT",
+        "# include it from the panel vhost as well: the router prefixes would then exist on",
+        "# the panel's own origin, and a hostile router page could act as a signed-in",
+        "# operator (docs/SECURITY.md 6.1) - the exact exposure the separate layout removes.",
+        "#",
+        "# The router locations reuse the $connection_upgrade map the panel vhost already",
+        "# declares for its own /api/ websocket block: a map is illegal inside a server",
+        "# block, so it cannot live in this file, and nginx allows only one map per target",
+        "# variable. The gateway vhost must therefore not declare a second one.",
+        "",
+    ]
+
+
 def render_nginx_path(routes: list[RouteSpec], settings) -> str:
-    """Path mode: one host for the fleet, one location per router - in TWO layouts.
+    """Path mode: one host for the fleet, one location per router - in THREE layouts.
 
     Why a single host at all
     ------------------------
@@ -751,6 +829,19 @@ def render_nginx_path(routes: list[RouteSpec], settings) -> str:
     still reaches the SPA. What that costs is stated in docs/SECURITY.md: paths are not an
     origin boundary, so a hostile router page runs in the panel's origin.
 
+    **Separate on a plain-HTTP hop** (gateway != panel host, TUNNELGATE_PROXY_PLAIN_HTTP=true):
+    the shape scripts/quick-install.sh installs when the operator terminates TLS in their own
+    proxy. nginx then serves plain HTTP and the operator's proxy routes both names to it, so
+    this file cannot carry the gateway server block either - not because of a name clash this
+    time, but because the file is REGENERATED whenever the router set changes: a listen port
+    the installer had written into it would disappear on the next render, and Settings has no
+    field naming that port at all. The gateway name is therefore served by its own vhost,
+    deploy/nginx/tunnelgate-gateway-behind-proxy.conf (written by --gateway-host), which
+    includes this file INSIDE its server block; the renderer emits the same locations-only
+    body as the merged layout and keeps the panel vhost's include OUT. The origin boundary is
+    what matters: the panel and the routers are on different names, so a hostile router page
+    cannot reach the panel's origin (docs/SECURITY.md 6.1).
+
     Known limitation, stated rather than hidden: rewriting happens on HTML only. A LuCI theme
     that builds an absolute URL in JavaScript at runtime, instead of using the <base> the
     theme emitted, will still point at the gateway root. Subdomain mode has no such gap,
@@ -759,6 +850,11 @@ def render_nginx_path(routes: list[RouteSpec], settings) -> str:
     gateway = settings.gateway
     body_limit = _client_max_body(settings)
     merged = bool(getattr(settings, "gateway_merged", False))
+    # A separate gateway on a plain-HTTP nginx still gets its server block from the
+    # installer's vhost rather than from this file (see the docstring), so the body is the
+    # merged one: locations only. Only the header text distinguishes the two, because the
+    # operator has to edit a different file for each.
+    locations_only = merged or _plain_http_hop(settings)
     routes_path = str(settings.proxy_routes_path)
 
     out: list[str] = [
@@ -773,31 +869,8 @@ def render_nginx_path(routes: list[RouteSpec], settings) -> str:
         "#",
     ]
 
-    if merged:
-        out.extend(
-            [
-                "# MERGED LAYOUT: " + gateway + " is the panel's own host, so this file holds",
-                "# LOCATIONS ONLY - it declares no server{} block (a second block for the same",
-                "# name would be served first and would answer 404 on every panel page).",
-                "#",
-                "# Include it INSIDE the panel server block, after that block's TLS settings",
-                "# and before (or instead of relying on) its own location /:",
-                "#",
-                "#     server {",
-                "#         listen 443 ssl;",
-                "#         server_name " + gateway + ";",
-                "#         ...",
-                "#         include " + routes_path + ";",
-                "#         location / { proxy_pass http://127.0.0.1:8080; ... }",
-                "#     }",
-                "#",
-                "# The router locations reuse the $connection_upgrade map the panel vhost",
-                "# already declares for its own /api/ websocket block. A map is illegal inside",
-                "# a server block, so it cannot live in this file - and nginx allows only one",
-                "# map per target variable, so reusing that name is the only option anyway.",
-                "",
-            ]
-        )
+    if locations_only:
+        out.extend(_locations_only_header(settings, gateway, routes_path, merged))
         out.extend(_path_auth_locations(settings, "    "))
         if not routes:
             out.append("    # No routers currently have an allocated tunnel port.")

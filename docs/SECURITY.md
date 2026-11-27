@@ -27,11 +27,11 @@ bootstrap flow, or anything in `app/security.py`.
 | A4 | Compromised **VPS panel** (RCE in the app) | Steal keys that grant access to routers | Tunnel private keys are never stored at all; console private keys are AES-GCM sealed and only unsealed per handshake (an RCE with the master key can still decrypt them - documented limitation) |
 | A5 | Panel user without rights | Touch routers they should not | RBAC (`viewer` cannot create/rotate/delete or open a console); audit of every mutation |
 | A6 | Panel user tampering with another router's URL | Access a router they were not authorised for | The `router_id` is injected by nginx from the matched `server` block, never taken from the request |
-| A7 | CSRF from a malicious site | Perform panel mutations with the operator's cookie | Double-submit CSRF header on every mutating request + `SameSite=Lax` cookie |
+| A7 | CSRF from a malicious site | Perform panel mutations with the operator's cookie | Double submit on every mutating request: `X-CSRF-Token` header **and** the `tg_csrf` cookie, which must agree with each other and with the session row (`app/deps.py:csrf_protect`) + `SameSite=Lax` session cookie |
 | A8 | MITM during onboarding | Learn the private key | TLS to the panel - and note this row assumes the agent **verifies** the certificate: with the agent endpoint's `verify_tls` off (§7) the next link in the chain, the bootstrap token, is handed to an impostor instead; `ssh-keyscan` fingerprint is compared with the value returned by the API over TLS before `known_hosts` is written; `StrictHostKeyChecking=yes` afterwards |
 | A9 | Dump of the panel database | Replay credentials | Passwords are scrypt-hashed; session and bootstrap tokens are stored as SHA-256; only public keys are stored in plaintext |
 | A10 | Operator error (deleting the wrong router) | Outage | Delete is key revocation + port release, reversible by re-creating the router (the router keeps retrying/needs a reinstall) |
-| A11 | Compromised **router** (or anything that can read the traffic reaching its LuCI) | Take over the panel: every router, every console, every mutation - not just the one device | The panel cookie is **host-only by default** (`TUNNELGATE_COOKIE_DOMAIN` unset), so the browser never sends `tg_session` to `<slug>.<suffix>`; every panel-generated router vhost additionally drops the header, in both drivers (`proxy_set_header Cookie "";` / `"delete": ["Cookie"]`); the console WS re-validates the session cookie on `console.<suffix>`, a host the browser reaches only over TLS. What a router *does* get is `tg_luci`: a signed, Host-scoped cookie for that one device, obtainable only from a single-use ticket minted by an authenticated panel request (`/__tg/launch` -> `/__tg/enter`), so it grants that router's LuCI and nothing else, and nginx forwards it to the gate in a dedicated header instead of `$http_cookie`. Replaying it against the panel is worthless: `/api/*` reads only `tg_session` from the panel host, which the browser never sends there. Enabling `COOKIE_DOMAIN` collapses this control - see §6. **In path mode's merged layout this row is weakened**: the router's page is same-origin with the panel, so it does not need to *receive* `tg_session` to use it - the browser sends it on same-origin requests the router's script issues, and `/api/auth/me` hands out the CSRF token. The cookie strip and the host-only default still hold against exfiltration; nothing holds against same-origin abuse. See §6.1 |
+| A11 | Compromised **router** (or anything that can read the traffic reaching its LuCI) | Take over the panel: every router, every console, every mutation - not just the one device | The panel cookie is **host-only by default** (`TUNNELGATE_COOKIE_DOMAIN` unset), so the browser never sends `tg_session` to `<slug>.<suffix>`; every panel-generated router vhost additionally drops the header, in both drivers (`proxy_set_header Cookie "";` / `"delete": ["Cookie"]`); the console WS re-validates the session cookie on `console.<suffix>`, a host the browser reaches only over TLS. What a router *does* get is `tg_luci`: a signed, Host-scoped cookie for that one device, obtainable only from a single-use ticket minted by an authenticated panel request (`/__tg/launch` -> `/__tg/enter`), so it grants that router's LuCI and nothing else, and nginx forwards it to the gate in a dedicated header instead of `$http_cookie`. Replaying it against the panel is worthless: `/api/*` reads only `tg_session` from the panel host, which the browser never sends there. Enabling `COOKIE_DOMAIN` collapses this control - see §6. **In path mode's merged layout this row is weakened**: the router's page is same-origin with the panel, so it does not need to *receive* `tg_session` to use it - the browser sends it on same-origin requests the router's script issues, and a same-origin script can read the CSRF cookie. The cookie strip and the host-only default still hold against exfiltration; nothing holds against same-origin abuse. **It is also no longer confined to the one device**: the same session that reads `/api/...` also reaches `/<other-slug>/`, so one compromised router can read every *other* router's LuCI - see §6.2. See §6.1 |
 
 ### Explicitly out of scope
 
@@ -184,6 +184,7 @@ router has multiple interfaces and you want to be stricter, add `command=` with 
 | Keystrokes leak into logs | The WS handler logs open/close only; never payloads. `paramiko` logging is pinned to WARNING and its transport log is not enabled |
 | No trace of what happened | `ConsoleSession` row + `console.open`/`console.close` audit events; `bytes_in/out` give volume evidence |
 | Router-side audit gap | The console connects as a real (usually `root`) user; the router's own `logread` records the dropbear login. Rotating the console key is the way to cut off a stolen one |
+| A router answers the panel's SSH dial with a forged host key | The router's host key fingerprint is pinned on the first successful handshake (`Router.console_host_key_fingerprint`) and every later handshake must match it - a mismatch refuses to open the shell with `console_auth_failed` instead of exposing the operator's keystrokes. Admins can read the pinned value from `GET /api/v1/routers/{id}/console` and clear it with `DELETE /api/v1/routers/{id}/console/host-key` after verifying a reflashed device out of band (`trust on first use`, so the first handshake is only as trustworthy as the tunnel - which is why the tunnel key is the primary control, A3/A11) |
 
 **Recommended production posture:** create a dedicated `tunnelgate` user on the router with
 shell `/bin/ash` and no password, then set `TUNNELGATE_CONSOLE_SSH_USER` to it on the panel (and
@@ -233,7 +234,9 @@ while the UI still reported "ready".
   the panel host, the second through the router vhost but answered by the panel:
   1. **`GET /__tg/launch?router=<slug>&next=<path>`** on the panel host. Requires a panel
      session (that is the `CurrentUser` dependency, so CSRF does not apply to a GET that only
-     redirects). It mints a 32-byte ticket, stores only its SHA-256 bound to
+     redirects) **and a per-router grant for a `viewer`** (`app.services.access`): a ticket is a
+     credential for one router, so minting one asks the same question the gate asks, rather
+     than handing out a credential that is born dead. It mints a 32-byte ticket, stores only its SHA-256 bound to
      `(router_id, user_id, target path)`, TTL `TUNNELGATE_LAUNCH_TICKET_TTL_SECONDS` (120 s), and
      answers `303 https://<slug>.<suffix>/__tg/enter?t=<ticket>`.
   2. **`GET /__tg/enter?t=<ticket>`** arriving through the router vhost, which proxies it to the
@@ -283,7 +286,15 @@ with the panel's origin privileges:
 
 * it can issue same-origin `fetch` requests to `/api/...` and the browser attaches the operator's
   `tg_session` cookie automatically;
-* it can read the CSRF token, because `GET /api/auth/me` is same-origin and returns it in the body;
+* it can read the CSRF cookie and echo it, so the double-submit check stops nothing here either.
+  `tg_csrf` is deliberately not `HttpOnly` (the SPA has to read it to build the header), so a
+  script running in the panel's origin reads it exactly as it used to read the token out of the
+  `/api/auth/me` body. What the change does buy is that the token is in **no** response body any
+  more: it cannot be lifted from a cached response, a proxy capture, a HAR export, a browser
+  response pane or a bug report, and an attacker who can only make the browser issue a request
+  (without executing script in the origin) no longer gets it - previously one `fetch` of
+  `/api/auth/me` was enough. Against a router page that does run script there, it changes
+  nothing: this is why the merged layout itself, not the token, is the thing to avoid;
 * so it can perform **any** authenticated action the operator can, from the operator's browser:
   add or delete routers, start consoles, mint launch tickets, change settings.
 
@@ -327,9 +338,18 @@ panel `server` block. Put it in the http context instead and nginx refuses to lo
 (`"location" directive is not allowed here`) rather than serving anything wrong - a loud
 misconfiguration, not a silent widening.
 
-* **CSRF**: double submit - the session row owns a random `csrf_token`, the SPA sends it in
-  `X-CSRF-Token` on every mutating request, the server compares in constant time. A cross-site
-  form post cannot set a custom header.
+* **CSRF**: double submit - the session row owns a random `csrf_token`, which is delivered to the
+  browser in its own cookie (`TUNNELGATE_CSRF_COOKIE_NAME`, default `tg_csrf`) rather than in a
+  JSON body, and the SPA reads that cookie and echoes it back in `X-CSRF-Token` on every mutating
+  request. The server requires the header and the cookie to agree `and` the cookie to match the
+  session row, comparing in constant time (`hmac.compare_digest` via `app/security.py:tokens_equal`);
+  a missing header, a missing cookie or any mismatch is `403 csrf_failed`. A cross-site form post
+  can set neither, and a cross-origin `fetch` may not read the cookie to build the header.
+  Neither `POST /api/auth/login` nor `GET /api/auth/me` returns the token any more, so it is in no
+  response body - not in a cache entry, a proxy trace, a HAR export or a bug report. That is all
+  the cookie is for: the double-submit contract is unchanged, and a script that can run in the
+  panel's origin still reads a non-`HttpOnly` cookie (see §6.1), so this narrows the merged-layout
+  exposure described there without closing it.
 * **Rate limiting**: sliding window, per IP and per IP+username, on `/api/auth/login`
   (`429` + `Retry-After`). Bootstrap `/install` and `/bootstrap/exchange`: 60/min per IP
   (`EXCHANGE_LIMIT`, 60-second window, one counter per endpoint); `/install` additionally
@@ -340,8 +360,60 @@ misconfiguration, not a silent widening.
   helper, and the app sends `X-Content-Type-Options`, `Referrer-Policy`, `X-Frame-Options`
   (the SPA is not embeddable). Set a CSP at the nginx layer - the shipped config does.
 * **Authorization**: every endpoint declares its dependency (`CurrentUser`, `OperatorUser`,
-  `AdminUser`); the router's ownership is checked by scope, and there is no cross-tenant mode by
-  design (single team deployment).
+  `AdminUser`), and every router-scoped endpoint additionally calls
+  `app.services.access.require_router_access`. `admin` and `operator` reach every router; a
+  `viewer` reaches only routers granted to them (`RouterGrant`), which is what makes "a viewer
+  cannot open a router console they were not given" true at the proxy gate as well as in the API.
+  Groups stay labels, not boundaries, and there is no cross-tenant mode by design (single team
+  deployment).
+
+### 6.2 Router-to-router visibility (merged layout)
+
+§6.1 is about one router reaching the **panel**. There is a second, quieter consequence of the
+merged layout worth stating on its own: one router reaches every **other** router.
+
+In merged mode every router is a path on the panel's one origin, and the nginx gate
+(`auth_request /__tg/auth`) answers "may this caller read this router" from the request's
+**session**, not from anything the requesting router controls. A script served by router A is
+therefore same-origin with `/beta/`, and the browser attaches the operator's `tg_session` to a
+`fetch("/beta/")` exactly as it does to `fetch("/api/v1/routers")`. Measured against a
+reproduction of the shipped configuration, a hostile page served by one router read a second
+router's LuCI - including the credentials written in its HTML - while the same page was confined
+to its own prefix in the separate layout.
+
+Two properties make this worse than it sounds, and neither is a bug in the gate:
+
+* **The prefix is not a boundary.** `proxy_cookie_path` and the per-router `tg_luci` cookie do
+  keep one device's LuCI *session* out of its neighbour's, and the router hop strips the browser
+  `Cookie` header so no router's server ever receives `tg_session`. None of that applies to a
+  **browser-side** same-origin read driven by the operator's own session, which is the case here.
+* **Every router is equally reachable.** Routers are the least-trusted hosts in the deployment by
+  construction - cheap, physically accessible, internet-facing devices - and in merged mode the
+  weakest one holds a path to all the others. That is precisely the lateral movement the
+  "Explicitly out of scope" note below rules out for a *root* router attacker at the SSH layer,
+  arriving through a different door.
+
+`docs/SECURITY.md` A11 covers the panel takeover and limitation 11 repeats it; this subsection is
+the router-to-router half, because "my routers can read each other's admin pages" is a different
+decision from "my router can become a panel admin" and an operator may accept one and not the
+other.
+
+**What reduces it.** Only the origin boundary does, in practice:
+
+* the **separate layout** (gateway host != panel host, §6.1) - this is the whole fix, and it needs
+  one DNS name and one certificate for that name, not a wildcard;
+* **per-router grants** (`RouterGrant`, see limitation 4) do *not* fix the merged layout, because
+  the operator legitimately holds a grant for each router they can see - they narrow who may open
+  what, not what a same-origin script may ask for with the operator's session;
+* a **narrower operator population** helps in proportion: a viewer granted two of twenty routers
+  exposes those two, not twenty, if a router is compromised under that viewer's session.
+
+**What does not reduce it.** The CSP, the `Cookie` strip, `tg_luci` scoping, and the CSRF token
+change (§6) all leave this intact for the reason given above: the request is same-origin, uses the
+browser's own session, and needs no third-party origin. Moving the CSRF token out of the JSON body
+into a cookie does not reduce it at all for a script already running in the origin - it can read a
+non-`HttpOnly` cookie as easily as it read the response body. It only removes the case where the
+attacker can make the browser fetch but not execute.
 
 ## 7. Transport and host hardening
 
@@ -535,8 +607,13 @@ ship to a log store you cannot rewrite (`journald` + off-host forwarding); the s
 2. **scrypt parameters** are tuned for a login form, not for offline resistance (§6).
 3. **No MFA.** The design supports adding TOTP in front of `POST /api/auth/login`; not
    implemented, tracked in README's Known limitations.
-4. **No per-router ACL.** Any `operator` can reach any router. Groups are labels, not
-   authorisation boundaries.
+4. **Per-router ACL is grant-based, not group-based.** `admin` and `operator` reach every
+   router; a `viewer` reaches only the routers an admin has granted them (`router_grants`,
+   `GET/PUT /api/v1/users/{user_id}/routers`). Groups remain labels, not authorisation
+   boundaries, and there is no cross-tenant mode by design - a single-team deployment is the
+   assumption, so every `operator` is trusted with the whole fleet. In the merged path layout a
+   grant does not limit what a same-origin router script can read with that operator's session
+   (§6.2).
 5. **The console runs as the installer's chosen user** (root unless a dedicated user could be
    created), so LuCI's own user accounts are bypassed - the panel becomes the router's root
    credential holder. This is inherent to "give me a shell".
@@ -561,11 +638,13 @@ ship to a log store you cannot rewrite (`journald` + off-host forwarding); the s
     console tickets, so a panel restart drops any hand-off in flight (the operator clicks again)
     and two panel processes behind one address do not share them - the same constraint the
     console already has, and the shipped unit runs one process.
-11. **The merged path layout has no origin isolation** (§6.1). When
-    `TUNNELGATE_GATEWAY_HOST` equals `TUNNELGATE_PANEL_HOST` the router pages are served from the
-    panel's origin, so a hostile or compromised router runs script that can use the operator's
-    session - the panel session cookie, the CSRF token and every API call are reachable
-    same-origin. The cookie is `HttpOnly` and the router hop strips the `Cookie` header, so the
-    router's *server* never holds `tg_session`; that limits exfiltration, not abuse. If any
-    router is less trusted than the panel host - and a cheap internet-facing device usually is -
-    use the separate layout.
+11. **The merged path layout has no origin isolation** (§6.1) **and no router-to-router
+    isolation** (§6.2). When `TUNNELGATE_GATEWAY_HOST` equals `TUNNELGATE_PANEL_HOST` the router
+    pages are served from the panel's origin, so a hostile or compromised router runs script that
+    can use the operator's session - the panel session cookie, the CSRF cookie and every API call
+    are reachable same-origin - **and it can read every other router under `/<slug>/` with that
+    same session**. The cookie is `HttpOnly` and the router hop strips the `Cookie` header, so the
+    router's *server* never holds `tg_session`; that limits exfiltration, not abuse. Per-router
+    grants narrow who may open what but do not help here: the operator legitimately holds the
+    grants. If any router is less trusted than the panel host - and a cheap internet-facing device
+    usually is - use the separate layout.

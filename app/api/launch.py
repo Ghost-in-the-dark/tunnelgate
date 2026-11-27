@@ -30,6 +30,7 @@ from ..deps import DbSession, OptionalSession, SettingsDep, client_ip
 from ..errors import ApiError
 from ..forwarded import request_scheme
 from ..models import STATUS_REVOKED, Router, User
+from ..services.access import can_access_router
 from ..services.audit import record as audit_record
 from ..services.launch import (
     TICKETS,
@@ -116,6 +117,23 @@ def mint_launch_ticket(
         if _prefers_html(request):
             return _redirect(panel_login_url(settings, item.slug, destination))
         raise ApiError(401, "unauthorized", "Account is disabled")
+
+    # A ticket is a credential for this router, so minting one needs the same per-router
+    # decision the gate makes. The gate does refuse the resulting cookie for an ungranted
+    # viewer, so this is not the only barrier - but minting a credential that is born dead
+    # wastes an audit row (luci.launch says a hand-off happened), burns a ticket store slot
+    # and sends the operator on a redirect that ends in a 401. Refuse here, in the shape the
+    # caller can act on: a browser navigating gets the login hand-off, an API client a 403.
+    if not can_access_router(db, user, item):
+        log.info(
+            "launch: denied router %s for %s (role %s) - no grant",
+            item.slug,
+            user.username,
+            user.role,
+        )
+        if _prefers_html(request):
+            return _redirect(panel_login_url(settings, item.slug, destination))
+        raise ApiError(403, "forbidden", "You do not have access to this router")
 
     ttl = max(1, int(settings.launch_ticket_ttl_seconds))
     ticket = TICKETS.issue(item.id, user.id, destination, ttl=float(ttl))

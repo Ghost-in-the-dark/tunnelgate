@@ -15,6 +15,7 @@ from ..deps import CurrentUser, DbSession, SettingsDep
 from ..models import STATUS_OFFLINE, STATUS_ONLINE, STATUS_PENDING, ConsoleSession, Router, User
 from ..schemas import AgentEndpointOut, ConfigOut, StatsOut, iso
 from ..services import ports as ports_service
+from ..services.access import accessible_router_ids
 
 router = APIRouter(prefix="/api/v1", tags=["meta"])
 
@@ -59,14 +60,37 @@ async def panel_config(db: DbSession, user: CurrentUser, settings: SettingsDep) 
 
 @router.get("/stats", response_model=StatsOut)
 async def stats(db: DbSession, user: CurrentUser) -> StatsOut:
-    """Counters for the dashboard tiles. One query per number, all indexed."""
+    """Counters for the dashboard tiles. One query per number, all indexed.
+
+    Counters are constrained exactly like the router list, because they answer the same
+    question: "how many routers are there". A viewer granted two of twenty reading
+    routers_total=20 is told about eighteen devices they cannot open - the fleet's size and
+    health are information about routers they were not given. So the same predicate is
+    applied here, and IP/ports/console numbers are all derived from the visible set rather
+    than from the whole table. admin and operator see everything, so their counters are
+    unchanged (accessible_router_ids returns None for them and no filter is added).
+    """
+    visible = accessible_router_ids(db, user)
+    scope = [] if visible is None else [Router.id.in_(visible)]
     by_status = dict(
-        db.execute(select(Router.status, func.count(Router.id)).group_by(Router.status)).all()
+        db.execute(
+            select(Router.status, func.count(Router.id)).where(*scope).group_by(Router.status)
+        ).all()
     )
     total = sum(by_status.values())
+    # Console sessions are per router, so the count follows the same scope. Counting them
+    # globally would tell a viewer that somebody is inside a device they cannot see, and the
+    # registry-backed count the console API returns is already per router.
+    console_filters = [ConsoleSession.closed_at.is_(None)]
+    if visible is not None:
+        console_filters.append(ConsoleSession.router_id.in_(visible))
     console_active = db.execute(
-        select(func.count(ConsoleSession.id)).where(ConsoleSession.closed_at.is_(None))
+        select(func.count(ConsoleSession.id)).where(*console_filters)
     ).scalar_one()
+    # users_total is deliberately global: it counts panel accounts, not routers, there is no
+    # per-user scoping rule for it, and the admin-only Users tab is where it is shown. The
+    # stats endpoint answers a viewer too (the dashboard tiles render for every role), so it
+    # stays a plain count rather than being invented into a permission.
     users_total = db.execute(select(func.count(User.id))).scalar_one()
     return StatsOut(
         routers_total=total,

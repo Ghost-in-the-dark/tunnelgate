@@ -8,8 +8,8 @@ from typing import ClassVar
 import paramiko
 import pytest
 
-from app.config import utcnow
-from app.models import ConsoleSession, Router, User
+from app.config import get_settings, utcnow
+from app.models import AuditLog, ConsoleSession, PanelSession, Router, User
 from app.security import encrypt_secret, generate_ed25519_keypair
 from app.services import console as console_service
 from app.services import keys as keys_service
@@ -27,6 +27,7 @@ from app.services.console import (
     console_state,
 )
 from app.services.keys import console_remote_user
+from tests.conftest import settings_csrf_header
 
 
 # --------------------------------------------------------------------------- fixtures
@@ -243,6 +244,11 @@ class _StubSSHClient:
     """Minimal SSHClient stand-in: records the connect() kwargs and never touches the network."""
 
     instances: ClassVar[list[_StubSSHClient]] = []
+    # The host key the fake router presents. paramiko calls the missing-host-key policy during
+    # connect() with whatever key the server sent; the stub does the same, so the pin/refuse
+    # logic runs exactly as it does against a real device. A class attribute because the client
+    # is constructed inside open_ssh(): a test that wants a different key sets it on the fixture.
+    host_key_bytes: ClassVar[bytes] = b"stub-host-key-bytes"
 
     def __init__(self) -> None:
         self.policy = None
@@ -256,6 +262,18 @@ class _StubSSHClient:
 
     def connect(self, **kwargs):
         self.connect_kwargs = kwargs
+
+        class _PresentedKey:
+            def __init__(self, blob: bytes) -> None:
+                self._blob = blob
+
+            def asbytes(self) -> bytes:
+                return self._blob
+
+        if self.policy is not None:
+            self.policy.missing_host_key(
+                self, kwargs.get("hostname", "?"), _PresentedKey(self.host_key_bytes)
+            )
 
     def get_transport(self):
         return None
@@ -271,6 +289,7 @@ class _StubSSHClient:
 @pytest.fixture()
 def stub_ssh(monkeypatch):
     _StubSSHClient.instances = []
+    _StubSSHClient.host_key_bytes = b"stub-host-key-bytes"
     monkeypatch.setattr(console_service, "SSHClient", _StubSSHClient)
     return _StubSSHClient
 
@@ -501,3 +520,345 @@ def test_channel_send_and_resize_are_used(monkeypatch):
     chan = _Chan()
     chan.resize_pty(100, 30)
     assert calls == [((100, 30), {})]
+
+
+# --------------------------------------------------------------------------- host key pinning
+# The bug this covers: _pinned_host_key_fingerprint() probed attribute names the Router model
+# never had, so it always answered None and ConsoleHostKeyPolicy accepted ANY host key. A router
+# that had been taken over (or an impostor inside the tunnel) could therefore terminate the
+# panel's SSH session with a key of its own choosing and read everything typed into the console.
+# The pin is what makes that detectable; these tests are what keep the pin honest.
+def _expected_fingerprint(blob: bytes) -> str:
+    """The same form app.security.key_fingerprint and console._fingerprint_of_key produce."""
+    import base64
+    import hashlib
+
+    return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+
+
+@pytest.mark.asyncio
+async def test_first_use_pins_the_host_key_and_persists_it(db, settings, stub_ssh):
+    """First open: accept, record the fingerprint plus when it was seen, keep the session."""
+    item = _make_router(
+        db, settings, name="HK1", slug="hk1", console_key_sealed=_sealed_keypair(settings)
+    )
+    assert item.console_host_key_fingerprint is None
+
+    client = await console_service.open_ssh(item, settings, db=db)
+    expected = _expected_fingerprint(_StubSSHClient.instances[0].host_key_bytes)
+
+    assert _StubSSHClient.instances[0].closed is False
+    # the fingerprint travels on the client so the WS handler can audit it
+    assert client._tg_console_host_key_fingerprint == expected
+    # and it is on the row, with a timestamp, not only on the in-memory object
+    db.expire_all()
+    row = db.get(Router, item.id)
+    assert row.console_host_key_fingerprint == expected
+    assert row.console_host_key_seen_at is not None
+
+
+@pytest.mark.asyncio
+async def test_a_matching_pin_opens_the_console_and_leaves_the_row_alone(db, settings, stub_ssh):
+    """A router that still presents the pinned key must open, and must not rewrite the pin.
+
+    The seen-at timestamp is deliberately NOT refreshed by a matching handshake: it answers
+    "when was this key first learned", and bumping it on every open would quietly erase the only
+    evidence of how long the device has been trusted.
+    """
+    pinned_blob = b"the-pinned-host-key"
+    stub_ssh.host_key_bytes = pinned_blob
+    pinned_at = utcnow().replace(year=2026, month=1, day=2, hour=3, minute=4, second=5)
+    item = _make_router(
+        db,
+        settings,
+        name="HK2",
+        slug="hk2",
+        console_key_sealed=_sealed_keypair(settings),
+        console_host_key_fingerprint=_expected_fingerprint(pinned_blob),
+        console_host_key_seen_at=pinned_at,
+    )
+
+    client = await console_service.open_ssh(item, settings, db=db)
+    assert _StubSSHClient.instances[0].closed is False
+    assert client.connect_kwargs is not None
+
+    db.expire_all()
+    row = db.get(Router, item.id)
+    assert row.console_host_key_fingerprint == _expected_fingerprint(pinned_blob)
+    assert row.console_host_key_seen_at == pinned_at
+
+
+@pytest.mark.asyncio
+async def test_a_mismatched_pin_refuses_the_console_and_closes_the_client(db, settings, stub_ssh):
+    """A changed host key is a 502 console_auth_failed, and nothing is left connected.
+
+    This is the whole point of the pin: the handshake must stop BEFORE a shell exists, and the
+    message has to tell an operator what changed and that an admin clears the pin only after
+    verifying the device out of band - "host key changed" alone invites a blind retry.
+    """
+    item = _make_router(
+        db,
+        settings,
+        name="HK3",
+        slug="hk3",
+        console_key_sealed=_sealed_keypair(settings),
+        console_host_key_fingerprint="SHA256:this-is-not-the-key-on-the-device",
+        console_host_key_seen_at=utcnow(),
+    )
+
+    with pytest.raises(ConsoleError) as excinfo:
+        await console_service.open_ssh(item, settings, db=db)
+
+    error = excinfo.value
+    assert error.code == "console_auth_failed"
+    assert error.status == 502
+    # the message must name the cause and the remedy, not just say "unexpected key"
+    assert "host key changed" in error.message
+    assert "clear the pin" in error.message
+    assert "console/host-key" in error.message
+    assert "tampered" in error.message
+    assert _StubSSHClient.instances[0].closed is True
+    # a refusal must never touch the stored pin: the panel has no reason to believe the new key
+    db.expire_all()
+    row = db.get(Router, item.id)
+    assert row.console_host_key_fingerprint == "SHA256:this-is-not-the-key-on-the-device"
+
+
+@pytest.mark.asyncio
+async def test_the_console_dial_still_forbids_agents_and_key_lookup(db, settings, stub_ssh):
+    """Pin or no pin, the panel must never offer an agent or a local key as a candidate."""
+    item = _make_router(
+        db, settings, name="HK4", slug="hk4", console_key_sealed=_sealed_keypair(settings)
+    )
+    await console_service.open_ssh(item, settings, db=db)
+    kwargs = _StubSSHClient.instances[0].connect_kwargs
+    assert kwargs is not None
+    assert kwargs["allow_agent"] is False
+    assert kwargs["look_for_keys"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_failed_pin_commit_does_not_break_the_console(
+    db, settings, stub_ssh, monkeypatch, caplog
+):
+    """A pin that cannot be saved is a warning, not a 502.
+
+    The commit happens inside the handshake worker; letting it raise would turn a database blip
+    into "the console is broken" for every router at once, and the cost of NOT saving is merely
+    that the pin is relearned next time.
+    """
+    item = _make_router(
+        db, settings, name="HK5", slug="hk5", console_key_sealed=_sealed_keypair(settings)
+    )
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(db, "commit", boom)
+    with caplog.at_level("WARNING", logger="tunnelgate.console"):
+        client = await console_service.open_ssh(item, settings, db=db)
+
+    assert _StubSSHClient.instances[0].closed is False
+    assert client.connect_kwargs is not None
+    assert "could not persist the console host key pin" in caplog.text
+    # the rollback expunges the uncommitted pin, so the row stays unpinned: the next open learns
+    # it again, which is the documented consequence and much better than a console that cannot
+    # be opened at all.
+    assert db.get(Router, item.id).console_host_key_fingerprint is None
+
+
+@pytest.mark.asyncio
+async def test_opening_without_a_session_records_the_pin_in_memory(db, settings, stub_ssh):
+    """open_ssh(..., db=None) has to stay usable: record the pin, just do not persist it."""
+    item = _make_router(
+        db, settings, name="HK6", slug="hk6", console_key_sealed=_sealed_keypair(settings)
+    )
+    await console_service.open_ssh(item, settings)
+
+    assert item.console_host_key_fingerprint == _expected_fingerprint(
+        _StubSSHClient.instances[0].host_key_bytes
+    )
+    assert item.console_host_key_seen_at is not None
+    db.rollback()
+    assert db.get(Router, item.id).console_host_key_fingerprint is None
+
+
+# --------------------------------------------------------------------------- host key API
+def _pinned_router_id(api, fingerprint: str | None = "SHA256:pinnedhostkey") -> str:
+    """Create a router through the API and give it everything console_state() needs."""
+    from app.db import session_scope
+
+    created = api.create_router("Console Pinned")
+    with session_scope() as s:
+        row = s.get(Router, created["id"])
+        row.status = "online"
+        row.console_port = 25001
+        row.console_ssh_port = 22
+        row.console_public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFake console"
+        row.console_key_sealed = encrypt_secret("-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n")
+        row.console_key_fingerprint = "SHA256:consolekey"
+        row.console_key_serial = 1
+        row.console_installed_at = utcnow()
+        row.console_host_key_fingerprint = fingerprint
+        row.console_host_key_seen_at = utcnow() if fingerprint else None
+    return created["id"]
+
+
+def test_console_read_exposes_the_host_key_pin(admin_client, api):
+    """The read endpoint is where an operator sees why a console refuses to open."""
+    router_id = _pinned_router_id(api)
+    body = admin_client.get(f"/api/v1/routers/{router_id}/console").json()
+
+    assert body["host_key_fingerprint"] == "SHA256:pinnedhostkey"
+    assert body["host_key_pinned_at"].endswith("Z")
+    # the console KEY fingerprint keeps its own field; the two must not be confused
+    assert body["fingerprint"] == "SHA256:consolekey"
+
+
+def test_console_read_reports_a_null_pin_before_the_first_open(api):
+    """A router that has never been opened has no pin, and both fields say so explicitly."""
+    created = api.create_router("Never Opened")
+    body = api.c.get(f"/api/v1/routers/{created['id']}/console").json()
+    assert body["host_key_fingerprint"] is None
+    assert body["host_key_pinned_at"] is None
+
+
+def _login_as(client, user_id: int, username: str, csrf_token: str):
+    """Point the client at an already-created user with its own panel session cookie.
+
+    A second username/password login would rotate state the shared TestClient cookie jar cannot
+    cleanly undo; minting the session row directly is what tests/test_console_ws.py does, and it
+    keeps each role's client independent.
+    """
+    from app.db import session_scope
+    from app.security import hash_token, new_token
+
+    token = new_token()
+    with session_scope() as s:
+        s.add(
+            PanelSession(
+                user_id=user_id,
+                token_hash=hash_token(token),
+                csrf_token=csrf_token,
+                expires_at=utcnow().replace(year=utcnow().year + 1),
+            )
+        )
+    client.cookies.set(get_settings().cookie_name, token)
+    # CSRF is a double submit now: the header and the tg_csrf cookie must agree and both must
+    # match the session row, so a role test that only set the header would fail on csrf_failed
+    # instead of reaching the role check it is about.
+    client.cookies.set(get_settings().csrf_cookie_name, csrf_token)
+    client.headers[settings_csrf_header()] = csrf_token
+    return client
+
+
+def test_clearing_the_host_key_pin_needs_admin(api, client, db, make_user):
+    """operator 403, viewer 403: clearing a pin disarms the check that catches a swapped router."""
+    router_id = _pinned_router_id(api)
+
+    from app.security import new_token
+
+    for username, role in (("op-hk", "operator"), ("view-hk", "viewer")):
+        user_id = make_user(username, role=role)
+        _login_as(client, user_id, username, new_token(16))
+        r = client.delete(f"/api/v1/routers/{router_id}/console/host-key")
+        assert r.status_code == 403, (username, r.text)
+        assert r.json()["error"]["code"] == "forbidden"
+
+    # the pin survives both refusals
+    db.expire_all()
+    assert db.get(Router, router_id).console_host_key_fingerprint == "SHA256:pinnedhostkey"
+
+
+def test_clearing_the_host_key_pin_requires_csrf(admin_client, api, db, settings):
+    router_id = _pinned_router_id(api)
+    saved = admin_client.headers.pop(settings.csrf_header)
+    try:
+        r = admin_client.delete(f"/api/v1/routers/{router_id}/console/host-key")
+    finally:
+        admin_client.headers[settings.csrf_header] = saved
+
+    assert r.status_code == 403
+    assert r.json()["error"]["code"] == "csrf_failed"
+    db.expire_all()
+    assert db.get(Router, router_id).console_host_key_fingerprint == "SHA256:pinnedhostkey"
+
+
+def test_clearing_the_host_key_pin_clears_both_columns_and_audits(admin_client, api, db):
+    """204, both columns gone, and a row naming the fingerprint that was discarded.
+
+    The audit detail is the point: the next open re-pins whatever the device presents, so the
+    discarded value is the only remaining record of the key an admin decided to stop trusting -
+    and who made that call.
+    """
+    router_id = _pinned_router_id(api)
+
+    r = admin_client.delete(f"/api/v1/routers/{router_id}/console/host-key")
+    assert r.status_code == 204
+    assert r.content == b""
+
+    db.expire_all()
+    row = db.get(Router, router_id)
+    assert row.console_host_key_fingerprint is None
+    assert row.console_host_key_seen_at is None
+
+    entry = (
+        db.query(AuditLog)
+        .filter(AuditLog.action == "console.host_key.cleared")
+        .order_by(AuditLog.id.desc())
+        .first()
+    )
+    assert entry is not None
+    assert entry.router_id == router_id
+    assert entry.actor_username == "admin"
+    assert entry.outcome == "ok"
+    assert "SHA256:pinnedhostkey" in (entry.detail or "")
+
+
+def test_clearing_an_absent_pin_is_still_204(admin_client, api):
+    """Idempotent: a router that was never opened has no pin, and pressing the button is fine."""
+    created = api.create_router("Unpinned")
+    r = admin_client.delete(f"/api/v1/routers/{created['id']}/console/host-key")
+    assert r.status_code == 204
+
+
+def test_clearing_the_host_key_pin_404s_for_an_unknown_router(admin_client):
+    r = admin_client.delete("/api/v1/routers/does-not-exist/console/host-key")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "router_not_found"
+
+
+@pytest.mark.asyncio
+async def test_clearing_the_pin_lets_the_next_open_learn_a_new_key(db, settings, stub_ssh):
+    """End to end: pin -> cleared -> the next handshake records the NEW key instead of refusing.
+
+    Without this the route would only be cosmetic: the reason it exists is that a reflashed
+    router presents a key the panel has never seen, and that has to be accepted exactly once.
+    """
+    item = _make_router(
+        db,
+        settings,
+        name="HK7",
+        slug="hk7",
+        console_key_sealed=_sealed_keypair(settings),
+        console_host_key_fingerprint="SHA256:the-old-device",
+        console_host_key_seen_at=utcnow(),
+    )
+
+    # refused while the old pin stands
+    with pytest.raises(ConsoleError) as excinfo:
+        await console_service.open_ssh(item, settings, db=db)
+    assert excinfo.value.code == "console_auth_failed"
+
+    # an admin clears it ...
+    item.console_host_key_fingerprint = None
+    item.console_host_key_seen_at = None
+    db.commit()
+
+    # ... and the next open learns the key the router now presents
+    await console_service.open_ssh(item, settings, db=db)
+    observed = _expected_fingerprint(_StubSSHClient.instances[-1].host_key_bytes)
+    db.expire_all()
+    row = db.get(Router, item.id)
+    assert row.console_host_key_fingerprint == observed
+    assert row.console_host_key_seen_at is not None

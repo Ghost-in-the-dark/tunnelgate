@@ -15,9 +15,18 @@ export interface User {
   last_login_at: string | null
 }
 
+/**
+ * What POST /api/auth/login and GET /api/auth/me answer.
+ *
+ * No csrf_token field: the server writes the CSRF token into the tg_csrf cookie in the same
+ * response instead. It used to be in this body, and in the merged path layout - where router
+ * pages are served from the panel's own origin - a compromised router page could fetch
+ * /api/auth/me with the operator's cookie, read the token and then mutate anything the
+ * operator could. Reading a cookie needs script in the origin; reading a JSON body needs
+ * nothing but a fetch.
+ */
 export interface Session {
   user: User
-  csrf_token: string
   expires_at: string | null
 }
 
@@ -253,4 +262,28 @@ export interface UpdateUserInput {
   role?: Role
   is_active?: boolean
   password?: string
+}
+
+/**
+ * One router a viewer is granted, as the grant API returns it.
+ *
+ * A brief, not a Router: the grant endpoints answer "which routers, and what are they called",
+ * and an admin editing grants does not need ports, status or heartbeat data for every router in
+ * the panel. `slug` is the part operators recognise - it is what the URL and the audit trail use.
+ */
+export interface UserRouterGrant {
+  id: string
+  slug: string
+  name: string
+}
+
+/**
+ * 200 body of GET and PUT /api/v1/users/{user_id}/routers.
+ *
+ * PUT answers the same shape with the whole set it just stored, so the caller can replace its
+ * cache with the response instead of guessing what the server ended up with.
+ */
+export interface UserRouterGrantList {
+  items: UserRouterGrant[]
+  total: number
 }

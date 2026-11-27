@@ -119,6 +119,17 @@ class Router(Base):
     console_key_serial: Mapped[int] = mapped_column(Integer, default=0)
     console_installed_at: Mapped[datetime | None] = mapped_column(DateTime, default=None)
 
+    # The router's SSH host key, learned on the FIRST successful console handshake and then
+    # required never to change. The console connection dials a loopback listener that the
+    # router's own authenticated tunnel created, so the tunnel already establishes identity;
+    # this is defence in depth for the case that matters - a router whose tunnel key was
+    # stolen, or one that has been reflashed or replaced by an attacker who took the device.
+    # Without it a router could present any host key and the panel would accept the session.
+    # NULL means "not yet observed": the first handshake records it (trust on first use) and
+    # every later handshake refuses a different value until an admin clears the pin.
+    console_host_key_fingerprint: Mapped[str | None] = mapped_column(String(128), default=None)
+    console_host_key_seen_at: Mapped[datetime | None] = mapped_column(DateTime, default=None)
+
     # reported by the router at exchange time / heartbeat
     hostname: Mapped[str | None] = mapped_column(String(128), default=None)
     model: Mapped[str | None] = mapped_column(String(128), default=None)
@@ -155,6 +166,50 @@ class Router(Base):
     @property
     def is_online(self) -> bool:
         return self.status == STATUS_ONLINE
+
+
+class RouterGrant(Base):
+    """One router a particular viewer is allowed to see. The row IS the permission.
+
+    Why only viewers get a row here. The admin and operator roles are implicitly allowed on
+    every router: they create, re-key, rotate and delete routers, and rotating a router's key
+    hands the panel a working credential to it anyway, so a per-router grant on top of that
+    would be theatre - it would refuse an operator a router they can already take by pressing
+    rotate. The viewer role is the read-only one, and it was the accident: before this table
+    existed the gate let any authenticated user, viewer included, straight into any router's
+    LuCI, so one tenant's account could reach every tenant's device. Grants are how that is
+    now narrowed, one explicit row at a time, and app/services/access.py is the single place
+    that reads them.
+
+    Why a new table instead of a column on users or routers. The panel has no migration
+    engine: init_db is Base.metadata.create_all, so a new table appears on upgrade by itself
+    while a new column on an existing table does not (that is exactly why app/cli.py
+    check-schema exists). A grant also wants its own created_at/created_by_id so an access
+    review can say who handed out a router and when, which a comma-separated id column could
+    not carry.
+
+    The unique constraint is part of the permission, not decoration: two rows for the same
+    pair would make "is there a grant" ambiguous, and every caller would have to know which
+    duplicate counts. ondelete CASCADE on both sides means deleting a user or a router takes
+    its grants with it instead of leaving orphan rows that would silently come back to life
+    if an id were ever reused.
+    """
+
+    __tablename__ = "router_grants"
+    __table_args__ = (
+        UniqueConstraint("user_id", "router_id", name="uq_router_grants_user_router"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    router_id: Mapped[str] = mapped_column(ForeignKey("routers.id", ondelete="CASCADE"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), default=None)
+
+    # foreign_keys is explicit: this table has two foreign keys into users (the grantee and
+    # the admin who granted it), so SQLAlchemy cannot guess which one "user" means.
+    user: Mapped[User] = relationship(foreign_keys=[user_id])
+    router: Mapped[Router] = relationship()
 
 
 class BootstrapToken(Base):

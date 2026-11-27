@@ -24,8 +24,9 @@ def csrf(client: TestClient) -> str:
 def login(client: TestClient, username: str, password: str) -> None:
     r = client.post("/api/auth/login", json={"username": username, "password": password})
     assert r.status_code == 200, r.text
-    data = r.json()
-    client.headers[get_settings().csrf_header] = data["csrf_token"]
+    # The token is no longer in the body; login writes it to the csrf cookie and mutating
+    # routes need it back in the header as well (double submit).
+    client.headers[get_settings().csrf_header] = r.cookies[get_settings().csrf_cookie_name]
 
 
 def stored_value():

@@ -1044,6 +1044,94 @@ def test_render_nginx_path_renders_an_empty_file_without_routes(db, settings):
     assert "/__tg/enter" not in rendered
 
 
+# ------------------------------------- path mode, separate gateway on a plain-HTTP hop
+# scripts/quick-install.sh installs this shape: the panel and the gateway are two names
+# on ONE plain-HTTP port, the operator's proxy terminates TLS and routes both names here.
+# The generated file must therefore hold locations only - a server{} block for the
+# gateway inside it would be the first block for that name and shadows the installer's
+# vhost, so the panel 404s while nginx -t stays green.
+def _plain_http_path_settings(settings, **kw):
+    _path_settings(settings, **kw)
+    settings.proxy_plain_http = True
+    return settings
+
+
+def test_plain_http_separate_layout_renders_locations_only(db, settings, edge):
+    _plain_http_path_settings(settings)
+    rendered = render_nginx(load_routes(db), settings)
+    config = "\n".join(_directives(rendered))
+    assert "server {" not in config
+    assert "server_name" not in config
+    # No certificate reference at all: the operator's proxy owns TLS, and this file is
+    # included inside the installer's vhost, which also has none.
+    assert "ssl_certificate" not in rendered
+    assert "listen 443" not in rendered
+    assert "listen 80" not in rendered
+    # The routers are still all there, with the gate and the rewritten URLs.
+    assert "location /edge-one/ {" in rendered
+    assert "location = /__tg/auth {" in rendered
+    assert f"proxy_pass http://127.0.0.1:{edge.remote_port}/;" in rendered
+    assert "auth_request /__tg/auth;" in rendered
+    assert """sub_filter 'href="/' 'href="/edge-one/';""" in rendered
+    assert "proxy_cookie_path / /edge-one/;" in rendered
+
+
+def test_plain_http_separate_layout_tells_the_operator_where_to_include_it(db, settings):
+    """The one failing-quietly mistake left is the include landing in the panel vhost."""
+    _plain_http_path_settings(settings)
+    block = render_nginx([], settings)
+    assert "SEPARATE LAYOUT ON A PLAIN-HTTP HOP" in block
+    assert "LOCATIONS ONLY" in block
+    assert "include " + str(settings.proxy_routes_path) + ";" in block
+    # It has to say, in the file itself, that including it twice undoes the fix.
+    assert "Do NOT" in block
+    assert "panel vhost" in block
+
+
+def test_plain_http_separate_layout_reuses_the_panel_vhost_map(db, settings, edge):
+    """A map cannot be declared twice, and it cannot live inside a server block."""
+    _plain_http_path_settings(settings)
+    block = render_nginx(load_routes(db), settings)
+    assert "map $http_upgrade" not in block
+    assert "proxy_set_header Connection $connection_upgrade;" in block
+
+
+def test_the_plain_http_flag_is_what_selects_the_new_rendering(db, settings, edge):
+    """With the flag off, this deployment shape keeps the TLS rendering it had before.
+
+    proxy_plain_http exists to change ONE rendering. If it ever stops being the switch,
+    an install that never set it would silently lose its certificate lines.
+    """
+    _path_settings(settings)
+    before = render_nginx(load_routes(db), settings)
+    settings.proxy_plain_http = True
+    after = render_nginx(load_routes(db), settings)
+    assert before != after
+    assert "ssl_certificate" in before
+    assert "listen 443 ssl;" in before
+    assert "server {" in before
+    assert "ssl_certificate" not in after
+    assert "server {" not in after
+    # The per-router locations are the same text in both, or the factoring broke them.
+    for line in (
+        "location = /edge-one/__tg/enter {",
+        "location /edge-one/ {",
+        "auth_request /__tg/auth;",
+        "location = /__tg/auth {",
+        "proxy_cookie_path / /edge-one/;",
+    ):
+        assert line in after
+        assert line in before
+
+
+def test_merged_render_is_unchanged_by_the_plain_http_flag(db, settings, edge):
+    """Merged mode already includes routes.conf inside the panel vhost - same file either way."""
+    _merged_path_settings(settings)
+    merged = render_nginx(load_routes(db), settings)
+    settings.proxy_plain_http = True
+    assert render_nginx(load_routes(db), settings) == merged
+
+
 def test_render_nginx_auth_snippet_explains_itself_in_path_mode(settings):
     _path_settings(settings)
     snippet = render_nginx_auth_snippet(settings)
@@ -1219,6 +1307,96 @@ def test_a_one_router_path_mode_config_is_accepted_by_nginx(
     rendered = render_nginx(load_routes(db), settings)
     code, output = _nginx_accepts(tmp_path, rendered, inside_server=False, cert=cert, key=key)
     assert code == 0, output
+
+
+PANEL_VHOST = REPO / "deploy" / "nginx" / "tunnelgate-behind-proxy.conf"
+GATEWAY_VHOST = REPO / "deploy" / "nginx" / "tunnelgate-gateway-behind-proxy.conf"
+
+
+def _two_vhost_parse(
+    tmp_path: Path, locations: str, *, panel: Path, gateway: Path
+) -> tuple[int, str]:
+    """Assemble the pair of vhosts the installer installs and hand it to nginx -t.
+
+    Mirrors section 9 of scripts/quick-install.sh: the panel vhost's routes include is
+    replaced by a comment, the gateway vhost includes the rendered file inside ITS server
+    block, and both listen on one unprivileged port. Only the two listen port numbers are
+    rewritten for the test - everything else is the shipped text, so a template edit that
+    breaks the pair fails here.
+    """
+    prefix = tmp_path / "prefix"
+    (prefix / "logs").mkdir(parents=True, exist_ok=True)
+    routes = prefix / "routes.conf"
+    routes.write_text(locations)
+    port = "127.0.0.1:18443"
+    problem = ""
+    panel_text = panel.read_text()
+    if "include /etc/nginx/tunnelgate/routes.conf;" not in panel_text:
+        problem = "the panel vhost no longer has the routes include the installer rewrites\n"
+    panel_text = panel_text.replace(
+        "    include /etc/nginx/tunnelgate/routes.conf;", "    # routers live on the gateway name"
+    )
+    panel_text = panel_text.replace("listen 80 default_server;", f"listen {port} default_server;")
+    panel_text = panel_text.replace("listen [::]:80 default_server;", "")
+    (prefix / "panel.conf").write_text(panel_text)
+    gateway_text = gateway.read_text()
+    gateway_text = gateway_text.replace(
+        "server_name gateway.example.com;", "server_name gate.panel.test;"
+    )
+    gateway_text = gateway_text.replace("listen 80;", f"listen {port};")
+    gateway_text = gateway_text.replace("listen [::]:80;", "")
+    gateway_text = gateway_text.replace("/etc/nginx/tunnelgate/routes.conf", str(routes))
+    (prefix / "gateway.conf").write_text(gateway_text)
+    assessed = (
+        f"pid {prefix}/nginx.pid;"
+        f"error_log {prefix}/logs/error.log;"
+        f"events {{}} http {{ access_log {prefix}/logs/access.log; "
+        f"include {prefix}/gateway.conf; include {prefix}/panel.conf; }}"
+    )
+    (prefix / "nginx.conf").write_text(assessed)
+    proc = subprocess.run(
+        [NGINX, "-t", "-c", str(prefix / "nginx.conf"), "-p", str(prefix)],
+        capture_output=True,
+        text=True,
+    )
+    # A template without the include is a failure of the pair, not a parse verdict.
+    return (proc.returncode or (3 if problem else 0)), problem + proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("empty", [True, False], ids=["zero-routers", "one-router"])
+@requires_nginx
+def test_the_plain_http_gateway_vhost_pair_is_accepted_by_nginx(
+    tmp_path, settings, edge, db, empty
+):
+    """The arrangement the installer installs must parse: two vhosts, one plain port.
+
+    routes.conf holds locations only in this mode, so it is only valid INSIDE a server
+    block; the panel vhost must not include it at all. Getting that pair wrong is the
+    failure this test exists for: on a fresh install there is no router yet, and an empty
+    locations-only file still has to load - the gate variables are declared in an internal
+    location for exactly that reason.
+    """
+    _plain_http_path_settings(settings)
+    rendered = render_nginx([] if empty else load_routes(db), settings)
+    assert not any(line.strip().startswith("server {") for line in _directives(rendered))
+    code, output = _two_vhost_parse(tmp_path, rendered, panel=PANEL_VHOST, gateway=GATEWAY_VHOST)
+    assert code == 0, output
+
+
+def test_the_gateway_vhost_template_keeps_the_include_inside_its_server_block():
+    """At http level nginx says 'location directive is not allowed here' and every router
+    stops resolving; the include therefore belongs inside the gateway server block, which
+    is why the rendered file may hold locations only."""
+    conf = GATEWAY_VHOST.read_text()
+    directives = "\n".join(line for line in conf.splitlines() if not line.lstrip().startswith("#"))
+    assert "listen 80;" in directives
+    assert "default_server" not in directives, "the panel vhost owns the default listener"
+    assert "ssl_certificate" not in directives
+    # One map per target variable, and it belongs to the panel vhost.
+    assert "map $http_upgrade" not in conf
+    include = conf.index("include /etc/nginx/tunnelgate/routes.conf;")
+    assert conf.index("server {") < include
+    assert "server_name gateway.example.com;" in conf
 
 
 def test_path_mode_declares_the_gate_variables_for_an_empty_fleet(settings):

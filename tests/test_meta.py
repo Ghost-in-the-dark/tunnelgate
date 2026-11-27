@@ -205,3 +205,53 @@ def test_configure_logging_is_idempotent(settings, monkeypatch, capsys):
     create_app(settings, use_monitor=False)
     logging.getLogger("tunnelgate").info("exactly once")
     assert capsys.readouterr().err.count("exactly once") == 1
+
+
+# --------------------------------------------------------------------------- stats scoping
+def test_stats_are_scoped_to_the_routers_a_viewer_may_reach(client, api):
+    """A viewer granted one of three routers must not learn that the other two exist.
+
+    The dashboard tiles render for every role, so the counters answer the same question the
+    router list does. Counting the whole table would tell a viewer the fleet's size and health
+    for devices they cannot open.
+    """
+    from app.db import session_scope
+    from app.models import RouterGrant, User
+    from app.security import hash_password
+
+    first = api.create_router("Stats Granted")
+    api.create_router("Stats Hidden One")
+    api.create_router("Stats Hidden Two")
+    with session_scope() as s:
+        viewer = User(
+            username="stats-viewer", role="viewer", password_hash=hash_password("user-t3st-pass")
+        )
+        s.add(viewer)
+        s.flush()
+        s.add(RouterGrant(user_id=viewer.id, router_id=first["id"]))
+        s.commit()
+
+    admin = client.get("/api/v1/stats")
+    assert admin.status_code == 200
+    assert admin.json()["routers_total"] == 3
+
+    login = client.post(
+        "/api/auth/login", json={"username": "stats-viewer", "password": "user-t3st-pass"}
+    )
+    assert login.status_code == 200, login.text
+    scoped = client.get("/api/v1/stats")
+    assert scoped.status_code == 200
+    body = scoped.json()
+    assert body["routers_total"] == 1
+    assert body["routers_pending"] == 1
+    # A viewer's fleet view is exactly what they were granted, nothing wider.
+    assert body["routers_online"] == 0
+    assert body["routers_offline"] == 0
+
+
+def test_stats_are_unchanged_for_an_admin(client, api):
+    """The scope must not narrow anything for a role that already sees every router."""
+    api.create_router("Admin Stats One")
+    api.create_router("Admin Stats Two")
+    body = client.get("/api/v1/stats").json()
+    assert body["routers_total"] == 2

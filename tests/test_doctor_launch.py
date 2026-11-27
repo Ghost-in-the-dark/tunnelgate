@@ -310,6 +310,24 @@ def test_path_mode_warns_when_the_gateway_is_the_panel_host(settings):
     assert "INSIDE the panel server block" in check.fix
 
 
+def test_path_mode_reports_the_plain_http_separate_layout_as_ok(settings):
+    """The shape scripts/quick-install.sh --gateway-host installs, and doctor must agree.
+
+    It is a separate origin (so the merged-layout warning does not apply) reached over a
+    plain-HTTP hop (so routes.conf is locations only, included inside the gateway vhost).
+    Anything doctor said here other than OK would send an operator to "fix" a correct
+    install.
+    """
+    _path_mode(settings, gateway_host="gate." + settings.panel_host)
+    settings.proxy_plain_http = True
+    report = Report()
+    _check_launch(settings, report)
+    check = next(c for c in report.checks if c.name == "gateway host")
+    assert check.status == OK
+    assert "plain-HTTP hop" in check.detail
+    assert "docs/SECURITY.md" not in (check.fix or "")
+
+
 def test_path_mode_accepts_a_gateway_next_to_the_panel_host(settings):
     _path_mode(settings, gateway_host="gate." + settings.panel_host)
     report = Report()

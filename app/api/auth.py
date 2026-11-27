@@ -89,9 +89,57 @@ def _set_cookie(response: Response, token: str, settings, request: Request) -> N
     )
 
 
+def _set_csrf_cookie(response: Response, csrf_token: str, settings, request: Request) -> None:
+    """Write the double-submit CSRF cookie beside the session cookie.
+
+    Why a cookie and not the JSON body it used to be in: the token was considered harmless
+    because the session cookie is HttpOnly, and that reasoning fails in exactly one documented
+    deployment - the merged path layout, where router pages are served from the panel's own
+    origin. There a compromised router page runs same-origin script, calls GET /api/auth/me,
+    reads the token out of the response and performs any authenticated mutation. Proven in a
+    real browser (a router page created a second admin account). Serving it as a cookie that no
+    response body ever contains removes that fetch-and-read step.
+
+    HttpOnly is OFF on purpose, unlike the session cookie: the SPA has to read this value to
+    build the X-CSRF-Token header, and a token that only the browser can send is a token the
+    browser must be able to show to script. The session cookie is the credential; this cookie
+    is only the second half of a proof that the request came from the same origin.
+
+    Attributes mirror the session cookie (same max-age, path, domain, samesite, secure) so the
+    two cannot drift apart under TUNNELGATE_COOKIE_DOMAIN or a TLS terminator: a session cookie
+    this browser already dropped would otherwise leave a live CSRF cookie behind, and an
+    operator who narrows the session scope must narrow this one with it. httpx.TestClient drops
+    a cookie whose max-age is 0, so the test suite sees logout delete both.
+    """
+    response.set_cookie(
+        settings.csrf_cookie_name,
+        csrf_token,
+        max_age=int(settings.session_ttl_minutes) * 60,
+        httponly=False,
+        samesite="lax",
+        secure=_cookie_secure(request, settings),
+        path="/",
+        domain=settings.cookie_domain or None,
+    )
+
+
 def _clear_cookie(response: Response, settings) -> None:
     response.delete_cookie(
         settings.cookie_name,
+        path="/",
+        domain=settings.cookie_domain or None,
+    )
+
+
+def _clear_csrf_cookie(response: Response, settings) -> None:
+    """Logout must take the CSRF cookie with it.
+
+    Leaving it behind would keep a stale token in the browser past the session it belongs to;
+    the next login would then have to overwrite it before the first mutation, and an operator
+    reading their bank of cookies would see a live-looking CSRF token for a dead session.
+    """
+    response.delete_cookie(
+        settings.csrf_cookie_name,
         path="/",
         domain=settings.cookie_domain or None,
     )
@@ -185,9 +233,9 @@ async def login(
     audit_record(db, "auth.login", actor=user, ip=ip, user_agent=request.headers.get("user-agent"))
     db.commit()
     _set_cookie(response, plaintext, settings, request)
+    _set_csrf_cookie(response, session.csrf_token, settings, request)
     return SessionOut(
         user=UserOut.model_validate(user),
-        csrf_token=session.csrf_token,
         expires_at=iso(session.expires_at),
     )
 
@@ -210,6 +258,7 @@ async def logout(
     )
     db.commit()
     _clear_cookie(response, settings)
+    _clear_csrf_cookie(response, settings)
     response.status_code = 204
     return response
 
@@ -220,15 +269,28 @@ async def me(
     user: CurrentUser,
     db: DbSession,
 ) -> SessionOut:
-    """Who the cookie belongs to, plus the CSRF token so a reload keeps working.
+    """Who the cookie belongs to. The CSRF token is NOT part of this answer any more.
 
-    The session token itself is never echoed - it lives in an HttpOnly cookie precisely so
-    JavaScript cannot read it. The CSRF token is safe to hand out: it is useless without that
-    cookie.
+    It is in the csrf cookie instead: login sets it next to the session cookie with the same
+    lifetime, and logout deletes it. It used to be a field of this body, which was the whole
+    vulnerability: in the merged path layout a router page is same-origin with the panel, so
+    a compromised router could fetch this route with the operator's cookie and read the token
+    straight out of the JSON - then mutate anything the operator could. Measured in a real
+    browser, where a router page created a second admin account. This route does not touch the
+    cookie: login writes it and logout deletes it, so a reloaded SPA reads the value the browser
+    still holds and needs nothing from this answer.
+
+    Serving it as a cookie does not make it secret from same-origin script - a script in the
+    panel's origin can still read a non-HttpOnly cookie. What it removes is the cheap path: no
+    response body carries the token, so no fetch, cache entry, log line, proxy trace or
+    developer-tools response pane carries it either, and an attacker needs real script
+    execution in the origin rather than merely a page served from it. See docs/SECURITY.md.
+
+    The session token itself is still never echoed - it lives in an HttpOnly cookie precisely
+    so JavaScript cannot read it.
     """
     return SessionOut(
         user=UserOut.model_validate(user),
-        csrf_token=session.csrf_token,
         expires_at=iso(session.expires_at),
     )
 

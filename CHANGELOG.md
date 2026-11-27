@@ -8,6 +8,95 @@ Panel and router are versioned separately: `agent/install.sh` carries its own
 `CLIENT_VERSION` (the bootstrap protocol the panel records per router), so a panel patch release
 does not require reinstalling every router.
 
+## [1.3.0] - 2026-11-27
+
+A security release. Two of the three findings below were not theorised: they were reproduced in a
+real browser against a copy of the shipped configuration before anything was changed, and the
+browser transcript - a router page creating a second admin account, then reading a *neighbour*
+router's LuCI - is why this is a minor bump with a breaking edge for API clients rather than a
+patch.
+
+The theme is one sentence: **a path is not an origin boundary**. The panel's merged path layout
+(router pages served on the panel's own hostname) turned a compromised router into a working
+panel session, and turned each router into a reader of every other router. It remains supported -
+one public name is all some deployments have - but it is no longer what the installer chooses for
+you silently, and the docs now say exactly what it costs.
+
+### Security
+
+- **Per-router authorization (`RouterGrant`).** The proxy gate authenticated callers and stopped
+  there: any signed-in account, a `viewer` included, could open every router's LuCI and read every
+  router row, because nothing answered "may *this* user reach *this* router". A new
+  `router_grants` table and one predicate (`app/services/access.py`) now answer that question for
+  the gate, the router API, the launch hand-off and the console. `admin` and `operator` reach
+  every router - they can rotate a key and take one anyway, so a grant would be theatre - and a
+  `viewer` reaches only what an admin granted. Admin routes: `GET`/`PUT
+  `/api/v1/users/{id}/routers` (PUT replaces the whole set; an unknown id is a 400 naming it) and
+  `DELETE /api/v1/users/{id}/routers/{router_id}`. **Upgrade note:** this is a new *table*, which
+  `init-db` creates automatically, so no `ALTER TABLE` is needed. Existing `viewer` accounts start
+  with no grants and therefore see no routers until an admin grants them - by design, but say so
+  before upgrading if anyone signs in as a viewer today.
+- **The console verifies the router's SSH host key.** `ConsoleHostKeyPolicy` was supposed to pin
+  it and never could: `_pinned_host_key_fingerprint()` probed attribute names the model did not
+  have, so the pin was always `None`, every handshake logged "unpinned" and accepted anything.
+  A router - or anything that had taken one - could terminate the panel's SSH session with a host
+  key of its choosing and read the operator's keystrokes. The key is now pinned on first use
+  (`Router.console_host_key_fingerprint`, `console_host_key_seen_at`) and every later handshake
+  must match it or the console refuses with `console_auth_failed` and a message naming the
+  remedy. `GET /api/v1/routers/{id}/console` reports the pin; `DELETE .../console/host-key`
+  clears it for a device an admin has verified out of band. **Upgrade note:** two new *columns* on
+  `routers`; `init-db` will not add them, so run `python -m app.cli check-schema` and apply the
+  printed `ALTER TABLE routers ADD COLUMN ...` statements with a backup taken first. Until you do,
+  the console cannot persist a pin - it still refuses a changed key within one session, but
+  relearns on the next open, and `doctor` shows the drift.
+- **The CSRF token is no longer in any response body.** It lived in the JSON of
+  `POST /api/auth/login` and `GET /api/auth/me`, which was safe exactly while `/api/` was a
+  different origin from anything able to run script - untrue in the merged layout, where one
+  `fetch` of `/api/auth/me` was enough to lift it. It is now delivered in its own cookie
+  (`TUNNELGATE_CSRF_COOKIE_NAME`, default `tg_csrf`) and every mutating request must present the
+  header *and* the cookie, agreeing with each other and with the session row
+  (`app/deps.py:csrf_protect`, constant-time). **Breaking for hand-written API clients** that read
+  `csrf_token` from the JSON: read the cookie instead. The SPA does so automatically, so a browser
+  user needs only a reload. Be clear about the limit: a script that already runs in the panel
+  origin can read a non-`HttpOnly` cookie just as it read the body, so this narrows the
+  merged-layout exposure rather than closing it.
+
+### Added
+
+- **`scripts/quick-install.sh` stops choosing the shared origin for you.** It now asks, and with
+  no terminal it refuses: the refusal names both ways forward instead of installing the risky
+  layout silently. `--gateway-host NAME` publishes routers on their own name over the same plain
+  HTTP listener (new `deploy/nginx/tunnelgate-gateway-behind-proxy.conf`, and the panel vhost's
+  `routes.conf` include is *removed* in that layout so router paths do not exist on the panel
+  origin at all), and `--allow-shared-origin` is the explicit consent for the one-name case. The
+  new setting `TUNNELGATE_PROXY_PLAIN_HTTP` (default `false`, so every existing rendering is
+  byte-identical) tells the renderer that nginx serves plain HTTP and TLS terminates in front.
+- **Router grants in the UI.** Settings -> Users gains a "Routers" action for `viewer` rows: a
+  dialog listing every router as a checkbox, the current grants pre-checked, one Save sending the
+  complete set. The action is hidden for `admin`/`operator`, and the row explains which of the two
+  rules applies rather than offering checkboxes that would imply a restriction that does not
+  exist.
+- **`docs/SECURITY.md` §6.2, "Router-to-router visibility".** The merged layout's second
+  consequence had no home: A11 covered "a router can become the panel", not "a router can read its
+  neighbours". §6.2 states it, names what does and does not reduce it, and limitation 11 now
+  carries both halves.
+
+### Fixed
+
+- `GET /api/v1/stats` and `GET /__tg/launch` enforced less than the routes around them: the
+  counters counted every router for every role (telling a `viewer` the fleet's size and health for
+  devices they cannot open), and the launch hand-off minted a router credential for a `viewer`
+  with no grant - a ticket born dead, plus a misleading `luci.launch` audit row. Both now use the
+  same per-router predicate as everything else.
+
+### Changed
+
+- `docs/SECURITY.md` limitation 4 is no longer "no per-router ACL" but the grant rule that exists,
+  with the merged-layout caveat attached; `README.md` carries the same correction.
+- `docs/API.md`, `docs/CLI.md`, `docs/CONFIGURATION.md`, `docs/INSTALL_SERVER.md`, `docs/INDEX.md`
+  and `deploy/env/tunnelgate.env.example` follow the new routes, the two new settings and the
+  revised contracts.
+
 ## [1.1.2] - 2026-11-19
 
 The release that makes the router install work on a stock router, and makes the panel reachable

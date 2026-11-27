@@ -12,26 +12,56 @@ def _login(client, username="admin", password=ADMIN_PASSWORD):
     return client.post("/api/auth/login", json={"username": username, "password": password})
 
 
-def test_login_returns_session_and_sets_cookie(client):
+def test_login_returns_session_and_sets_cookie(client, settings):
     r = _login(client)
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["user"]["username"] == "admin"
     assert body["user"]["role"] == "admin"
-    assert body["csrf_token"]
     assert body["expires_at"].endswith("Z")
+    # The CSRF token is NOT in the body any more, and that is the point of the change: a
+    # same-origin script could fetch this response (in the merged path layout a router page is
+    # same-origin with the panel) and read any token the body carried. It lives in a cookie.
+    assert "csrf_token" not in body
+    assert r.cookies[settings.csrf_cookie_name] not in r.text
     # The session token never appears in the JSON body; only the cookie carries it.
-    assert "tg_session" in r.cookies
-    assert r.cookies["tg_session"] not in r.text
+    assert settings.cookie_name in r.cookies
+    assert r.cookies[settings.cookie_name] not in r.text
 
 
-def _set_cookie_header(response) -> str:
-    return response.headers.get("set-cookie", "")
+def _set_cookie_headers(response) -> list[str]:
+    """Every Set-Cookie line. Login sends two (session + csrf), and .get() joins them."""
+    headers = response.headers
+    get_list = getattr(headers, "get_list", None)
+    if get_list is not None:
+        return get_list("set-cookie")
+    return [h for h in [headers.get("set-cookie", "")] if h]
+
+
+def _cookie_line(response, name: str) -> str:
+    for line in _set_cookie_headers(response):
+        if line.split("=", 1)[0].strip() == name:
+            return line
+    raise AssertionError(f"no Set-Cookie for {name} in {response.headers.get('set-cookie')!r}")
+
+
+def _cookie_attrs(response, name: str) -> dict[str, str]:
+    """Set-Cookie line -> {attribute: value}, with bare flags mapped to ''."""
+    attrs: dict[str, str] = {}
+    parts = _cookie_line(response, name).split(";")
+    for part in parts[1:]:
+        key, _, value = part.partition("=")
+        attrs[key.strip().lower()] = value.strip()
+    return attrs
 
 
 def test_login_cookie_is_not_secure_over_plain_http(client):
     """The dev/loopback layout stays usable: no Secure flag without TLS."""
-    assert "secure" not in _set_cookie_header(_login(client)).lower()
+    r = _login(client)
+    assert "secure" not in _cookie_attrs(r, "tg_session")
+    # The CSRF cookie has to follow the session cookie here too, or the browser would send the
+    # session over plain http while withholding the token that makes it usable.
+    assert "secure" not in _cookie_attrs(r, "tg_csrf")
 
 
 def _login_from(app, peer: str, headers: dict[str, str] | None = None):
@@ -57,14 +87,16 @@ def test_login_cookie_is_secure_when_the_request_came_over_https(app, settings):
     set_settings_override(settings.model_copy(update={"cookie_secure": False}))
     r = _login_from(app, "127.0.0.1", {"X-Forwarded-Proto": "https"})
     assert r.status_code == 200, r.text
-    assert "secure" in _set_cookie_header(r).lower()
+    assert "secure" in _cookie_attrs(r, "tg_session")
+    assert "secure" in _cookie_attrs(r, "tg_csrf")
 
 
 def test_the_https_cookie_rule_only_listens_to_a_trusted_peer(app):
     """An untrusted client cannot talk the panel into marking its own cookie Secure."""
     r = _login_from(app, "203.0.113.9", {"X-Forwarded-Proto": "https"})
     assert r.status_code == 200, r.text
-    assert "secure" not in _set_cookie_header(r).lower()
+    assert "secure" not in _cookie_attrs(r, "tg_session")
+    assert "secure" not in _cookie_attrs(r, "tg_csrf")
 
 
 def test_login_accepts_display_name_absence(client):
@@ -133,13 +165,23 @@ def test_me_requires_a_session(client):
     assert r.status_code == 401
 
 
-def test_me_returns_session_out_with_csrf(client, admin_client):
+def test_me_does_not_return_a_csrf_token(client, admin_client, settings):
+    """The regression test for the merged-layout escalation.
+
+    A compromised router page in the merged path layout is same-origin with the panel and can
+    call this route with the operator's session cookie. When the answer carried the CSRF token
+    it could then perform any authenticated mutation - a router page really did create a second
+    admin account. The body must not carry the token, and the token must still be usable from
+    the cookie the browser already has.
+    """
     r = admin_client.get("/api/auth/me")
     assert r.status_code == 200, r.text
     body = r.json()
-    assert set(body) == {"user", "csrf_token", "expires_at"}
-    assert body["csrf_token"] == admin_client.csrf_token
+    assert set(body) == {"user", "expires_at"}
+    assert "csrf_token" not in body
     assert body["user"]["username"] == "admin"
+    # Belt and braces: the token appears nowhere in the serialised response.
+    assert admin_client.cookies[settings.csrf_cookie_name] not in r.text
 
 
 def test_me_rejects_revoked_session_cookie(client, admin_client, db):
@@ -164,10 +206,16 @@ def test_expired_session_is_rejected(client, admin_client, db):
     assert client.get("/api/auth/me").status_code == 401
 
 
-def test_logout_revokes_and_clears_cookie(admin_client, db):
+def test_logout_revokes_and_clears_cookie(admin_client, db, settings):
     r = admin_client.post("/api/auth/logout")
     assert r.status_code == 204
-    assert admin_client.cookies.get("tg_session") in (None, "")
+    assert admin_client.cookies.get(settings.cookie_name) in (None, "")
+    # The CSRF cookie must go with it: a token left behind belongs to no session, and a browser
+    # that kept it would try the next mutation with a value the server has already forgotten.
+    assert admin_client.cookies.get(settings.csrf_cookie_name) in (None, "")
+    # Both cookies were cleared in the same response, not just dropped from the jar.
+    for name in (settings.cookie_name, settings.csrf_cookie_name):
+        assert "max-age=0" in _cookie_line(r, name).lower(), (name, _set_cookie_headers(r))
     assert admin_client.get("/api/auth/me").status_code == 401
     live = db.query(PanelSession).filter(PanelSession.revoked_at.is_(None)).count()
     assert live == 0
@@ -184,6 +232,142 @@ def test_change_password_requires_csrf(admin_client, settings):
         admin_client.headers[settings.csrf_header] = saved
     assert r.status_code == 403
     assert r.json()["error"]["code"] == "csrf_failed"
+
+
+# --------------------------------------------------- double submit: cookie AND header
+def _create_router(client, name="csrf-probe"):
+    """A harmless state-changing request: the whole point of the CSRF check."""
+    return client.post("/api/v1/routers", json={"name": name})
+
+
+def test_the_two_cookies_carry_the_attributes_the_design_requires(client, settings):
+    """Session cookie unreadable by script, CSRF cookie readable, and otherwise identical.
+
+    HttpOnly on the CSRF cookie would be self-defeating (the SPA has to read it to build the
+    header); HttpOnly missing on the session cookie would hand the credential itself to any XSS.
+    Same path, domain, SameSite and Max-Age so the two cannot drift: a browser that drops one
+    and keeps the other leaves a session that can never mutate again, which looks like a bug to
+    the operator and is a support ticket, so the lifetimes are pinned together here.
+    """
+    r = _login(client)
+    session = _cookie_attrs(r, settings.cookie_name)
+    csrf = _cookie_attrs(r, settings.csrf_cookie_name)
+
+    assert "httponly" in session
+    assert "httponly" not in csrf
+    for attrs in (session, csrf):
+        assert attrs.get("path") == "/"
+        assert attrs.get("samesite", "").lower() == "lax"
+    assert session.get("max-age") == csrf.get("max-age")
+    assert int(session["max-age"]) == int(settings.session_ttl_minutes) * 60
+    # Same domain handling: cookie_domain is unset in tests, so neither carries Domain.
+    assert ("domain" in session) == ("domain" in csrf)
+
+
+def test_the_csrf_cookie_carries_the_session_token(client, settings, db):
+    """The cookie is the session's token, not a second independent secret."""
+    r = _login(client)
+    token = r.cookies[settings.csrf_cookie_name]
+    row = db.query(PanelSession).one()
+    assert token == row.csrf_token
+    assert token != r.cookies[settings.cookie_name]
+
+
+def test_a_mutation_succeeds_with_both_the_cookie_and_the_header(admin_client):
+    assert _create_router(admin_client).status_code == 201
+
+
+def test_a_mutation_fails_without_the_csrf_cookie(admin_client, settings):
+    """Header alone is not proof of anything: the cookie has to travel too."""
+    saved = admin_client.cookies[settings.csrf_cookie_name]
+    admin_client.cookies.delete(settings.csrf_cookie_name)
+    try:
+        r = _create_router(admin_client)
+    finally:
+        admin_client.cookies.set(settings.csrf_cookie_name, saved)
+    assert r.status_code == 403
+    assert r.json()["error"]["code"] == "csrf_failed"
+
+
+def test_a_mutation_fails_without_the_header(admin_client, settings):
+    """Cookie alone is not proof either: any page on the origin gets the cookie for free."""
+    saved = admin_client.headers.pop(settings.csrf_header)
+    try:
+        r = _create_router(admin_client)
+    finally:
+        admin_client.headers[settings.csrf_header] = saved
+    assert r.status_code == 403
+    assert r.json()["error"]["code"] == "csrf_failed"
+
+
+def test_a_header_that_disagrees_with_the_cookie_fails(admin_client, settings):
+    from app.security import new_token
+
+    saved_header = admin_client.headers[settings.csrf_header]
+    saved_cookie = admin_client.cookies[settings.csrf_cookie_name]
+    # A well-formed token that is simply not this session's: the shape must not matter.
+    other = new_token(24)
+    try:
+        admin_client.headers[settings.csrf_header] = other
+        r = _create_router(admin_client)
+    finally:
+        admin_client.headers[settings.csrf_header] = saved_header
+    assert r.status_code == 403
+    assert r.json()["error"]["code"] == "csrf_failed"
+
+    # And the mirror image: a stale cookie with the right header.
+    try:
+        admin_client.cookies.set(settings.csrf_cookie_name, other)
+        r = _create_router(admin_client)
+    finally:
+        admin_client.cookies.set(settings.csrf_cookie_name, saved_cookie)
+    assert r.status_code == 403
+    assert r.json()["error"]["code"] == "csrf_failed"
+
+
+def test_a_cached_json_token_from_the_old_contract_is_not_enough(admin_client, settings):
+    """An older client that kept the token from the JSON body has no cookie, so it is refused.
+
+    This is the documented cost of the change: the SPA is updated in the same release, and a
+    hand-written client has to log in again to receive the cookie. Rejecting it silently would
+    be worse - the client would believe it is authorised until the first mutation.
+    """
+    saved_header = admin_client.headers[settings.csrf_header]
+    saved_cookie = admin_client.cookies[settings.csrf_cookie_name]
+    admin_client.cookies.delete(settings.csrf_cookie_name)
+    try:
+        admin_client.headers[settings.csrf_header] = saved_header
+        r = _create_router(admin_client)
+    finally:
+        admin_client.cookies.set(settings.csrf_cookie_name, saved_cookie)
+    assert r.status_code == 403
+    assert r.json()["error"]["code"] == "csrf_failed"
+
+
+def test_the_double_submit_comparisons_are_constant_time(admin_client, monkeypatch):
+    """Both halves go through tokens_equal (hmac.compare_digest), never ==.
+
+    A byte-wise comparison with an early return leaks the token one byte at a time to anyone who
+    can time the 403, which is exactly the party the check exists to stop.
+    """
+    from app import deps
+
+    calls: list[tuple[str, str]] = []
+    real = deps.tokens_equal
+
+    def counting(a: str, b: str) -> bool:
+        calls.append((a, b))
+        return real(a, b)
+
+    monkeypatch.setattr(deps, "tokens_equal", counting)
+    assert _create_router(admin_client, name="csrf-constant-time").status_code == 201
+    assert len(calls) == 2, calls
+    # Header vs cookie, then cookie vs the session row.
+    assert calls[0] == (
+        admin_client.headers[deps.get_settings().csrf_header],
+        admin_client.cookies[deps.get_settings().csrf_cookie_name],
+    )
+    assert calls[1][1] == admin_client.cookies[deps.get_settings().csrf_cookie_name]
 
 
 def test_change_password_rejects_wrong_current(admin_client):
@@ -215,7 +399,9 @@ def test_change_password_works_and_revokes_other_sessions(admin_client, settings
     # client cookie, so pick up its CSRF token too and make THIS the session that acts.
     other = _login(admin_client)
     assert other.status_code == 200
-    admin_client.headers[settings.csrf_header] = other.json()["csrf_token"]
+    other_csrf = other.cookies[settings.csrf_cookie_name]
+    admin_client.cookies.set(settings.csrf_cookie_name, other_csrf)
+    admin_client.headers[settings.csrf_header] = other_csrf
     try:
         r = admin_client.post(
             "/api/auth/password",
@@ -230,6 +416,7 @@ def test_change_password_works_and_revokes_other_sessions(admin_client, settings
         still_live = db.query(PanelSession).filter(PanelSession.revoked_at.is_(None)).count()
         assert still_live == 1
     finally:
+        admin_client.cookies.set(settings.csrf_cookie_name, admin_client.csrf_token)
         admin_client.headers[settings.csrf_header] = admin_client.csrf_token
     # The old password is dead, the new one works.
     admin_client.cookies.clear()

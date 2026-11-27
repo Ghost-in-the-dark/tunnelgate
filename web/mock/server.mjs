@@ -76,6 +76,22 @@ const users = [
   },
 ]
 
+/**
+ * Per-router grants, keyed by user id. Only viewers appear: admin and operator reach every
+ * router by role (app/services/access.py), so a grant row for them would be meaningless and the
+ * real API never writes one. Kept beside the users because it is a property of a user, and
+ * resets with the process like everything else here.
+ */
+const grants = new Map([
+  [3, new Set()],
+  [4, new Set()],
+])
+
+function grantedRouters(userId) {
+  const ids = grants.get(userId) || new Set()
+  return routers.filter((r) => ids.has(r.id))
+}
+
 function makeRouter(i, overrides) {
   const id = (overrides && overrides.id) || randomUUID()
   return Object.assign(
@@ -380,7 +396,13 @@ function requireUser(req, res) {
 
 function requireCsrf(req, res, session) {
   if (req.method === 'GET' || req.method === 'HEAD') return true
-  if (req.headers['x-csrf-token'] !== session.csrf) {
+  // Mirrors app/deps.py::csrf_protect: the header and the cookie must both be present and must
+  // agree, and the cookie must match the token bound to the server-side session. The mock is
+  // what reviewers and screenshots see, so it has to reject exactly what the real server
+  // rejects - a mock that is more permissive hides the 403 an operator would hit.
+  const header = req.headers['x-csrf-token']
+  const cookieValue = cookie(req, 'tg_csrf')
+  if (!header || !cookieValue || header !== cookieValue || cookieValue !== session.csrf) {
     fail(res, 403, 'csrf_failed', 'The CSRF token is missing or stale.')
     return false
   }
@@ -483,8 +505,16 @@ async function handleApi(req, res, url) {
     json(
       res,
       200,
-      { user: user, csrf_token: csrf, expires_at: new Date(Date.now() + 86400000).toISOString() },
-      { 'set-cookie': 'tg_session=' + sid + '; Path=/; HttpOnly; SameSite=Lax' },
+      { user: user, expires_at: new Date(Date.now() + 86400000).toISOString() },
+      {
+        // Two cookies, as the real app/api/auth.py writes them: the session is HttpOnly, and
+        // the CSRF token is readable by script because src/lib/api.ts echoes it back in the
+        // X-CSRF-Token header on every mutating request.
+        'set-cookie': [
+          'tg_session=' + sid + '; Path=/; HttpOnly; SameSite=Lax',
+          'tg_csrf=' + csrf + '; Path=/; SameSite=Lax',
+        ],
+      },
     )
     return
   }
@@ -495,9 +525,11 @@ async function handleApi(req, res, url) {
       fail(res, 401, 'unauthenticated', 'No active session.')
       return
     }
+    // No csrf_token in the body: it lives in the tg_csrf cookie, which the real server writes
+    // at login. A body is readable by any same-origin script; in the merged path layout a
+    // router page is same-origin with the panel, which is the whole reason for the change.
     json(res, 200, {
       user: session.user,
-      csrf_token: session.csrf,
       expires_at: new Date(Date.now() + 86400000).toISOString(),
     })
     return
@@ -511,7 +543,12 @@ async function handleApi(req, res, url) {
         if (entry[1] === session) sessions.delete(entry[0])
       }
     }
-    res.writeHead(204, { 'set-cookie': 'tg_session=; Path=/; Max-Age=0; HttpOnly' })
+    res.writeHead(204, {
+      'set-cookie': [
+        'tg_session=; Path=/; Max-Age=0; HttpOnly',
+        'tg_csrf=; Path=/; Max-Age=0',
+      ],
+    })
     res.end()
     return
   }
@@ -744,6 +781,62 @@ async function handleApi(req, res, url) {
     users.push(user)
     json(res, 201, user)
     return
+  }
+
+  /* ---- per-router grants ---- */
+  const grantsMatch = path.match(/^\/api\/v1\/users\/(\d+)\/routers(?:\/([^/]+))?$/)
+  if (grantsMatch) {
+    const id = Number(grantsMatch[1])
+    const routerId = grantsMatch[2] ? decodeURIComponent(grantsMatch[2]) : null
+    const user = users.find((u) => u.id === id)
+    if (!user) {
+      fail(res, 404, 'not_found', 'That user does not exist.')
+      return
+    }
+    if (session.user.role !== 'admin') {
+      fail(res, 403, 'forbidden', 'Only administrators can change router access.')
+      return
+    }
+    if (method === 'GET' && !routerId) {
+      const items = grantedRouters(id).map(publicRouter)
+      json(res, 200, { items: items, total: items.length })
+      return
+    }
+    // CSRF and authentication are already enforced by the shared guard above every /api/v1
+    // route, so these handlers only deal with the grant set itself.
+    if (method === 'PUT' && !routerId) {
+      const body = await readBody(req)
+      const wanted = Array.isArray(body.router_ids) ? body.router_ids : null
+      if (!wanted) {
+        fail(res, 400, 'validation_error', 'router_ids must be a list of router ids.', {
+          fields: [{ loc: ['body', 'router_ids'], msg: 'expected a list' }],
+        })
+        return
+      }
+      const unknown = wanted.filter((rid) => !routers.some((r) => r.id === rid))
+      if (unknown.length > 0) {
+        fail(res, 400, 'validation_error', 'Unknown router id in router_ids: ' + unknown.sort().join(', '), {
+          fields: unknown.map((rid) => ({ loc: ['body', 'router_ids'], msg: 'unknown router ' + rid })),
+        })
+        return
+      }
+      grants.set(id, new Set(wanted))
+      const items = grantedRouters(id).map(publicRouter)
+      json(res, 200, { items: items, total: items.length })
+      return
+    }
+    if (method === 'DELETE' && routerId) {
+      const set = grants.get(id) || new Set()
+      if (!set.has(routerId)) {
+        fail(res, 404, 'not_found', 'This user has no grant for that router')
+        return
+      }
+      set.delete(routerId)
+      grants.set(id, set)
+      res.writeHead(204)
+      res.end()
+      return
+    }
   }
 
   const userMatch = path.match(/^\/api\/v1\/users\/(\d+)$/)

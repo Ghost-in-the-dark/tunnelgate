@@ -16,12 +16,23 @@ half.
 Host key verification
 ---------------------
 The peer is only reachable through the loopback listener that the *router's own* authenticated
-tunnel connection created, so router identity is already established at the tunnel layer.
-`Router` currently carries no stored console host key, so :class:`ConsoleHostKeyPolicy`
-**records** the observed fingerprint and still refuses a mismatch whenever a fingerprint is
-available (today via `Router.console_host_key_fingerprint` / `Router.console_host_key` when a
-future model revision adds them, and via `:func:`app.security.key_fingerprint` for a public
-key line). Nothing is trusted from the network in the meantime: `allow_agent=False` and
+tunnel connection created, so router identity is already established at the tunnel layer. That
+makes the host key check defence in depth, and it is the check that still holds in the case that
+matters: a router whose tunnel key was stolen, or a device someone else now controls, could
+otherwise terminate the panel's session with a host key of its choosing and read every keystroke.
+
+So the console pins the router's host key on first use. :class:`ConsoleHostKeyPolicy` records
+the fingerprint it observed into `Router.console_host_key_fingerprint` (with
+`Router.console_host_key_seen_at`) the first time a handshake succeeds, and every later
+handshake must present exactly that fingerprint - compared with `hmac.compare_digest` - or the
+open fails with `console_auth_failed` before any channel exists. An admin who has verified a
+device out of band (it was reflashed or replaced) clears the pin through
+`DELETE /api/v1/routers/{router_id}/console/host-key`, and the next open learns the new key.
+
+An earlier revision compared against attribute names the model never had, so the pin was always
+None and every host key was accepted: the check existed on paper only.
+
+Nothing is trusted from the network in the meantime: `allow_agent=False` and
 `look_for_keys=False` mean a wrong key never reaches the wire.
 
 Nothing in this module logs key material, keystrokes or shell output.
@@ -50,10 +61,11 @@ from paramiko import (
     SSHClient,
     SSHException,
 )
+from sqlalchemy.orm import Session
 
-from ..config import Settings, get_settings
+from ..config import Settings, get_settings, utcnow
 from ..models import STATUS_ONLINE, STATUS_REVOKED, Router
-from ..security import decrypt_secret, hash_token, key_fingerprint
+from ..security import decrypt_secret, hash_token
 from .keys import console_remote_user
 
 log = logging.getLogger("tunnelgate.console")
@@ -370,44 +382,133 @@ def _fingerprint_of_key(key: Any) -> str:
 
 
 def _pinned_host_key_fingerprint(router: Router) -> str | None:
-    """Best-effort pin: a stored fingerprint if a future model revision provides one."""
-    for attr in ("console_host_key_fingerprint", "host_key_fingerprint"):
-        value = getattr(router, attr, None)
-        if value:
-            return str(value).strip()
-    public_line = getattr(router, "console_host_key", None)
-    if public_line:
-        with contextlib.suppress(ValueError):
-            return key_fingerprint(str(public_line))
+    """The fingerprint this router's console host key was pinned to, or None if not yet pinned."""
+    value = getattr(router, "console_host_key_fingerprint", None)
+    if value:
+        return str(value).strip()
     return None
 
 
+def _host_key_changed_message(router: Router, expected: str, observed: str) -> str:
+    """Explain a changed host key in the only terms an admin can act on.
+
+    The message deliberately spells out the remedy (clear the pin) and where to clear it,
+    because the alternative - a bare "host key changed" - leaves the operator to guess whether
+    the panel is broken or the device is compromised, and the tempting fix is to retry.
+    """
+    return (
+        f"The router's SSH host key changed (pinned {expected}, observed {observed}); "
+        "refusing to open a console session. The device may have been reflashed or replaced, "
+        "or the connection may be tampered with. Verify the router out of band (console cable, "
+        "physical access, another trusted path); if the new key is expected, an admin must "
+        "clear the pin with DELETE /api/v1/routers/"
+        f"{router.id}/console/host-key and it will be relearned on the next console open."
+    )
+
+
+def _set_host_key_pin(router: Router, observed: str, when: Any) -> None:
+    """Write the pin onto one Router instance. Never raises: the row may be a detached stub."""
+    with contextlib.suppress(Exception):
+        router.console_host_key_fingerprint = observed
+    with contextlib.suppress(Exception):
+        router.console_host_key_seen_at = when
+
+
+def record_host_key_pin(router: Router, observed: str, db: Session | None = None) -> None:
+    """Remember the observed host key on the router, persisting it when a session is available.
+
+    Runs inside the SSH handshake worker thread, so the commit here is on the caller's Session
+    and must never be allowed to take the console down: a pin that fails to save is logged and
+    the session proceeds, while an exception escaping this function would turn a working router
+    into a 502. The in-memory attributes are always updated so the calling request (and any
+    other caller holding this row) sees the learned value even when db is None.
+    """
+    now = utcnow()
+    _set_host_key_pin(router, observed, now)
+
+    if db is None:
+        log.info(
+            "console host key for router %s pinned on first use: %s (not persisted: no session)",
+            getattr(router, "id", "?"),
+            observed,
+        )
+        return
+
+    # The WebSocket path hands us a router loaded through session_scope() and detached from it,
+    # so writing to that object alone would be silently discarded at commit time: fetch the row
+    # this Session actually owns and pin that one. For an attached router db.get() returns the
+    # same instance, so the ordinary request path does no extra work.
+    with contextlib.suppress(Exception):
+        fetched = db.get(Router, getattr(router, "id", None))
+        if fetched is not None and fetched is not router:
+            _set_host_key_pin(fetched, observed, now)
+
+    try:
+        db.commit()
+    except Exception as exc:  # pragma: no cover - only on a broken/locked database
+        with contextlib.suppress(Exception):
+            db.rollback()
+        log.warning(
+            "could not persist the console host key pin for router %s (%r); the console keeps "
+            "working but the pin will be relearned on the next open",
+            getattr(router, "id", "?"),
+            exc,
+        )
+        return
+
+    log.info(
+        "console host key for router %s pinned on first use: %s",
+        getattr(router, "id", "?"),
+        observed,
+    )
+
+
 class ConsoleHostKeyPolicy(MissingHostKeyPolicy):
-    """Accept the router's host key on first use, but refuse a changed one.
+    """Trust the router's host key on first use, then refuse any other key for ever.
 
     See the module docstring: the peer is authenticated by the tunnel that created the loopback
-    listener, so the host key here is defence in depth, not the trust anchor.
+    listener, so the host key here is defence in depth, not the trust anchor. It is still the
+    only thing standing between a compromised router and an interactive root shell on that
+    router, so a mismatch ends the handshake before paramiko can send anything: the session is
+    never opened, so there is no window in which keystrokes go to the wrong device.
     """
 
-    def __init__(self, router: Router) -> None:
+    def __init__(self, router: Router, db: Session | None = None) -> None:
         self.router = router
+        self.db = db
         self.observed: str | None = None
 
     def missing_host_key(self, client, hostname: str, key) -> None:
         observed = _fingerprint_of_key(key)
         self.observed = observed
         expected = _pinned_host_key_fingerprint(self.router)
-        if expected and not hmac.compare_digest(expected, observed):
-            raise ConsoleError(
-                "console_auth_failed",
-                "The router presented an unexpected SSH host key; refusing to open a shell",
-                502,
-            )
-        log.debug("console host key for %s is %s (unpinned)", hostname, observed)
+        if expected:
+            if not hmac.compare_digest(expected, observed):
+                log.error(
+                    "console host key mismatch for router %s: pinned %s, observed %s",
+                    getattr(self.router, "id", "?"),
+                    expected,
+                    observed,
+                )
+                raise ConsoleError(
+                    "console_auth_failed",
+                    _host_key_changed_message(self.router, expected, observed),
+                    502,
+                )
+            log.debug("console host key for %s matches the pin: %s", hostname, observed)
+            return
+        # First use: nothing to compare against, so record this key and never accept another.
+        record_host_key_pin(self.router, observed, self.db)
 
 
-def _connect_blocking(router: Router, settings: Settings) -> SSHClient:
-    """Blocking half of :func:`open_ssh`: unseal, handshake, keep the session. No channel yet."""
+def _connect_blocking(router: Router, settings: Settings, db: Session | None = None) -> SSHClient:
+    """Blocking half of :func:`open_ssh`: unseal, handshake, keep the session. No channel yet.
+
+    `db` is the caller's session so a host key learned on first use can be persisted from this
+    worker thread. It is optional because not every caller has one (the WebSocket bridge opens
+    its own short-lived session around the call); without it the pin still lands on the
+    in-memory router and is only written by a later caller that does have a session.
+    """
     sealed = getattr(router, "console_key_sealed", None)
     port = getattr(router, "console_port", None)
     if not sealed or not port:
@@ -444,7 +545,9 @@ def _connect_blocking(router: Router, settings: Settings) -> SSHClient:
         del plaintext
 
     client = SSHClient()
-    client.set_missing_host_key_policy(ConsoleHostKeyPolicy(router))
+    # The policy both enforces a pinned key and records the pin on first use; it needs the
+    # caller's session to persist that, which is why db is threaded down to here.
+    client.set_missing_host_key_policy(ConsoleHostKeyPolicy(router, db))
     timeout = float(settings.console_connect_timeout_seconds or 10.0)
     try:
         client.connect(
@@ -471,10 +574,16 @@ def _connect_blocking(router: Router, settings: Settings) -> SSHClient:
             502,
         ) from exc
     except BadHostKeyException as exc:
+        # paramiko raises this instead of consulting the policy when the server's key differs
+        # from one it already cached for this host. The message says what to check so an admin
+        # does not read it as a transient network fault and simply retry.
         _close_quietly(client)
         raise ConsoleError(
             "console_auth_failed",
-            "The router presented an unexpected SSH host key",
+            "The router presented an SSH host key that does not match the one on record; "
+            "refusing to open a console session. If the device was reflashed or replaced, an "
+            f"admin must clear the pin with DELETE /api/v1/routers/{router.id}/console/host-key "
+            "after verifying it out of band; otherwise treat it as possible tampering.",
             502,
         ) from exc
     except (SSHException, OSError, EOFError) as exc:
@@ -496,9 +605,12 @@ def _connect_blocking(router: Router, settings: Settings) -> SSHClient:
         with contextlib.suppress(Exception):
             transport.set_keepalive(CONSOLE_KEEPALIVE_SECONDS)
 
+    # paramiko keeps the policy on the private _policy attribute; read it defensively so a
+    # client that exposes it under another name (a stub in the tests) still reports what the
+    # policy observed, which is what the WebSocket handler audits as host_key_fingerprint.
     policy = None
     with contextlib.suppress(Exception):
-        policy = client._policy
+        policy = getattr(client, "_policy", None) or getattr(client, "policy", None)
     if isinstance(policy, ConsoleHostKeyPolicy) and policy.observed:
         with contextlib.suppress(Exception):
             client._tg_console_host_key_fingerprint = policy.observed
@@ -510,12 +622,24 @@ def _close_quietly(client: Any) -> None:
         client.close()
 
 
-async def open_ssh(router: Router, settings: Settings | None = None) -> SSHClient:
+async def open_ssh(
+    router: Router,
+    settings: Settings | None = None,
+    *,
+    db: Session | None = None,
+) -> SSHClient:
     """Dial the router's console listener and return a connected, authenticated SSH client.
 
     Runs the whole blocking handshake in a worker thread. Raises :class:`ConsoleError` with
     `console_no_key` / `console_auth_failed` / `console_unreachable`; the caller is responsible
     for closing the returned client (that is what a throwaway reachability probe does).
+
+    `db` is the caller's Session and exists for one reason: a host key met for the first time
+    has to be pinned on the router row before the console is usable again, and this is the only
+    place that sees the observed key. The commit happens inside the worker thread on that
+    session, which is safe because the caller is awaiting this call and cannot be using the
+    same Session concurrently. Callers that pass None (a detached router, a unit test) still
+    get the pin on the in-memory object.
     """
     s = settings or get_settings()
     if not s.console_enabled:
@@ -523,7 +647,7 @@ async def open_ssh(router: Router, settings: Settings | None = None) -> SSHClien
     timeout = float(s.console_connect_timeout_seconds or 10.0)
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(_connect_blocking, router, s), timeout=timeout * 3 + 5
+            asyncio.to_thread(_connect_blocking, router, s, db), timeout=timeout * 3 + 5
         )
     except TimeoutError as exc:
         raise ConsoleError(
@@ -564,10 +688,14 @@ async def open_shell(
     *,
     cols: int = DEFAULT_CONSOLE_COLS,
     rows: int = DEFAULT_CONSOLE_ROWS,
+    db: Session | None = None,
 ) -> ConsoleConnection:
-    """Connect and immediately request an interactive pty/shell channel."""
+    """Connect and immediately request an interactive pty/shell channel.
+
+    `db` is forwarded to :func:`open_ssh` so a host key seen for the first time is pinned.
+    """
     s = settings or get_settings()
-    client = await open_ssh(router, s)
+    client = await open_ssh(router, s, db=db)
     try:
         channel = await asyncio.to_thread(_invoke_shell_blocking, client, s, cols, rows)
     except ConsoleError:

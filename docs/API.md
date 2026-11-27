@@ -22,9 +22,17 @@ Two completely separate mechanisms:
 | Router, during onboarding | `X-Bootstrap-Token` header | single-use, 15 min |
 | Router, afterwards | `X-Api-Token` header | derived from its public key, see below |
 
-State-changing operator requests **must** carry `X-CSRF-Token` with the value returned by
-login (double-submit; the token is bound to the server-side session row, not to a cookie).
-Missing or wrong CSRF on a mutating request → `403 csrf_failed`.
+State-changing operator requests **must** carry `X-CSRF-Token`, and the value must match the
+`tg_csrf` cookie that login sets beside the session cookie (name from
+`TUNNELGATE_CSRF_COOKIE_NAME`, default `tg_csrf`). The client reads that cookie and echoes it in
+the header; the server then checks three things - the header is present, it equals the cookie,
+and the cookie equals the server-side `PanelSession.csrf_token`. Sending only one of the two, or
+sending two different values, is `403 csrf_failed`.
+
+Neither `POST /api/auth/login` nor `GET /api/auth/me` puts the token in the response body any
+more. That was the bug: in the merged path layout a router page is same-origin with the panel,
+so a compromised router could fetch `/api/auth/me` with the operator's cookie and read the token
+straight out of the JSON. No response body carries it now; see docs/SECURITY.md.
 
 The `X-Api-Token` a router sends on heartbeats is `"tg_" + sha256(public_key)[:40]`, the same
 value handed to it at exchange time. It is deliberately **not** a stored secret: it can be
@@ -66,9 +74,14 @@ Two timestamps in the same second are indistinguishable by design.
 
 | Role | May |
 |---|---|
-| `viewer` | read routers, read audit, open **LuCI** |
-| `operator` | + create/rotate/delete routers, read install scripts, open a **console** |
-| `admin` | + manage users, terminate console sessions, reissue scripts for installed routers, set the agent endpoint |
+| `viewer` | read **the routers granted to them**, read audit, open **LuCI** on a granted router |
+| `operator` | + **every** router, create/rotate/delete routers, read install scripts, open a **console** |
+| `admin` | + manage users and grants, terminate console sessions, reissue scripts for installed routers, set the agent endpoint |
+
+`admin` and `operator` are allowed on every router without a grant row: they rotate keys and
+read install scripts, which already means a working credential for any device, so asking for a
+grant on top would be theatre. `viewer` is the role grants exist for - see
+[Per-router access](#per-router-access-grants).
 
 ---
 
@@ -86,13 +99,22 @@ Two timestamps in the same second are indistinguishable by design.
 {
   "user": {"id": 1, "username": "admin", "display_name": "Administrator",
            "role": "admin", "is_active": true, "created_at": "...", "last_login_at": "..."},
-  "csrf_token": "b7c1...",
   "expires_at": "2026-11-18T09:42:34Z"
 }
 ```
 
-Sets `Set-Cookie: tg_session=<opaque>; HttpOnly; SameSite=Lax; Path=/; Max-Age=...`
-(`Secure` when `TUNNELGATE_COOKIE_SECURE=true`).
+Sets **two** cookies:
+
+```
+Set-Cookie: tg_session=<opaque>; HttpOnly; SameSite=Lax; Path=/; Max-Age=<session ttl>
+Set-Cookie: tg_csrf=<the session row's csrf token>; SameSite=Lax; Path=/; Max-Age=<same ttl>
+```
+
+(`Secure` on both when `TUNNELGATE_COOKIE_SECURE=true`.) The second one is deliberately **not**
+HttpOnly: the SPA has to read it to build the `X-CSRF-Token` header, and a token only the browser
+can send is a token the browser must be able to show to script. The session cookie is the
+credential; this cookie is only the second half of a same-origin proof. The response body carries
+no token at all - that is what makes a fetched-and-read attack impossible.
 
 No `Domain` attribute is emitted unless `TUNNELGATE_COOKIE_DOMAIN` is set, so the cookie is
 **host-only** and a browser sends it only to the panel hostname - never to a router vhost. Setting
@@ -104,11 +126,21 @@ Rate limited per client IP and per IP+username: `TUNNELGATE_LOGIN_RATE_LIMIT` (1
 
 ### `POST /api/auth/logout`
 
-Revokes the session row and clears the cookie. → `204`.
+Revokes the session row and clears **both** cookies - `tg_session` and `tg_csrf`, each with
+`Max-Age=0`. → `204`.
+
+Leaving the CSRF cookie behind would keep a live-looking token in the browser past the session
+it belongs to.
 
 ### `GET /api/auth/me`
 
-→ `200` `UserOut` (no CSRF token; the SPA keeps the one it got at login).
+→ `200` `SessionOut` = `{"user": UserOut, "expires_at": "..."}`. No CSRF token in the body:
+it lives in the `tg_csrf` cookie, which login set and logout deletes.
+
+A reloaded SPA boots from this call and reads the cookie. The route does not set it: only login
+writes `tg_csrf` and only logout deletes it, so a browser that lost the cookie has no token
+until it signs in again - the next mutating request fails `403 csrf_failed` rather than
+guessing.
 
 ### `POST /api/auth/password`
 
@@ -117,6 +149,29 @@ Revokes the session row and clears the cookie. → `204`.
 ```
 
 Rehashes and revokes **every other** session of that user. → `204`.
+
+---
+
+## Per-router access (grants)
+
+Every router endpoint, the LuCI gate and the console check the same rule, implemented once in
+`app/services/access.py`:
+
+```
+admin, operator             -> every router
+viewer                      -> only the routers in router_grants for that user
+```
+
+A viewer with no grant therefore sees an empty router list and a plain `401 not_authenticated`
+from the gate - the same body an unauthenticated caller gets, so a viewer cannot use the panel
+to find out which router ids exist. The REST endpoints answer `403 forbidden` for a router the
+caller may not see, and for a router id that does not exist the answer is the same `403`: a
+`404` exists only for callers who are allowed on every router (`admin`/`operator`), where
+telling "missing" from "forbidden" leaks nothing.
+
+Grants are managed by an admin (see [Users](#users-admin-only)); a viewer who creates a router is
+granted it automatically, otherwise the router would appear in the create response and vanish
+from their list forever.
 
 ---
 
@@ -164,6 +219,10 @@ substring), `limit`, `offset`.
 ```json
 {"items": [RouterOut, ...], "total": 12, "online": 9, "offline": 2, "pending": 1}
 ```
+
+A viewer gets only the routers granted to them, and the counters describe that filtered set:
+`total` is the number of routers they can see, not the number in the panel. Returning the
+unfiltered totals would turn the list into a census of devices the caller may not touch.
 
 ### `GET /api/v1/routers/{id}` → `RouterOut`
 
@@ -373,13 +432,31 @@ the audit trail.
 → `200`
 
 ```json
-{"state": "ready", "console_port": 25001, "installed_at": "...",
- "fingerprint": "SHA256:...", "active_sessions": 0,
- "idle_timeout_seconds": 900, "max_session_seconds": 7200}
+{"state": "ready", "console_port": 25001, "console_ssh_port": 22, "ssh_user": "root",
+ "installed_at": "...", "fingerprint": "SHA256:...",
+ "host_key_fingerprint": "SHA256:...", "host_key_pinned_at": "...",
+ "active_sessions": 0, "idle_timeout_seconds": 900, "max_session_seconds": 7200,
+ "max_sessions_per_user": 3}
 ```
 
 `state`: `disabled` (feature off for this router) · `no_key` (never opened yet) ·
 `not_installed` (key created, router has not picked it up) · `ready` · `offline`.
+
+Two fingerprints, deliberately separate:
+
+| Field | What it fingerprints |
+|---|---|
+| `fingerprint` | the **console key** the panel presents to the router (the panel's identity) |
+| `host_key_fingerprint` | the **router's own SSH host key**, pinned on the first console open and required never to change; `null` until that first open |
+
+`host_key_pinned_at` is when that key was learned; while the pin is `null` the console has not
+verified the device yet, which the UI should say in those words rather than showing an empty
+string that reads like "nothing to check". Compare `host_key_fingerprint` with
+`ssh-keygen -lf` on the device; comparing the *other* one proves nothing about the router.
+
+Readable by every authenticated user for a router they may access - console state is per-router
+data (ports, fingerprints, live session count), so a viewer without a grant gets `403` here
+just as on the router row itself.
 
 ### `POST /api/v1/routers/{id}/console/start` *(operator, CSRF)*
 
@@ -394,6 +471,21 @@ Opens the SSH connection (this is the reachability check) and mints a one-time t
 
 Ticket: 30 s TTL, single use, bound to (router_id, user_id, client IP). Rate limited to
 10 starts/minute per user. `403` for `viewer`.
+
+The dial performs the host key check, so the failures below are the ones an operator will
+actually see:
+
+| Status | `code` | Meaning |
+|---|---|---|
+| `502` | `console_auth_failed` | the router presented a host key that does not match its pin, or rejected the console key (see the message: it names which) |
+| `502` | `console_unreachable` | the loopback listener did not answer; the router is offline or its forward is down |
+| `409` | `console_no_key` | no console key, or no console port allocated |
+
+The first successful open **pins** the router's host key (`host_key_fingerprint` on the read
+endpoint). Every later open must present the same key. A different one is refused before a
+session exists - a reflash, a swapped device, or an impostor inside the tunnel all look the
+same from here, and the recovery is the same: verify the device out of band, then clear the
+pin with the `DELETE .../console/host-key` route below.
 
 ### `WS /api/v1/routers/{id}/console/ws?ticket=...`
 
@@ -411,6 +503,30 @@ CSRF-equivalent proof). Frame protocol:
 
 Close reasons: `idle_timeout`, `max_duration`, `client_closed`, `router_disconnected`,
 `admin_terminated`, `server_shutdown`.
+
+### `DELETE /api/v1/routers/{id}/console/host-key` *(admin, CSRF)*
+
+Forget the router's pinned SSH host key, so the next console open learns it again. → `204`
+
+This is the only way out of the trust-on-first-use pin, and it exists because the pin cannot be
+allowed to relearn itself: a router that has been taken over would present its own host key and
+every console would silently talk to the attacker. A router that was legitimately reflashed or
+physically replaced genuinely does come back with a new host key, so an admin with out-of-band
+proof of the device - console cable, physical access, a trusted second path - clears the pin
+here and the next `start` re-pins it.
+
+Verify the device **before** calling this. Calling it because a console opening felt wrong is
+the exact move someone who took the router needs, which is why it is admin-only and audited as
+`console.host_key.cleared` with the discarded fingerprint, who discarded it and from where.
+
+| Status | `code` | Meaning |
+|---|---|---|
+| `204` | - | pin cleared (also when there was no pin) |
+| `404` | `router_not_found` | no such router |
+| `403` | `forbidden` | caller is not an admin |
+| `403` | `csrf_failed` | missing or stale CSRF token |
+
+It terminates nothing: live shells were verified when they opened and keep running.
 
 ### `DELETE /api/v1/console/sessions/{id}` *(admin, CSRF)*
 
@@ -466,7 +582,9 @@ Filters: `router_id`, `actor`, `action`, `outcome`, `limit` (default 100, max 10
 Actions: `auth.login`, `auth.login_failed`, `auth.logout`, `auth.password`, `router.create`,
 `router.update`, `router.delete`, `router.rotate`, `router.script`, `router.exchange`,
 `luci.open`, `console.start`, `console.open`, `console.close`, `console.terminate`,
-`user.create`, `user.update`, `user.delete`, `settings.agent_endpoint.save`,
+`console.host_key.cleared`, `user.create`, `user.update`, `user.delete`,
+`user.grants.update`, `user.grants.revoke`,
+`settings.agent_endpoint.save`,
 `settings.agent_endpoint.reset`, `settings.agent_endpoint.test`.
 
 `settings.agent_endpoint.test` is written with `outcome: "error"` when the probe failed even
@@ -488,6 +606,59 @@ subresources does not create 40 rows.
 ```
 
 The last active admin cannot be deleted or demoted (`409 last_admin`).
+
+The grant routes below decide which routers a `viewer` may reach; see
+[Per-router access](#per-router-access-grants) for the rule they feed.
+
+### `GET /api/v1/users/{id}/routers` *(admin)*
+
+The routers granted to one user, in the router list shape the rest of the panel uses. Only
+meaningful for a `viewer`: `admin` and `operator` are allowed on every router without a row
+here, so an empty list for them is not a lack of access.
+
+→ `200` `{"items": [RouterOut, ...], "total": 2}`
+
+### `PUT /api/v1/users/{id}/routers` *(admin, CSRF)*
+
+```json
+{"router_ids": ["a1b2...", "c3d4..."]}
+```
+
+**Replaces** the whole set for that user - it is not a merge. A set operation is idempotent, so
+a retry after a timeout cannot double-grant, and the audit row records the state that resulted
+instead of a delta nobody can replay against an unknown starting point. Send
+`{"router_ids": []}` to revoke everything.
+
+→ `200` with the same envelope as `GET`, now describing the new set.
+
+| Status | `code` | Meaning |
+|---|---|---|
+| `400` | `validation_error` | an id in `router_ids` does not exist; the message and `details.fields` name it |
+| `403` | `forbidden` | caller is not an admin - an operator who could grant themselves routers would make the whole access check pointless |
+| `403` | `csrf_failed` | missing or stale CSRF token |
+| `404` | `not_found` | no such user |
+
+An unknown id is refused rather than skipped: silently dropping it would tell the caller a grant
+exists when no row was written, and nobody would find out until that person cannot open the
+router. Router ids are validated by a single `SELECT ... WHERE id IN (...)`, so the whole body
+is rejected or none of it is.
+
+Grants and roles are independent on purpose. Promoting a user to `admin` or `operator` leaves
+their rows in place - redundant, harmless, and the whole permission again if the role ever falls
+back to `viewer`. Demoting to `viewer` does **not** create grants and does not copy anything
+from the old role: until an admin grants routers, that user reaches none. Nothing deletes rows
+behind the caller's back here; deleting the user or the router does, by `ON DELETE CASCADE`.
+
+Audited as `user.grants.update` with `detail` = `{"username", "router_ids", "added",
+"removed"}`.
+
+### `DELETE /api/v1/users/{id}/routers/{router_id}` *(admin, CSRF)*
+
+→ `204`. Removes exactly one grant and audits `user.grants.revoke` with
+`detail: {"username": "...", "router_ids": ["<router_id>"]}`.
+
+`404 not_found` when that user has no grant for that router: a delete that reports success while
+doing nothing teaches the caller the router was protected when it was not.
 
 ---
 
@@ -644,7 +815,7 @@ audited (`settings.agent_endpoint.test`, `detail: {checked_url, error, verify_tl
 ### `GET /api/v1/health` (no auth)
 
 ```json
-{"status": "ok", "version": "1.1.2", "time": "2026-11-17T21:42:34Z"}
+{"status": "ok", "version": "1.3.0", "time": "2026-11-17T21:42:34Z"}
 ```
 
 ### `GET /api/v1/config`
@@ -653,7 +824,7 @@ audited (`settings.agent_endpoint.test`, `detail: {checked_url, error, verify_tl
 {"panel_url": "http://127.0.0.1:8080", "subdomain_suffix": "panel.example.com",
  "route_mode": "subdomain", "gateway_host": "gate.panel.example.com",
  "bootstrap_ttl_minutes": 15, "poll_interval_seconds": 2, "proxy_driver": "nginx",
- "version": "1.1.2",
+ "version": "1.3.0",
  "agent_url": "https://panel.example.com",
  "agent_endpoint": {"scheme": "https", "host": "panel.example.com", "port": null,
                     "source": "environment", "verify_tls": true},
@@ -685,6 +856,11 @@ the override is `PUT /api/v1/settings/agent-endpoint` (see [Settings](#settings-
  "ports_free": 456, "users_total": 3, "console_sessions_active": 1}
 ```
 
+The router and console counters describe **the routers the caller may reach** (`admin` and
+`operator`: all of them; a `viewer`: the granted set), because a fleet's size and health is
+information about routers a viewer was not given. `users_total` is a panel-wide account count
+and is not scoped.
+
 ---
 
 ## Internal: the router launch hand-off
@@ -702,7 +878,10 @@ GET /__tg/launch?router=office-ap&next=/cgi-bin/luci
    Cache-Control: no-store
 ```
 
-* The caller must hold a panel session (`401 not_authenticated` otherwise).
+* The caller must hold a panel session (`401 not_authenticated` otherwise), **and** may reach
+  the router: a `viewer` without a grant gets `403 forbidden` (or, when the request looks like a
+  browser navigation, a `303` to the login form carrying `?router=`). A ticket is a credential
+  for one router, so minting one asks the same question the gate asks.
 * `next` is sanitised to a same-host absolute path (`/` on anything else - `//host`,
   `/\host`, `https://...` and a bare segment all become `/`).
 * The ticket is 32 random bytes, valid for `TUNNELGATE_LAUNCH_TICKET_TTL_SECONDS` (120 s),
@@ -758,9 +937,19 @@ Accepts **either** credential:
 401  {"error": {"code": "not_authenticated"}} -> nginx redirects to the panel login
 ```
 
-It fails closed: an unknown router, a disabled account, a forged signature or a cookie for a
-different router all produce the same `401`. Both responses carry `Cache-Control: no-store`.
+It fails closed: an unknown router, a disabled account, a forged signature, a cookie for a
+different router, and a **router the caller was not granted** all produce the same `401`.
+That last one matters: a viewer is refused with the identical body an unauthenticated caller
+gets, so the status code and message never reveal whether a router id exists. Both responses
+carry `Cache-Control: no-store`.
 
 It audits `luci.open` (throttled) with `detail: {"uri": "...", "credential":
 "panel-session"|"router-cookie"}`, so the audit log answers "who looked at which router, and
-with which credential".
+with which credential". A refusal is logged at INFO naming the router and the role, and is not
+audited: the row that matters is the open that succeeded.
+
+The decision is two questions in that order - *who* is calling (the credential above) and
+*whether* that user may reach this router (`app/services/access.py`: `admin`/`operator` always,
+`viewer` only with a grant). Keeping them separate is what makes the gate safe to call from
+nginx on every subresource: it costs one indexed lookup on `router_grants` per request and
+decides nothing else.

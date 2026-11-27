@@ -40,7 +40,13 @@ def _user(username: str = "launch-user", role: str = "operator") -> int:
 def _login(client, username: str = "launch-user", password: str = "user-t3st-pass") -> str:
     r = client.post("/api/auth/login", json={"username": username, "password": password})
     assert r.status_code == 200, r.text
-    return r.json()["csrf_token"]
+    # The token is no longer in the body; login writes it to the csrf cookie and mutating
+    # routes need it back in the header as well (double submit).
+    from app.config import get_settings
+
+    token = r.cookies[get_settings().csrf_cookie_name]
+    client.headers[get_settings().csrf_header] = token
+    return token
 
 
 # --------------------------------------------------------------------------- pure helpers
@@ -563,3 +569,70 @@ def test_the_router_api_advertises_path_urls(client, api, settings):
     created = api.create_router("Path Advertising")
     assert created["url"] == f"https://gate.panel.test/{created['slug']}/"
     assert created["launch_url"] == f"https://gate.panel.test/{created['slug']}/__tg/enter"
+
+
+# --------------------------------------------------------------------------- per-router access
+# The launch endpoint mints a credential for one router, so it asks the same question the gate
+# asks: may THIS user reach THIS router. Without it a viewer could mint a ticket for a router
+# they were never granted, land a cookie that the gate then refuses, and leave a luci.launch
+# audit row claiming a hand-off happened.
+def _grant(db, user_id: int, router_id: str) -> None:
+    from app.models import RouterGrant
+
+    db.add(RouterGrant(user_id=user_id, router_id=router_id))
+    db.commit()
+
+
+def test_launch_refuses_a_viewer_without_a_grant(client, api, db):
+    created = api.create_router("Ungranted")
+    # Deliberately no RouterGrant row: this is the viewer who was never given the router.
+    _user("launch-viewer", role="viewer")
+    _login(client, "launch-viewer")
+
+    r = client.get(
+        "/__tg/launch",
+        params={"router": created["slug"]},
+        headers={"accept": "application/json"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 403
+    assert r.json()["error"]["code"] == "forbidden"
+    # Nothing was minted, so there is no ticket to redeem.
+    assert TICKETS.consume("anything") is None
+    with session_scope() as s:
+        assert s.query(AuditLog).filter(AuditLog.action == "luci.launch").count() == 0
+
+
+def test_launch_sends_a_viewer_without_a_grant_to_the_login_form(client, api):
+    """A browser navigating must not be shown a JSON 403 page."""
+    created = api.create_router("Ungranted Browser")
+    _user("launch-viewer-browser", role="viewer")
+    _login(client, "launch-viewer-browser")
+
+    r = client.get(
+        "/__tg/launch",
+        params={"router": created["slug"]},
+        # Browsers advertise text/html; that Accept header is what tells the endpoint to hand
+        # a navigation to the login form instead of returning an error envelope.
+        headers={"accept": "text/html,application/xhtml+xml"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+    assert "/login" in r.headers["location"]
+    assert "router=" + created["slug"] in r.headers["location"]
+
+
+def test_launch_mints_for_a_viewer_with_a_grant(client, api, db):
+    created = api.create_router("Granted")
+    viewer_id = _user("launch-granted", role="viewer")
+    _grant(db, viewer_id, created["id"])
+    _login(client, "launch-granted")
+
+    r = client.get("/__tg/launch", params={"router": created["slug"]}, follow_redirects=False)
+    assert r.status_code == 303
+    location = r.headers["location"]
+    assert "/__tg/enter?t=" in location
+    ticket = location.split("t=", 1)[1]
+    record = TICKETS.consume(ticket)
+    assert record is not None
+    assert record.router_id == created["id"]

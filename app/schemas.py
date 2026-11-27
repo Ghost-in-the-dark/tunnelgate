@@ -42,8 +42,17 @@ class UserOut(ORMModel):
 
 
 class SessionOut(BaseModel):
+    """What POST /api/auth/login and GET /api/auth/me answer.
+
+    There is deliberately no csrf_token here. The token is delivered in the csrf cookie
+    (settings.csrf_cookie_name) instead, because a JSON body is readable by any same-origin
+    script: in the merged path layout a compromised router page is same-origin with the panel
+    and used to fetch /api/auth/me, lift the token out of this body and then perform any
+    authenticated mutation with the operator's session cookie. A cookie the panel never
+    serialises into a response body removes that one cheap step; see app/api/auth.py.
+    """
+
     user: UserOut
-    csrf_token: str
     expires_at: str | None = None
 
 
@@ -66,6 +75,24 @@ class UserUpdate(BaseModel):
     role: Role | None = None
     is_active: bool | None = None
     password: str | None = Field(default=None, min_length=8, max_length=256)
+
+
+class UserRouterGrantsIn(BaseModel):
+    """The complete set of routers a viewer may reach; PUT replaces, it does not merge.
+
+    A set, not a diff: the caller sends the list it wants and gets it back, so re-sending the
+    same body changes nothing and a UI does not have to compute additions and removals against
+    a stale snapshot. Duplicates are collapsed on the way in for the same reason - the table
+    has a unique constraint on (user_id, router_id), and a body listing the same router twice
+    should mean "granted", not a 500 from a constraint violation.
+    """
+
+    router_ids: list[str] = Field(default_factory=list, max_length=1000)
+
+    @field_validator("router_ids")
+    @classmethod
+    def _unique(cls, value: list[str]) -> list[str]:
+        return list(dict.fromkeys(value))
 
 
 class ChangePasswordRequest(BaseModel):
@@ -310,6 +337,29 @@ class ConsoleStartOut(BaseModel):
     ws_path: str
     expires_at: str
     console_port: int
+
+
+class ConsoleInfoOut(BaseModel):
+    """Read-only console state for one router (GET /routers/{id}/console).
+
+    `fingerprint` is the console KEY the panel presents to the router. `host_key_fingerprint`
+    is the mirror image: the router's own SSH host key, pinned on first use and required never
+    to change. They are separate fields on purpose - an operator comparing the wrong one to
+    `ssh-keygen -lf` on the device would "confirm" a key the console never looks at.
+    """
+
+    state: str
+    console_port: int | None = None
+    console_ssh_port: int | None = None
+    ssh_user: str | None = None
+    installed_at: str | None = None
+    fingerprint: str | None = None
+    host_key_fingerprint: str | None = None
+    host_key_pinned_at: str | None = None
+    active_sessions: int = 0
+    idle_timeout_seconds: int = 0
+    max_session_seconds: int = 0
+    max_sessions_per_user: int = 0
 
 
 class ConsoleSessionOut(BaseModel):

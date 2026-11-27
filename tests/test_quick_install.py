@@ -16,6 +16,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 QUICK_SH = REPO / "scripts" / "quick-install.sh"
 BEHIND_PROXY_CONF = REPO / "deploy" / "nginx" / "tunnelgate-behind-proxy.conf"
+GATEWAY_CONF = REPO / "deploy" / "nginx" / "tunnelgate-gateway-behind-proxy.conf"
 TLS_CONF = REPO / "deploy" / "nginx" / "tunnelgate.conf"
 
 
@@ -30,6 +31,32 @@ def _directives(text: str) -> list[str]:
 
 def _ufw_lines() -> list[str]:
     return [line.strip() for line in _directives(_text()) if line.strip().startswith("ufw ")]
+
+
+def _render_routes_include(layout: str, *, routes: str = "/etc/nginx/tunnelgate/routes.conf"):
+    """Run the installer's own include rewriter over the shipped panel vhost.
+
+    The two layouts differ in ONE line of that file, and getting it wrong is invisible:
+    in the separate layout an include left in the panel vhost puts every /<slug>/ back on
+    the panel's origin, which parses, serves, and quietly undoes the security fix. So the
+    test drives the real function out of the script rather than grepping for a comment.
+    """
+    text = _text()
+    start = text.index("render_routes_include() {")
+    end = text.index("\n}\n", start) + len("\n}\n")
+    function = text[start:end]
+    script = f"""
+set -eu
+{function}
+ROUTER_LAYOUT={layout}
+GATEWAY_HOST=gate.example.com
+GATEWAY_VHOST_AVAILABLE=/etc/nginx/sites-available/tunnelgate-gateway.conf
+ROUTES={routes}
+render_routes_include < deploy/nginx/tunnelgate-behind-proxy.conf
+"""
+    return subprocess.run(
+        ["sh", "-c", script], capture_output=True, text=True, check=False, cwd=REPO
+    )
 
 
 def test_quick_install_is_executable_and_parses(tmp_path: Path) -> None:
@@ -396,18 +423,252 @@ def test_quick_install_dry_run_touches_nothing() -> None:
     """A dry run must be safe for an operator to run against a production host."""
     before = sorted(str(p) for p in REPO.rglob("scripts/*") if p.is_file())
     run = subprocess.run(
-        ["sh", str(QUICK_SH), "--host", "gate.example.com", "--dry-run"],
+        [
+            "sh",
+            str(QUICK_SH),
+            "--host",
+            "gate.example.com",
+            # The one-name layout is still supported, but it now has to be asked for: a
+            # dry run that stops on the consent question proves nothing about the steps.
+            "--allow-shared-origin",
+            "--dry-run",
+        ],
         capture_output=True,
         text=True,
         check=False,
         cwd=REPO,
     )
+    assert run.returncode == 0, run.stderr
     # It exits non-zero only when a preflight check fires (a TLS vhost or a busy port);
     # it must never exit successfully having written something.
     assert "[dry-run]" in run.stdout
     assert "DRY RUN" in run.stdout
     after = sorted(str(p) for p in REPO.rglob("scripts/*") if p.is_file())
     assert before == after
+
+
+# ------------------------------------------------- router layout: one name or two
+def test_quick_install_refuses_the_merged_layout_unattended() -> None:
+    """Silence is not consent: no tty and no flag must stop the run.
+
+    This is the regression this whole change exists for. The installer used to write
+    TUNNELGATE_GATEWAY_HOST=<the panel's own host> with a comment and no question, so the
+    documented one-command install produced a deployment in which a hostile router page
+    runs in the panel's origin and can call the panel API as the signed-in operator -
+    proven in a browser. A scripted run has nobody to warn, so it must refuse.
+    """
+    run = subprocess.run(
+        ["sh", str(QUICK_SH), "--host", "gate.example.com", "--dry-run"],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=REPO,
+        stdin=subprocess.DEVNULL,
+    )
+    assert run.returncode == 1
+    assert "refusing to install the shared-origin layout unattended" in run.stderr
+    # It must name both ways out, or the operator has to guess.
+    assert "--gateway-host" in run.stderr
+    assert "--allow-shared-origin" in run.stderr
+    assert "setup-server.sh" in run.stderr
+    # Nothing was installed, so it must not print the success summary.
+    assert "TunnelGate is installed on this host." not in run.stdout
+
+
+def test_quick_install_accepts_the_merged_layout_with_explicit_consent() -> None:
+    """Consent has to be possible, and it has to be loud when given."""
+    run = subprocess.run(
+        [
+            "sh",
+            str(QUICK_SH),
+            "--host",
+            "gate.example.com",
+            "--allow-shared-origin",
+            "--dry-run",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=REPO,
+        stdin=subprocess.DEVNULL,
+    )
+    assert run.returncode == 0, run.stderr
+    # The consequence must be stated, not merely accepted.
+    assert "act as a signed-in operator" in run.stdout
+    assert "LuCI" in run.stdout
+    assert run.stdout.count("--allow-shared-origin") >= 1
+    # And the merged layout really is what the run decided on: the summary names the
+    # panel's own origin for the routers rather than a gateway name of their own.
+    assert "(the panel's OWN origin: merged layout)" in run.stdout
+
+
+def test_quick_install_puts_the_routers_on_their_own_name() -> None:
+    """--gateway-host publishes routers on a second name, on the same plain port."""
+    run = subprocess.run(
+        [
+            "sh",
+            str(QUICK_SH),
+            "--host",
+            "panel.example.com",
+            "--gateway-host",
+            "gate.example.com",
+            "--dry-run",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=REPO,
+        stdin=subprocess.DEVNULL,
+    )
+    assert run.returncode == 0, run.stderr
+    # The two names go into the environment file as different values: that is the whole
+    # mechanism, since app/config.py derives the layout from gateway_host != panel_host.
+    # A dry run writes nothing, so the heredoc itself is asserted on its text below.
+    text = _text()
+    assert "TUNNELGATE_PANEL_HOST=$HOST" in text
+    assert "TUNNELGATE_GATEWAY_HOST=$GATEWAY_HOST" in text
+    assert "TUNNELGATE_GATEWAY_HOST=$HOST" in text
+    # The router URL the summary prints must be the gateway's, not the panel's.
+    assert "https://gate.example.com/<slug>/" in run.stdout
+    assert "https://panel.example.com/<slug>/" not in run.stdout
+    # The operator's edge has to route a second name; the summary has to say so.
+    assert "TWO names on one port" in run.stdout
+    assert "gate.example.com" in run.stdout
+
+
+def test_quick_install_ships_the_gateway_vhost_only_for_the_second_name() -> None:
+    text = _text()
+    gateway = text.index("tunnelgate-gateway-behind-proxy.conf")
+    # Rendered only in the separate layout, and only onto the gateway site file.
+    guard = text.rindex('if [ "$ROUTER_LAYOUT" = separate ]', 0, gateway)
+    assert guard != -1, "the gateway vhost must be gated on the separate layout"
+    assert '"$GATEWAY_VHOST_AVAILABLE"' in text[gateway:]
+    assert '"$GATEWAY_VHOST_ENABLED"' in text[gateway:]
+    # And the template it installs must exist, with the two properties that make the
+    # arrangement work: a plain listener on the SAME port and the include inside the
+    # server block (the rendered file holds locations only).
+    assert GATEWAY_CONF.exists()
+    conf = GATEWAY_CONF.read_text()
+    directives = "\n".join(_directives(conf))
+    assert "listen 80;" in directives
+    assert "default_server" not in directives, "the panel vhost owns the default listener"
+    assert "ssl_certificate" not in directives
+    assert "map $http_upgrade" not in conf, "the panel vhost declares that map; one is allowed"
+    include = conf.index("include /etc/nginx/tunnelgate/routes.conf;")
+    assert conf.index("server {") < include
+    assert "server_name gateway.example.com;" in conf
+
+
+def test_quick_install_removes_the_routes_include_from_the_panel_vhost() -> None:
+    """The fix itself: the router locations must not exist on the panel's origin.
+
+    Commenting the include out rather than deleting it keeps the rendered file readable,
+    and this test runs the installer's own rewriter, so it fails if either layout starts
+    emitting the other layout's line.
+    """
+    merged = _render_routes_include("merged")
+    assert merged.returncode == 0, merged.stderr
+    assert "include /etc/nginx/tunnelgate/routes.conf;" in merged.stdout
+
+    separate = _render_routes_include("separate")
+    assert separate.returncode == 0, separate.stderr
+    directives = "\n".join(_directives(separate.stdout))
+    assert "include /etc/nginx/tunnelgate/routes.conf;" not in directives
+    assert "routes.conf" not in directives
+    # The router prefixes reach the panel's name through no other include either.
+    assert directives.count("include ") == directives.count("include /etc/nginx/")
+    assert "gate.example.com" in separate.stdout, "the comment must say where they went"
+    assert "tunnelgate-gateway.conf" in separate.stdout
+
+
+def test_quick_install_refuses_a_template_without_the_routes_include() -> None:
+    """awk exits 3 on no match; the installer must stop, not ship a half-rendered vhost.
+
+    A sed-based rewriter silently left the line untouched when the template changed; the
+    vhost then included the routers twice, or not at all, and only nginx -t three steps
+    later noticed - after the database had been created.
+    """
+    text = _text()
+    assert "render_routes_include() {" in text
+    assert "exit replaced ? 0 : 3" in text
+    # The refusal has to be a die, and it has to happen before the file is left behind.
+    assert "routes include line this installer rewrites" in text
+    assert "router locations were not resolved" in text
+    # And it is a real refusal: a template without the line must make the rewriter fail.
+    broken = REPO / "deploy" / "nginx" / "tunnelgate-behind-proxy.conf"
+    assert "include /etc/nginx/tunnelgate/routes.conf;" in broken.read_text()
+    newline = chr(10)
+    function = text[text.index("render_routes_include() {") :]
+    function = function[: function.index(newline + "}" + newline) + 2]
+    script = "set -eu" + newline + function + newline
+    script += "ROUTER_LAYOUT=merged" + newline + "ROUTES=/x" + newline
+    result = subprocess.run(
+        ["sh", "-c", script + "printf 'server {}" + newline + "' | render_routes_include"],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=REPO,
+    )
+    assert result.returncode == 3, "a template without the include must not render silently"
+
+
+def test_quick_install_documents_both_layouts_and_the_flags() -> None:
+    help_run = subprocess.run(
+        ["sh", str(QUICK_SH), "--help"], capture_output=True, text=True, check=False, cwd=REPO
+    )
+    assert help_run.returncode == 0
+    assert "--gateway-host" in help_run.stdout
+    assert "--allow-shared-origin" in help_run.stdout
+    assert "no wildcard" in help_run.stdout
+    # The difference between the layouts has to be stated where an operator reads it.
+    assert "separate" in help_run.stdout
+    assert "merged" in help_run.stdout
+    text = _text()
+    assert "--allow-shared-origin" in text
+    assert "Install with routers on the panel" in text
+
+
+def test_quick_install_summary_states_what_the_shared_origin_costs() -> None:
+    """The last thing an operator reads must name the loss, not a doc reference only."""
+    text = _text()
+    summary = text[text.index("TunnelGate is installed on this host.") :]
+    # The consequence is assembled per layout before the heredoc, so it is asserted
+    # there: $SUMMARY_SECURITY is what the operator actually reads.
+    assert "$SUMMARY_SECURITY" in summary
+    assert "$SUMMARY_ROUTERS" in summary
+    assert "a signed-in operator" in text
+    assert "LuCI" in text
+    assert "--gateway-host" in text
+    assert "one DNS record" in text
+    assert "no wildcard" in text
+    # ... and the separate layout's summary has to say what keeps it separate.
+    assert "Do not add routes.conf to the panel vhost" in text
+    assert "do not aim the gateway name at the panel server block" in text
+    # Both layouts have to reach the operator through the same two lines.
+    assert "SECURITY NOTES" + chr(10) + "$SUMMARY_SECURITY" in text
+
+
+def test_quick_install_treats_gateway_equal_to_host_as_merged() -> None:
+    """Same name twice is the merged layout with extra steps; saying so beats pretending."""
+    run = subprocess.run(
+        [
+            "sh",
+            str(QUICK_SH),
+            "--host",
+            "gate.example.com",
+            "--gateway-host",
+            "gate.example.com",
+            "--dry-run",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=REPO,
+        stdin=subprocess.DEVNULL,
+    )
+    assert run.returncode == 1
+    assert "same name as --host" in run.stderr or "same name as --host" in run.stdout
+    assert "refusing to install the shared-origin layout unattended" in run.stderr
 
 
 def test_behind_proxy_conf_is_http_only_and_includes_the_routes_inside_the_server() -> None:
@@ -456,3 +717,57 @@ def test_behind_proxy_conf_and_the_tls_vhost_are_mutually_exclusive() -> None:
     ]
     assert directive_maps == ["map $http_upgrade $connection_upgrade {"]
     assert behind.count("map $http_upgrade $connection_upgrade {") == 1
+
+
+def test_every_environment_setting_is_written_inside_a_heredoc() -> None:
+    """A TUNNELGATE_* line outside a heredoc is a shell assignment, not a setting.
+
+    This is the bug this test was written for: the env writer was split into three pieces
+    (base block, layout branch, shared tail) and the tail lost its heredoc opener. Nothing
+    failed - the script ran, `sh -n` was happy, and the assignments simply vanished - so the
+    panel started with none of those settings and fell back to defaults, including an
+    authorized_keys path sshd never reads. Only an operator noticing "every router says
+    Permission denied (publickey)" would have caught it, which is far too late.
+
+    So: walk the script, track whether we are inside a heredoc, and require that every line
+    assigning TUNNELGATE_<SOMETHING>= while writing the env file sits inside one.
+    """
+    text = _text()
+    opener = 'cat >"$ENV_FILE" <<ENVEOF'
+    start = text.index(opener)
+    assert start > 0
+
+    inside = False
+    offenders: list[str] = []
+    for line in text[start:].splitlines():
+        stripped = line.strip()
+        if stripped.endswith("<<ENVEOF") or stripped.endswith("<<'ENVEOF'"):
+            inside = True
+            continue
+        if stripped == "ENVEOF":
+            inside = False
+            continue
+        if not inside and stripped.startswith("TUNNELGATE_"):
+            offenders.append(stripped)
+    assert not offenders, (
+        "these settings are outside any heredoc, so they become shell assignments and never "
+        f"reach the environment file: {offenders}"
+    )
+
+
+def test_the_environment_file_gets_both_layouts_and_the_shared_tail() -> None:
+    """The three heredocs must cover the layout branch AND the settings that follow it."""
+    text = _text()
+    for key in (
+        "TUNNELGATE_PANEL_HOST=$HOST",
+        "TUNNELGATE_PROXY_PLAIN_HTTP=true",
+        "TUNNELGATE_GATEWAY_HOST=$HOST",
+        "TUNNELGATE_GATEWAY_HOST=$GATEWAY_HOST",
+        "TUNNELGATE_TRUSTED_PROXIES=",
+        "TUNNELGATE_FORWARDED_ALLOW_HOPS=$PROXY_HOPS",
+        "TUNNELGATE_DB_URL=",
+        "TUNNELGATE_AUTHORIZED_KEYS_PATH=",
+        "TUNNELGATE_SECRET_KEY=$SECRET",
+        "TUNNELGATE_ADMIN_PASSWORD=$ADMIN_PW",
+    ):
+        assert key in text, f"the env writer must still emit {key}"

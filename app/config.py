@@ -82,6 +82,25 @@ class Settings(BaseSettings):
     cookie_secure: bool = False
     session_ttl_minutes: int = 720
     csrf_header: str = "X-CSRF-Token"
+    # The double-submit half of the CSRF check: the session's token is written to this cookie
+    # beside the session cookie, and every mutating request must echo it in csrf_header.
+    #
+    # The token used to travel only in the JSON body of POST /api/auth/login and GET
+    # /api/auth/me. That is safe exactly as long as /api/ is a different origin from anything
+    # that can run script, which stops being true in the MERGED path layout
+    # (TUNNELGATE_GATEWAY_HOST == TUNNELGATE_PANEL_HOST): a compromised router page is then
+    # same-origin with the panel, calls /api/auth/me with the operator's cookie, reads the
+    # token out of the response and performs any authenticated mutation - adding an admin
+    # account, for instance. Measured in a real browser, not theorised. Moving the token to a
+    # cookie that the panel never serves in a body removes that fetch-and-read step: the
+    # reader now has to read a cookie, which requires script execution in the origin rather
+    # than merely a page served from it.
+    #
+    # This cookie is deliberately NOT HttpOnly, because the SPA has to read it to build the
+    # header. The session cookie stays HttpOnly: the token is useless on its own, the session
+    # is not. Setting samesite/secure/domain/path to the session's values keeps the two in
+    # step, and an operator who narrows the session cookie narrows this one with it.
+    csrf_cookie_name: str = "tg_csrf"
     # ------------------------------------------------------------------ router launch
     # The "Public route" link and every "Open LuCI" action open
     # https://<slug>.<host_suffix>, a host the browser holds no panel cookie for. A one-time
@@ -163,6 +182,26 @@ class Settings(BaseSettings):
     # gate.<host_suffix>; the panel keeps its own host, so a router credential is still
     # scoped to this host and never travels to the panel origin.
     gateway_host: str | None = None
+    # Whether the nginx this panel renders into serves PLAIN HTTP to a reverse proxy in
+    # front of it, instead of terminating TLS itself.
+    #
+    # This describes the hop nginx serves, NOT the scheme a browser sees, which is why
+    # public_scheme() cannot answer it: on the deployment this exists for the operator's own
+    # proxy serves https to browsers (so TUNNELGATE_PUBLIC_URL is https, and public_scheme()
+    # correctly says "https") while nginx answers on a loopback-ish plain port behind it.
+    # scripts/quick-install.sh writes TUNNELGATE_PROXY_PLAIN_HTTP=true for exactly that shape.
+    #
+    # It decides one thing in render_nginx_path(): a SEPARATE-layout gateway (gateway host
+    # != panel host) rendered for plain HTTP cannot live in the generated file at all. The
+    # generated file is rewritten by the panel on every router change, so it cannot carry the
+    # operator's listen port; and a server{} block for the gateway inside it would be the
+    # first block for that name and would shadow the routes the installer's vhost includes -
+    # the panel then 404s while nginx -t stays green. In this mode the renderer therefore
+    # emits LOCATIONS ONLY, exactly as the merged layout does, and the operator's gateway
+    # vhost (deploy/nginx/tunnelgate-gateway-behind-proxy.conf) includes them inside its own
+    # server block for the gateway name. Left false, every rendering is byte-identical to
+    # what it was before this field existed.
+    proxy_plain_http: bool = False
 
     # ------------------------------------------------------------------ console (web terminal)
     console_enabled: bool = True

@@ -62,7 +62,7 @@ read the output.
 | Scripts, monitoring, ticket attachments | `doctor --json`, `check-schema --json`, `console-url --json` |
 
 ```bash
-python -m app.cli --version      # tunnelgate 1.1.2  (argparse "version" action, exit 0)
+python -m app.cli --version      # tunnelgate 1.3.0  (argparse "version" action, exit 0)
 python -m app.cli                # prints help, exit 2
 ```
 
@@ -87,7 +87,7 @@ On SQLite it prints the resolved database path, and lists the tables it can see:
 ```console
 $ .venv/bin/python -m app.cli init-db
 database ready: data/tunnelgate.db
-tables: audit_logs, bootstrap_tokens, console_sessions, panel_sessions, panel_settings, router_runtime, routers, users
+tables: audit_logs, bootstrap_tokens, console_sessions, panel_sessions, panel_settings, router_grants, router_runtime, routers, users
 ```
 
 **Exit codes:** `0` always (a failure raises and prints a traceback; there is no partial
@@ -168,7 +168,7 @@ exit code, or on `"ok": false` in the JSON.
 
 ```console
 $ .venv/bin/python -m app.cli doctor
-OK   python: 3.13.5 / tunnelgate 1.1.2
+OK   python: 3.13.5 / tunnelgate 1.3.0
 WARN secret key: not set (dev mode)
       -> fine for development; production refuses to start without it
 OK   cookie flags: secure=False
@@ -189,10 +189,10 @@ The machine-readable shape is `Report.render(as_json=True)`:
 
 ```json
 {
-  "version": "1.1.2",
+  "version": "1.3.0",
   "ok": false,
   "checks": [
-    {"name": "python", "status": "ok", "detail": "3.13.5 / tunnelgate 1.1.2", "fix": ""},
+    {"name": "python", "status": "ok", "detail": "3.13.5 / tunnelgate 1.3.0", "fix": ""},
     {"name": "secret key", "status": "warn", "detail": "not set (dev mode)",
      "fix": "fine for development; production refuses to start without it"}
   ]
@@ -211,7 +211,7 @@ often not the function name.
 
 #### `_check_runtime` - "python", "secret key", "cookie flags"
 
-- `_check_version` emits `OK python: 3.13.5 / tunnelgate 1.1.2` - the interpreter triplet
+- `_check_version` emits `OK python: 3.13.5 / tunnelgate 1.3.0` - the interpreter triplet
   plus `app.__version__`. It never fails; a wrong Python fails at import instead.
 - **secret key**: `TUNNELGATE_SECRET_KEY` set is `OK`. Unset in `TUNNELGATE_ENV=production`
   is a **failure** (the app refuses to start and stored console keys cannot be decrypted);
@@ -345,7 +345,10 @@ Two subtleties, both encoded in the code:
   telling you to re-run as root. Blaming the include there would send you to move a correct
   include.
 - With `settings.gateway_merged` (routers published under the panel's own name) the fix text
-  says "include it INSIDE the panel server block"; otherwise it points at the `http` context.
+  says "include it INSIDE the panel server block"; on a plain-HTTP hop it says to include it in
+  the gateway vhost and to remove it from the panel vhost (leaving it there puts every
+  `/<slug>/` back on the panel's origin and silently undoes the separation); otherwise it
+  points at the `http` context.
 
 This check only runs in path mode with nginx present, and returns silently if `routes.conf`
 does not exist yet - `_check_launch` reports a missing render.
@@ -368,7 +371,11 @@ identical from the UI: an endless bounce through `/login`.
   exists at all.
 - **gateway host**: in merged layout (gateway == panel host) this is a warning - routers then
   share the panel's origin, so a hostile router page runs in the panel's origin. It works, it
-  costs origin isolation, and [docs/SECURITY.md](SECURITY.md) explains the trade.
+  costs origin isolation, and [docs/SECURITY.md](SECURITY.md) explains the trade. A gateway on
+  its own name over a plain-HTTP hop (`TUNNELGATE_PROXY_PLAIN_HTTP=true`, what
+  `scripts/quick-install.sh --gateway-host` installs) is **OK**: the renderer emits locations
+  only, so the one thing to get right there is the include, which is the "routes include"
+  check's job.
 - **cookie scope**: `TUNNELGATE_COOKIE_DOMAIN` set is a warning; per-router cookies supersede
   the domain-wide session cookie.
 - **public origin**: `TUNNELGATE_PANEL_URL` loopback **and** `TUNNELGATE_PUBLIC_URL` unset is a
@@ -435,7 +442,7 @@ Three findings, three different answers:
 
 | Finding | Reported as | Exit |
 |---|---|---|
-| Nothing missing | `schema up to date (8 tables)` | 0 |
+| Nothing missing | `schema up to date (9 tables)` | 0 |
 | Extra columns (in DB, not models) | a note; "harmless, but usually means a rollback or a hand edit" | 0 |
 | Missing columns | `ALTER TABLE` statements to apply | 1 |
 | Missing tables | **not fixable with ALTER TABLE** - restore a backup or start fresh | 1 |

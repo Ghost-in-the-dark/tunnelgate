@@ -3,8 +3,17 @@
  *
  * Rules this file enforces so no screen has to think about them:
  *  - `credentials: 'include'` on every request (the session cookie is HttpOnly).
- *  - the CSRF token lives in memory only. It is never written to localStorage or a
- *    cookie: an XSS payload that can read localStorage would defeat the point.
+ *  - the CSRF token comes from the `tg_csrf` cookie, which the server sets beside the
+ *    session cookie at login and deletes at logout. It is read here, per request, and
+ *    only echoed back in the X-CSRF-Token header; nothing caches it in memory, in
+ *    localStorage or anywhere else, so a token that rotates on the next login cannot be
+ *    left behind by a tab that stayed open.
+ *    It used to arrive in the JSON body of login and GET /api/auth/me. That was the bug:
+ *    in the merged path layout a router page is same-origin with the panel, so a
+ *    compromised router page could fetch /api/auth/me with the operator's cookie, read
+ *    the token out of the response and mutate anything the operator could - a router page
+ *    really did create a second admin account. A cookie is not fetchable as a body, so
+ *    that step is gone; see docs/SECURITY.md for what it does and does not buy.
  *  - the API error envelope {`{"error":{code,message,details}}`} becomes a typed ApiError.
  *  - a 401 anywhere flips the auth store to "logged out", which unmounts the shell.
  */
@@ -29,6 +38,7 @@ import type {
   Stats,
   UpdateUserInput,
   User,
+  UserRouterGrantList,
 } from './types'
 
 export class ApiError extends Error {
@@ -62,16 +72,44 @@ export class ApiError extends Error {
 export const DEFAULT_RETRY_AFTER = 30
 
 const CSRF_HEADER = 'X-CSRF-Token'
+// The cookie the server writes in the same response as the session cookie. Its value is the
+// session's CSRF token; the server never puts that token in a response body, which is the
+// whole point of the change. Read fresh on every mutating request, never cached: the browser
+// is the storage, and the browser drops this cookie on logout.
+//
+// The name is the server default (TUNNELGATE_CSRF_COOKIE_NAME). It is a literal here because a
+// static bundle cannot read the server's settings, and GET /api/v1/config is authenticated, so
+// it is not available on the login screen where the first mutation happens. A deployment that
+// renames the setting must rebuild this bundle with the new name - renaming it on the server
+// alone leaves the panel able to log in but unable to mutate anything.
+const CSRF_COOKIE = 'tg_csrf'
+
+function readCsrfCookie(): string | null {
+  // document.cookie is a string of `name=value; name=value`. The value is url-encoded on the
+  // way in (the server uses set_cookie, which encodes it), so decode it before sending it
+  // back in the header: the server compares the header against the raw session token.
+  for (const part of document.cookie.split(';')) {
+    const eq = part.indexOf('=')
+    if (eq === -1) continue
+    if (part.slice(0, eq).trim() !== CSRF_COOKIE) continue
+    try {
+      return decodeURIComponent(part.slice(eq + 1).trim())
+    } catch {
+      // A malformed cookie is not a token; let the request go out bare and take the 403.
+      return null
+    }
+  }
+  return null
+}
 
 // ------------------------------------------------------------------ auth store
 interface AuthState {
   user: User | null
-  csrfToken: string | null
   /** 'unknown' until GET /api/auth/me answers; the router shows a splash meanwhile. */
   bootState: 'unknown' | 'authenticated' | 'anonymous'
 }
 
-let authState: AuthState = { user: null, csrfToken: null, bootState: 'unknown' }
+let authState: AuthState = { user: null, bootState: 'unknown' }
 const authListeners = new Set<(s: AuthState) => void>()
 
 function emitAuth(next: AuthState) {
@@ -92,11 +130,10 @@ export function subscribeAuth(fn: (s: AuthState) => void): () => void {
 
 /** Called by the login screen after POST /api/auth/login succeeds. */
 export function setSession(session: Session) {
-  emitAuth({
-    user: session.user,
-    csrfToken: session.csrf_token,
-    bootState: 'authenticated',
-  })
+  // The CSRF token is not in the answer any more: the login response set it as a cookie.
+  // Nothing to store here, which is the point - a token this module does not hold cannot be
+  // handed to a same-origin reader by a bug in this module.
+  emitAuth({ user: session.user, bootState: 'authenticated' })
 }
 
 export function setUser(user: User) {
@@ -104,7 +141,7 @@ export function setUser(user: User) {
 }
 
 export function clearSession() {
-  emitAuth({ user: null, csrfToken: null, bootState: 'anonymous' })
+  emitAuth({ user: null, bootState: 'anonymous' })
 }
 
 // ------------------------------------------------------------------ transport
@@ -160,7 +197,13 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   if (body !== undefined) headers['Content-Type'] = 'application/json'
   // Mutating verbs need the CSRF header; GETs do not and sending it is harmless,
   // but we keep it off GET so a stale token cannot turn a harmless read into a 403.
-  if (method !== 'GET' && authState.csrfToken) headers[CSRF_HEADER] = authState.csrfToken
+  // The value comes from the cookie the server set beside the session cookie; the server also
+  // requires that same cookie to be present, so this header alone proves nothing and is not
+  // trusted on its own.
+  if (method !== 'GET') {
+    const csrf = readCsrfCookie()
+    if (csrf) headers[CSRF_HEADER] = csrf
+  }
 
   let res: Response
   try {
@@ -261,6 +304,24 @@ export const api = {
     request<User>(`/api/v1/users/${id}`, { method: 'PATCH', body: patch }),
 
   deleteUser: (id: number) => request<void>(`/api/v1/users/${id}`, { method: 'DELETE' }),
+
+  // Per-router grants. Only a viewer is narrowed per router: admin and operator reach every
+  // router by role (app/services/access.py), so these endpoints are only meaningful for a
+  // viewer and the UI only offers them on a viewer row.
+  listUserRouters: (userId: number, signal?: AbortSignal) =>
+    request<UserRouterGrantList>(`/api/v1/users/${userId}/routers`, { signal }),
+
+  /**
+   * Replaces the whole grant set. The body is the complete list the caller wants, not a diff,
+   * which is why the screen sends every checked id in one PUT: re-sending the same body is a
+   * no-op, and a caller never has to compute additions against a snapshot it may have lost
+   * track of. `request()` adds the CSRF header for a mutating verb.
+   */
+  setUserRouters: (userId: number, routerIds: string[]) =>
+    request<UserRouterGrantList>(`/api/v1/users/${userId}/routers`, {
+      method: 'PUT',
+      body: { router_ids: routerIds },
+    }),
 
   // meta -------------------------------------------------------------
   config: (signal?: AbortSignal) => request<PanelConfig>('/api/v1/config', { signal }),

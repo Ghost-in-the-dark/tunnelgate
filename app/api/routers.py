@@ -36,6 +36,8 @@ from ..models import (
     STATUS_REVOKED,
     BootstrapToken,
     Router,
+    RouterGrant,
+    User,
 )
 from ..schemas import (
     RotateKeyOut,
@@ -51,6 +53,7 @@ from ..services import bootstrap as bootstrap_service
 from ..services import console as console_service
 from ..services import keys as keys_service
 from ..services import ports as ports_service
+from ..services.access import accessible_router_ids, require_router_access
 from ..services.audit import record as audit_record
 from ..services.launch import launch_url
 from . import bootstrap as bootstrap_api
@@ -99,7 +102,18 @@ def _unique_slug(db, base: str) -> str:
     return candidate
 
 
-def _get_router(db, router_id: str) -> Router:
+def _get_router(db, router_id: str, user: User | None = None) -> Router:
+    """Load one router, refusing a caller who was not granted it.
+
+    The access check runs BEFORE the row is loaded, and that order is the whole point. If the
+    row were fetched first, a viewer could tell "this router exists but I was not granted it"
+    (403 from the grant check) from "no such router" (404 from this function) - a router-id
+    oracle. Checking the grant first makes both cases answer 403 for a viewer, while an
+    admin/operator - who always pass the check - still gets an honest 404 for a router that is
+    genuinely gone. app/services/access.py::require_router_access carries the rest of the why.
+    """
+    if user is not None:
+        require_router_access(db, user, router_id)
     item = db.get(Router, router_id)
     if item is None:
         raise ApiError(404, "not_found", "Router not found")
@@ -236,6 +250,14 @@ async def create_router(
     )
     db.add(item)
     db.flush()
+    # A viewer who is allowed to create a router must keep seeing what they made. Without this
+    # row the router would appear in the create response and then vanish from the very next list
+    # poll - the wizard would report success and the router would be unreachable from the panel
+    # forever, because no admin would know a grant was needed. Admin and operator need no row:
+    # they reach every router by role (app/services/access.py).
+    if user.role == "viewer":
+        db.add(RouterGrant(user_id=user.id, router_id=item.id, created_by_id=user.id))
+        db.flush()
     plaintext, token_row = _issue_token(db, item, bootstrap_service.PURPOSE_INSTALL, user, settings)
     audit_record(
         db,
@@ -263,6 +285,14 @@ async def list_routers(
 ) -> RouterListOut:
     """Filterable list. The counters describe the filtered set, not the whole table."""
     filters: list[ColumnElement[bool]] = []
+    # A viewer only lists the routers granted to them. The predicate goes into the same filter
+    # list as the query filters, so the counters below (total/online/offline/pending) describe
+    # exactly the visible set - the docstring's promise - instead of counting every router in
+    # the panel and describing a set the caller cannot see. None means "every router" (admin and
+    # operator) and must not be turned into an empty IN clause, which would list nothing.
+    granted = accessible_router_ids(db, user)
+    if granted is not None:
+        filters.append(Router.id.in_(granted))
     if status:
         if status not in (
             STATUS_PENDING,
@@ -342,7 +372,7 @@ async def get_router(
     user: CurrentUser,
     settings: SettingsDep,
 ) -> RouterOut:
-    item = _get_router(db, router_id)
+    item = _get_router(db, router_id, user)
     return router_out(item, token=_usable_token(db, item.id), settings=settings)
 
 
@@ -357,7 +387,7 @@ async def update_router(
     settings: SettingsDep,
 ) -> RouterOut:
     """Only mutable display fields. The slug never changes: it is baked into DNS and routers."""
-    item = _get_router(db, router_id)
+    item = _get_router(db, router_id, user)
     changed = payload.model_dump(exclude_unset=True)
     if changed.get("name"):
         item.name = changed["name"].strip()
@@ -401,7 +431,7 @@ async def delete_router(
     session row and no way to reach it from the UI. Deleting the router is an operator action, so
     the shells of other users die with it.
     """
-    item = _get_router(db, router_id)
+    item = _get_router(db, router_id, user)
     ports = [p for p in (item.remote_port, item.console_port) if p]
     killed = console_service.SESSIONS.close_all(
         item.id, console_service.CLOSE_REASON_ROUTER_DELETED
@@ -440,7 +470,7 @@ async def rotate_key(
     Ports are retained on purpose, so a reinstall lands on the same vhost and the same listener
     instead of breaking firewall rules and DNS that already point there.
     """
-    item = _get_router(db, router_id)
+    item = _get_router(db, router_id, user)
     keys_service.revoke_router_key(db, item)
     item.status = STATUS_PENDING
     db.flush()
@@ -477,7 +507,7 @@ async def router_script(
     `?reissue=true` is the admin-only escape hatch: on an installed router it is rotate-key,
     which is exactly why it is not the default and why the role requirement is stricter.
     """
-    item = _get_router(db, router_id)
+    item = _get_router(db, router_id, user)
     if item.has_key and not reissue:
         raise ApiError(
             409,
@@ -512,7 +542,7 @@ async def router_script(
 @router.get("/{router_id}/status", response_model=StatusOut)
 async def router_status(router_id: str, db: DbSession, user: CurrentUser) -> StatusOut:
     """Cheap derived status for the wizard poll. Reads two rows, writes nothing."""
-    item = _get_router(db, router_id)
+    item = _get_router(db, router_id, user)
     runtime = item.runtime
     phase, message = derive_phase(item)
     return StatusOut(

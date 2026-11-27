@@ -33,8 +33,8 @@ directory, installs the panel and removes that directory afterwards. Using the t
 `main` pins a version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Ghost-in-the-dark/tunnelgate/v1.1.2/scripts/quick-install.sh \
-  | sudo sh -s -- --host gate.example.com --ref v1.1.2
+curl -fsSL https://raw.githubusercontent.com/Ghost-in-the-dark/tunnelgate/v1.3.0/scripts/quick-install.sh \
+  | sudo sh -s -- --host gate.example.com --ref v1.3.0
 ```
 
 Piping a shell script to `sh` is only reasonable when you can read it first, so the script
@@ -42,11 +42,19 @@ carries its own documentation and every step it takes is printed as it runs. Rea
 `curl -fsSL <url> | less` before you run it, or run it from a checkout if you prefer (see below)
 - both paths install the same thing.
 
-It installs `deploy/nginx/tunnelgate-behind-proxy.conf`: plain HTTP on one port, **path routing
-in the merged layout**, so every router is `<your-public-url>/<slug>/` on the panel's own name.
-That is what makes a single ordinary name - including a free dynamic-DNS one - enough: no
-wildcard DNS, no wildcard certificate, no per-router DNS step. It stops after nginx answers on
-that port and prints the forwarding snippet your proxy has to replicate.
+It installs `deploy/nginx/tunnelgate-behind-proxy.conf`: plain HTTP on one port, **path
+routing**, so every router is `<gateway>/<slug>/`. Where that gateway lives is the one security
+decision the script makes you take:
+
+| route names | what it installs | what it costs |
+|---|---|---|
+| `--gateway-host gate.example.com` (recommended) | a second vhost, `deploy/nginx/tunnelgate-gateway-behind-proxy.conf`, on the **same** plain port; the panel vhost stops including `routes.conf` | one DNS record plus one extra name on the certificate you already have - **not** a wildcard |
+| `--allow-shared-origin` | routers on the panel's own name, `<your-public-url>/<slug>/` | the routers share the panel's origin: a hostile router page can call the panel API as the signed-in operator and read the other routers' LuCI |
+
+Asked on a terminal, with the merged layout as the default answer being **no**; with no terminal
+the script refuses to pick it, so a scripted install has to name one of the two flags. Either way
+it stops after nginx answers on that port and prints the forwarding snippet your proxy has to
+replicate - certificates, DNS and the proxy stay yours.
 
 Before it touches anything it asks **which account the panel service should run as**. Press
 Enter for the recommended answer, a dedicated `tunnelgate` system account. (It also asks the
@@ -80,25 +88,33 @@ sudo ./scripts/quick-install.sh --host gate.example.com
 ```
 
 Nothing is asked when the output is not a terminal (`| tee install.log`, a cloud-init run):
-the hostname then has to come from `--host` and the account defaults to `user`.
-`--non-interactive` says that out loud, so a run that would have prompted fails instead of
-picking silently.
+the hostname then has to come from `--host`, the account defaults to `user`, and the router
+layout has to be named - `--gateway-host` or `--allow-shared-origin`. `--non-interactive` says
+that out loud, so a run that would have prompted fails instead of picking silently.
 
 ```bash
 ... | sudo sh -s -- --host 192.168.1.10 --public-scheme http   # IP / LAN
 ... | sudo sh -s -- --host gate.example.com --proxy-hops 2     # proxy in front of a proxy
 ... | sudo sh -s -- --host gate.example.com --run-as root      # panel as root, not recommended
 ... | sudo sh -s -- --host gate.example.com --dry-run          # print, change nothing
+
+# recommended: routers on their own name (one DNS record, one extra certificate name)
+... | sudo sh -s -- --host panel.example.com --gateway-host gate.example.com
+
+# one public name only: accept the shared origin explicitly
+... | sudo sh -s -- --host gate.example.com --allow-shared-origin
 ```
 
 `--proxy-hops` is how many proxies append `X-Forwarded-For`; set it and
 `TUNNELGATE_TRUSTED_PROXIES` to the addresses the panel actually sees (see
 [Behind a reverse proxy](#behind-a-reverse-proxy-or-load-balancer)).
 
-The merged layout costs origin isolation - a router page shares the panel's origin and can use
-the operator's session. That is a documented, deliberate trade, not a side effect: read
-[docs/SECURITY.md §6.1](SECURITY.md) before adding routers you do not physically control. If
-you can spare a second name, prefer the separate layout and the manual walkthrough below.
+The merged layout costs origin isolation - a router page shares the panel's origin, can use the
+operator's session and can read the other routers' LuCI. That is a documented, deliberate trade,
+not a side effect: read [docs/SECURITY.md §6.1](SECURITY.md) before adding routers you do not
+physically control, and prefer `--gateway-host` whenever a second name is available - the
+[manual walkthrough](#option-c---no-wildcard-at-all-path-routing) reaches the same two-name
+shape by hand.
 
 What the script deliberately does **not** do: certificates, DNS, ACME, your edge proxy's config,
 or opening the router ports. Section by section it mirrors steps 1-9 below, and `--help` lists
@@ -1071,7 +1087,7 @@ One command, on the panel host:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Ghost-in-the-dark/tunnelgate/main/scripts/update.sh \
-  | sudo sh -s -- --ref v1.1.2
+  | sudo sh -s -- --ref v1.3.0
 ```
 
 Drop `--ref` to take the latest GitHub release. `--check-only` prints the installed and the
@@ -1108,7 +1124,7 @@ stale (it is reconciled on startup).
 
 ```bash
 cd /opt/tunnelgate
-git fetch --tags && git checkout v1.1.2
+git fetch --tags && git checkout v1.3.0
 .venv/bin/pip install -r requirements.txt
 (cd web && npm ci && npm run build)   # required: web/dist is not in the repo
 .venv/bin/python -m app.cli check-schema
@@ -1171,10 +1187,10 @@ online reconnect within one retry interval.
 
 ## Appendix - environment variables
 
-`app/config.py` defines 61 settings; every one is settable as
+`app/config.py` defines 63 settings; every one is settable as
 `TUNNELGATE_<UPPER_SNAKE_NAME>` (plus `TUNNELGATE_ENV_FILE`, which points pydantic at a
 different env file). `docs/CONFIGURATION.md` is the full reference: every setting, its default,
-and the failure it prevents. `deploy/env/tunnelgate.env.example` lists the same 61 keys - the
+and the failure it prevents. `deploy/env/tunnelgate.env.example` lists the same 63 keys - the
 ones a normal install sets are active, the rest are commented at their defaults.
 
 Two things are worth knowing before you touch any of them:
@@ -1206,6 +1222,7 @@ The values you are most likely to touch:
 | `TUNNELGATE_COOKIE_DOMAIN` | unset (host-only) | **Leave unset.** Operator opt-in only; a domain cookie is sent to every router host - see §5 "Do not widen the session cookie" |
 | `TUNNELGATE_SESSION_TTL_MINUTES` | `720` | Panel session lifetime |
 | `TUNNELGATE_CSRF_HEADER` | `X-CSRF-Token` | Header the SPA echoes the CSRF token in (`app/deps.py:csrf_protect`) |
+| `TUNNELGATE_CSRF_COOKIE_NAME` | `tg_csrf` | Cookie carrying the same token, written by login beside the session cookie and deleted by logout. Not `HttpOnly` by design; the header and the cookie must agree, so renaming it breaks mutations for sessions that already exist |
 | `TUNNELGATE_DB_URL` | `sqlite:///./data/tunnelgate.db` | SQLAlchemy URL |
 | `TUNNELGATE_DATA_DIR` | `./data` | Parent of the sqlite file and of `authorized_keys` when those use relative defaults |
 | `TUNNELGATE_SSH_HOST` | `127.0.0.1` | Where sshd listens; changes only when sshd is not on this host |
@@ -1228,6 +1245,7 @@ The values you are most likely to touch:
 | `TUNNELGATE_PROXY_DRIVER` | `nginx` | `nginx` | `caddy` | `none` |
 | `TUNNELGATE_PROXY_ROUTES_PATH` | `./data/tunnelgate.routes.conf` | Generated vhost include |
 | `TUNNELGATE_PROXY_RELOAD_COMMAND` | `nginx -s reload` in code, **empty** in every shipped install shape | Shell command after a route change. Leave empty under systemd - see the note above |
+| `TUNNELGATE_PROXY_PLAIN_HTTP` | `false` | `true` when this nginx serves plain HTTP to your TLS-terminating proxy (what `scripts/quick-install.sh` writes). It gates one rendering decision: a path-mode gateway on its own name then gets its `server` block in the installer's vhost, with `routes.conf` included inside it as locations only |
 | `TUNNELGATE_CADDY_ADMIN_URL` | `http://127.0.0.1:2019` | Caddy admin API, `PROXY_DRIVER=caddy` only |
 | `TUNNELGATE_CADDY_SERVER` | `srv0` | Caddy server name to inject routes into |
 | `TUNNELGATE_TRUST_PROXY_HEADERS` | `true` | Whether forwarded headers are considered at all. See §7 |

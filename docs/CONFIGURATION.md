@@ -14,7 +14,7 @@ wrong - see [Trap 1](#trap-1-x-forwarded-proto-is-used-by-the-panel-not-just-uvi
 
 ## How settings are loaded
 
-`app/config.py` defines one `pydantic_settings.BaseSettings` subclass, `Settings`, with 61
+`app/config.py` defines one `pydantic_settings.BaseSettings` subclass, `Settings`, with 63
 fields (the count is checked by the tests). Its `model_config` says how they are read:
 
 | Config | Value | Consequence |
@@ -139,6 +139,7 @@ at fleet size the journal becomes unreadable.
 | `TUNNELGATE_COOKIE_SECURE` | `false` | Force the `Secure` flag. The cookie is already marked `Secure` whenever the request arrives over HTTPS from a trusted proxy, so a normal TLS deployment needs nothing here. Read [Trap 4](#trap-4-cookie_secure_forcing-it-on-breaks-plain-http-deployments). |
 | `TUNNELGATE_SESSION_TTL_MINUTES` | `720` | Panel session lifetime: both the cookie `max-age` and the stored session expiry. |
 | `TUNNELGATE_CSRF_HEADER` | `X-CSRF-Token` | Header every state-changing API call must carry. |
+| `TUNNELGATE_CSRF_COOKIE_NAME` | `tg_csrf` | Name of the CSRF cookie that `POST /api/auth/login` writes beside the session cookie. Its value is the session's CSRF token, and a mutating request must echo it in `TUNNELGATE_CSRF_HEADER` *and* send the cookie back; `app/deps.py:csrf_protect` requires the header, the cookie and the session row to agree. Deliberately **not** `HttpOnly` - the SPA reads it with `document.cookie` because the token is no longer in any JSON body. The SPA reads a hardcoded `tg_csrf` (a static bundle cannot see server settings), so a deployment that renames this must rebuild `web/` with the new name - renaming it on the server alone leaves the panel able to sign in but unable to mutate anything. |
 | `TUNNELGATE_ADMIN_USERNAME` | `admin` | Username of the account seeded on first start. |
 | `TUNNELGATE_ADMIN_PASSWORD` | unset | Password for that first admin. Read only when the users table is empty. Generate it, do not invent it: `openssl rand -base64 24`. With no users and no password the panel starts with **no login at all** and logs a warning. |
 | `TUNNELGATE_LOGIN_RATE_LIMIT` | `10` | Failed logins allowed per window, per client address. |
@@ -162,6 +163,7 @@ These are the settings that decide where a router's LuCI answers. `ROUTE_MODE` p
 | `TUNNELGATE_PROXY_DRIVER` | `nginx` | `nginx`, `caddy` or `none`. `none` renders no router vhosts at all (dev only). Path mode requires `nginx`: it needs HTML rewriting and per-prefix cookie scoping, which the caddy driver does not do. |
 | `TUNNELGATE_PROXY_ROUTES_PATH` | `./data/tunnelgate.routes.conf` | The generated include the proxy reads. Its sibling `*.auth.conf` carries the shared `auth_request` snippet. |
 | `TUNNELGATE_PROXY_RELOAD_COMMAND` | `nginx -s reload` | Shell command run after a route change. **Leave empty under systemd and compose**: the unit sets `NoNewPrivileges=yes`, so the panel cannot signal root's nginx; the `tunnelgate-nginx-reload.path` unit does it instead. |
+| `TUNNELGATE_PROXY_PLAIN_HTTP` | `false` | `true` when this nginx serves **plain HTTP to a proxy that terminates TLS**, i.e. the shape `scripts/quick-install.sh` installs. It describes the hop nginx serves, not the scheme a browser uses: `PUBLIC_URL` stays `https`, which is why `public_scheme()` cannot answer this question. It changes one thing: in path mode with the gateway on its own name, the gateway's `server` block lives in the installer's vhost and `routes.conf` holds locations only. Left `false` - every other install shape - the rendering is unchanged. |
 | `TUNNELGATE_CADDY_ADMIN_URL` | `http://127.0.0.1:2019` | Caddy admin API, used only when the driver is `caddy`. Must be loopback - doctor fails a remote admin API. |
 | `TUNNELGATE_CADDY_SERVER` | `srv0` | The Caddy server name routes are pushed into. |
 

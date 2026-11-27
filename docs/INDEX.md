@@ -19,7 +19,7 @@ answers; if you already know your symptom, jump to [Task to document](#task-to-d
 1. [docs/INSTALL_SERVER.md](INSTALL_SERVER.md) - decide the DNS/TLS layout, then bring up the VPS:
    base system, firewall, tunnel account, sshd, panel, database, systemd, nginx.
 2. [docs/CONFIGURATION.md](CONFIGURATION.md) - every `TUNNELGATE_` setting (`app/config.py`
-   defines 61) with its default, what it changes and how it fails when it is wrong.
+   defines 63) with its default, what it changes and how it fails when it is wrong.
 3. [docs/INSTALL_ROUTER.md](INSTALL_ROUTER.md) - create a router in the panel, run the one-line
    install command, verify the tunnel and the console.
 4. [docs/OPERATIONS.md](OPERATIONS.md) - health and status, routine tasks, the common-failure

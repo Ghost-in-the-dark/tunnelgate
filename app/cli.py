@@ -944,11 +944,15 @@ def _check_proxy(settings: Settings, report: Report) -> None:
 def _check_routes_include(settings: Settings, report: Report, nginx: str) -> None:
     """Is routes.conf included where the layout requires, and does nginx accept the result?
 
-    Path mode has two layouts and they differ in nothing more consequential than this
-    include. Separate: routes.conf declares its own server{} block, so it belongs in the
-    *http* context. Merged: it declares locations only, so it belongs INSIDE the panel server
-    block - in the http context nginx rejects the bare "location" directives with
-    "location directive is not allowed here" and the router paths never appear.
+    Path mode has three layouts and they differ in nothing more consequential than this
+    include. Separate with TLS: routes.conf declares its own server{} block, so it belongs in
+    the *http* context. Merged: it declares locations only, so it belongs INSIDE the panel
+    server block - in the http context nginx rejects the bare "location" directives with
+    "location directive is not allowed here" and the router paths never appear. Separate on a
+    plain-HTTP hop (TUNNELGATE_PROXY_PLAIN_HTTP=true, what scripts/quick-install.sh
+    --gateway-host installs): also locations only, but inside the GATEWAY vhost's server
+    block - and specifically NOT in the panel vhost, which is the one mistake in that layout
+    that keeps working while it undoes the origin separation.
 
     Rather than guess from the file alone, this asks nginx itself: the rendered config either
     parses (and the operator is fine) or it does not, and nginx names the file and line that
@@ -956,6 +960,8 @@ def _check_routes_include(settings: Settings, report: Report, nginx: str) -> Non
     server block is equally illegal - and it needs no knowledge of where the operator keeps
     their vhosts.
     """
+    from .services.proxy import _plain_http_hop
+
     routes_path = Path(settings.proxy_routes_path)
     if not _exists(routes_path):
         return  # _check_launch already reports a missing render
@@ -981,6 +987,15 @@ def _check_routes_include(settings: Settings, report: Report, nginx: str) -> Non
         fix = (
             "in the merged layout routes.conf holds locations only: include it INSIDE the "
             "panel server block (server_name " + settings.gateway + "), not in the http context"
+        )
+    elif _plain_http_hop(settings):
+        # Same file shape, one name over: it must not be in the panel vhost, because that
+        # would put the router prefixes back on the panel's origin.
+        fix = (
+            "routes.conf holds locations only on a plain-HTTP hop: include it INSIDE the "
+            "server block for " + settings.gateway + " (the gateway vhost), and remove it from "
+            "the panel vhost - an include there puts every /<slug>/ back on the panel's origin "
+            "and undoes the separation the extra name buys"
         )
     else:
         fix = (
@@ -1038,6 +1053,7 @@ def _check_launch(settings: Settings, report: Report) -> None:
     files, which is exactly why it belongs here rather than in the UI.
     """
     from .services.launch import cookie_header_name
+    from .services.proxy import _plain_http_hop
 
     raw_mode = str(getattr(settings, "route_mode", "") or "").strip().lower()
     if raw_mode and raw_mode not in {"subdomain", "path"}:
@@ -1066,6 +1082,7 @@ def _check_launch(settings: Settings, report: Report) -> None:
             report.ok("router hostnames", f"{gateway}/<slug>/")
 
         panel = str(settings.panel_host or "").strip(".").lower()
+        plain_hop = _plain_http_hop(settings)
         if settings.gateway_merged:
             # Supported, but not free: same scheme+host+port means a path is not an origin
             # boundary, so a hostile router page runs in the panel's origin. The layout also
@@ -1080,6 +1097,16 @@ def _check_launch(settings: Settings, report: Report) -> None:
                 "'Path mode on the panel's own host' for what the shared origin costs. In this "
                 "layout routes.conf holds locations only and must be included INSIDE the panel "
                 "server block (doctor checks that under 'routes include')",
+            )
+        elif plain_hop:
+            # The shape scripts/quick-install.sh --gateway-host installs: two names on one
+            # plain-HTTP port, TLS at the operator's proxy. Nothing here is wrong, but the
+            # two facts an operator has to keep true are worth one line: what doctor cannot
+            # see is whether the proxy actually routes the gateway name to this host, and
+            # whether the panel vhost still includes routes.conf.
+            report.ok(
+                "gateway host",
+                f"{gateway} (panel on {panel or 'unset'}; separate origin on a plain-HTTP hop)",
             )
         else:
             report.ok("gateway host", f"{gateway} (panel on {panel or 'unset'})")

@@ -89,7 +89,10 @@ def fake_connection(monkeypatch):
     """Replace the SSH dial-out with an in-memory connection."""
     made: list[FakeConnection] = []
 
-    async def fake_open_shell(router, settings=None, *, cols=80, rows=24):
+    async def fake_open_shell(router, settings=None, *, cols=80, rows=24, db=None):
+        # db is where a first-use host key pin would be persisted; this fake connection has no
+        # handshake, so the parameter is accepted and ignored, exactly like a real handshake that
+        # finds the router already pinned.
         conn = FakeConnection()
         made.append(conn)
         return conn
@@ -100,7 +103,7 @@ def fake_connection(monkeypatch):
 
 @pytest.fixture()
 def failing_connection(monkeypatch):
-    async def boom(router, settings=None, *, cols=80, rows=24):
+    async def boom(router, settings=None, *, cols=80, rows=24, db=None):
         raise console_service.ConsoleError("console_auth_failed", "router said no", 502)
 
     monkeypatch.setattr(console_service, "open_shell", boom)
@@ -131,6 +134,10 @@ def _login(client: TestClient, settings, username="admin") -> tuple[TestClient, 
         s.expunge(user)
         s.expunge(sess)
     client.cookies.set(COOKIE, token)
+    # Session row minted directly rather than through POST /api/auth/login, so the CSRF cookie
+    # that login would have written is not in the jar. Mutating routes require BOTH the
+    # X-CSRF-Token header and the cookie, and the cookie has to match the session row.
+    client.cookies.set(settings.csrf_cookie_name, sess.csrf_token)
     return client, user, sess
 
 
@@ -653,10 +660,12 @@ def test_non_ip_peer_still_binds_the_console_ticket(client, settings, fake_conne
 
 # --------------------------------------------------------------------------- admin terminate
 def _csrf(client: TestClient, session) -> None:
-    """Put the CSRF header on the client; mutating routes require it."""
+    """Put the CSRF header AND cookie on the client; mutating routes require both to agree."""
     from app.config import get_settings
 
-    client.headers[get_settings().csrf_header] = session.csrf_token
+    settings = get_settings()
+    client.headers[settings.csrf_header] = session.csrf_token
+    client.cookies.set(settings.csrf_cookie_name, session.csrf_token)
 
 
 def test_admin_can_terminate_a_live_session(client, settings, fake_connection):
@@ -770,7 +779,7 @@ def test_terminate_requires_admin(client, settings, make_user, fake_connection):
     """An operator may open shells but may not kill other people's."""
     make_user("op1", role="operator")
     login = client.post("/api/auth/login", json={"username": "op1", "password": "user-t3st-pass"})
-    client.headers[settings.csrf_header] = login.json()["csrf_token"]
+    client.headers[settings.csrf_header] = login.cookies[settings.csrf_cookie_name]
     item = _make_router(settings)
     with session_scope() as s:
         row = ConsoleSession(

@@ -262,9 +262,19 @@ class ConsoleWebSocketHandler:
     async def run(self) -> None:
         """Connect, bridge until one side stops, then always clean up."""
         try:
-            self.connection = await console_service.open_shell(
-                self.router, self.settings, cols=self.cols, rows=self.rows
-            )
+            # The handshake gets a session of its own, held only for its duration: the console
+            # pins the router's host key on first use, and that write needs a Session that owns
+            # the row (app/services/console.py:record_host_key_pin). The session is closed as
+            # soon as the shell exists - an interactive console can run for hours and must not
+            # keep a database connection (or a transaction) open for that time.
+            with session_scope() as handshake_db:
+                self.connection = await console_service.open_shell(
+                    self.router,
+                    self.settings,
+                    cols=self.cols,
+                    rows=self.rows,
+                    db=handshake_db,
+                )
         except console_service.ConsoleError as exc:
             await self._refuse(exc.code, exc.message, CLOSE_UPSTREAM)
             await self._audit_failed_open(exc.code)

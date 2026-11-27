@@ -13,7 +13,7 @@ os.environ.setdefault("TUNNELGATE_ENV_FILE", "/nonexistent/.env")
 
 from fastapi.testclient import TestClient
 
-from app.config import Settings, set_settings_override
+from app.config import Settings, get_settings, set_settings_override
 from app.db import init_db, reset_for_tests, session_scope
 from app.main import create_app
 from app.security import hash_password
@@ -87,10 +87,17 @@ def db(settings: Settings):
 def admin_client(client: TestClient) -> TestClient:
     r = client.post("/api/auth/login", json={"username": "admin", "password": ADMIN_PASSWORD})
     assert r.status_code == 200, r.text
-    data = r.json()
-    client.headers[settings_csrf_header()] = data["csrf_token"]
-    client.csrf_token = data["csrf_token"]  # type: ignore[attr-defined]
-    client.user = data["user"]  # type: ignore[attr-defined]
+    # The token is no longer in the JSON body: login puts it in the csrf cookie beside the
+    # session cookie, and a mutating request has to carry both the cookie and the header.
+    # TestClient persists set-cookie on the login response, so this is the same value the
+    # browser would have; copying it into the header here is what the SPA does in api.ts.
+    # TestClient already stored both cookies from the login response, so they carry the real
+    # domain and path; setting them again here would add a second, domainless copy of the same
+    # name and make cookies[...] raise CookieConflict on the next read.
+    token = r.cookies[get_settings().csrf_cookie_name]
+    client.headers[settings_csrf_header()] = token
+    client.csrf_token = token  # type: ignore[attr-defined]
+    client.user = r.json()["user"]  # type: ignore[attr-defined]
     return client
 
 

@@ -18,6 +18,8 @@ if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/../requirements.txt" ] && \
 fi
 
 HOST=""
+GATEWAY_HOST=""
+ALLOW_SHARED_ORIGIN=0
 HTTP_PORT=80
 PANEL_PORT=8080
 PUBLIC_SCHEME=https
@@ -47,7 +49,26 @@ TunnelGate quick install - TLS is terminated by YOUR OWN reverse proxy.
 
 Installs the panel behind a plain-HTTP port and stops before any certificate, DNS or
 ACME work. You point your own proxy at it afterwards. Routers are served as
-https://<host>/<slug>/ (path routing, one name, no wildcard certificate).
+<public-url>/<slug>/ (path routing, no wildcard certificate).
+
+ROUTER NAMES AND WHY THIS SCRIPT ASKS
+  Behind a proxy that terminates TLS, this host speaks plain HTTP on ONE port and your
+  proxy decides which name reaches it. Two layouts are possible, and they differ in what
+  a compromised router costs you:
+
+    separate (--gateway-host NAME)   routers on NAME, the panel on --host. Different
+        origins, so a hostile router page cannot touch the panel: it can neither read
+        the operator's session nor call the panel API. Needs one DNS record for NAME and
+        one extra name on the certificate you already have - NOT a wildcard.
+
+    merged (--allow-shared-origin)   routers under <public-url>/<slug>/, i.e. the panel's
+        OWN origin. One name, no extra DNS or certificate, but a path is not an origin
+        boundary: a hostile or compromised router page runs in the panel's origin, can
+        call the panel API as the signed-in operator, and can read every other router's
+        LuCI through it. docs/SECURITY.md 6.1 has the detail.
+
+  Without --gateway-host the script asks before installing the merged layout, and with no
+  terminal to ask on it refuses rather than choosing for you.
 
 USAGE
   curl ... | sudo sh -s -- --host NAME     install by downloading the sources
@@ -62,7 +83,11 @@ QUESTIONS ASKED ON A TERMINAL (never when output is redirected)
       root = run the panel as root                              [NOT recommended]
 
 OPTIONS
-  --host NAME            public name a browser uses
+  --host NAME            public name a browser uses (the PANEL's name)
+  --gateway-host NAME    publish routers on NAME instead of the panel's origin: one DNS
+                         record plus one extra name on your certificate (no wildcard)
+  --allow-shared-origin  consent to routers sharing the panel's origin (merged layout);
+                         only sensible when one public name is all you have
   --run-as user|root     panel service account (default: ask, then user)
   --port N               plain-HTTP port your proxy forwards to    (default 80)
   --panel-port N         loopback port the panel listens on        (default 8080)
@@ -148,6 +173,9 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --host) need_value "$@"; HOST=$2; shift 2 ;;
         --host=*) HOST=${1#*=}; shift ;;
+        --gateway-host) need_value "$@"; GATEWAY_HOST=$2; shift 2 ;;
+        --gateway-host=*) GATEWAY_HOST=${1#*=}; shift ;;
+        --allow-shared-origin) ALLOW_SHARED_ORIGIN=1; shift ;;
         --port) need_value "$@"; HTTP_PORT=$2; shift 2 ;;
         --port=*) HTTP_PORT=${1#*=}; shift ;;
         --panel-port) need_value "$@"; PANEL_PORT=$2; shift 2 ;;
@@ -226,6 +254,12 @@ case "$HOST" in
     */*)   die "--host takes a bare hostname, without a path" ;;
     *:*)   die "--host takes a bare hostname, without a port; --port is the port your proxy forwards to" ;;
 esac
+case "$GATEWAY_HOST" in
+    *://*) die "--gateway-host takes a bare hostname, without http:// or https:// (the scheme is --public-scheme)" ;;
+    */*)   die "--gateway-host takes a bare hostname, without a path" ;;
+    *:*)   die "--gateway-host takes a bare hostname, without a port; --port is the port your proxy forwards to" ;;
+    *[!a-zA-Z0-9.-]*|'') [ -z "$GATEWAY_HOST" ] || die "--gateway-host may contain only letters, digits, dot and dash" ;;
+esac
 case "$PUBLIC_SCHEME" in
     http|https) ;;
     *) die "--public-scheme must be http or https" ;;
@@ -247,6 +281,84 @@ esac
 case "$REF" in
     *[!a-zA-Z0-9._/-]*) die "--ref may contain only letters, digits, dot, dash, slash and underscore" ;;
 esac
+
+# ---------------------------------------------------------------- router layout
+# Which nginx vhost(s) this run installs, and the one security decision in it. Decided
+# here, before anything is written, because it changes the vhost, the env file and what
+# the summary has to warn about.
+#
+# SEPARATE (GATEWAY_HOST set and different from HOST): routers get their own origin. The
+# routes include leaves the panel vhost and a second vhost serves the gateway name on the
+# SAME plain port, so the operator's proxy routes two names to one listener.
+#
+# MERGED (no GATEWAY_HOST, or it equals HOST): routers live on the panel's origin. One
+# name, no extra DNS or certificate - but scheme+host+port is what an origin IS, so a
+# hostile router page can call the panel API with the operator's session cookie and read
+# every other router's LuCI. That was proven in a browser against this layout, and this
+# script used to install it by default with a comment. It now needs consent, asked on a
+# terminal and defaulting to NO - a "just press enter" default must not hand over the
+# operator session of every future router.
+case "$GATEWAY_HOST" in
+    "") ;;
+    *) GATEWAY_HOST=$(printf '%s' "$GATEWAY_HOST" | tr '[:upper:]' '[:lower:]') ;;
+esac
+host_key=$(printf '%s' "$HOST" | tr '[:upper:]' '[:lower:]' | sed -e 's/\.$//')
+gateway_key=$(printf '%s' "$GATEWAY_HOST" | sed -e 's/\.$//')
+if [ -n "$GATEWAY_HOST" ] && [ "$gateway_key" = "$host_key" ]; then
+    # Same name twice is the merged layout with extra steps, and it is worth saying so
+    # rather than silently rendering one thing while the flags suggest another.
+    warn "--gateway-host is the same name as --host ($HOST): routers will share the"
+    warn "  panel's origin. Give the gateway its own name, or drop --gateway-host and"
+    warn "  pass --allow-shared-origin to say you meant it."
+    GATEWAY_HOST=""
+fi
+if [ -z "$GATEWAY_HOST" ]; then
+    if [ "$ALLOW_SHARED_ORIGIN" -eq 0 ]; then
+        if have_tty; then
+            printf '\nRouters are published under one host. Where should that be?\n' >/dev/tty
+            printf '  The panel is served on %s. Publishing every router on that SAME name\n' "$HOST" >/dev/tty
+            printf '  (/<slug>/) makes one origin out of both: a hostile or compromised router\n' >/dev/tty
+            printf '  page can then call the panel API as the signed-in operator and read the\n' >/dev/tty
+            printf '  other routers'"'"' LuCI. It is not a theoretical risk - it was reproduced in\n' >/dev/tty
+            printf '  a browser.\n' >/dev/tty
+            printf '  The way out is a second name: --gateway-host gate.example.com, plus one\n' >/dev/tty
+            printf '  DNS record and one extra name on the certificate you already have (no\n' >/dev/tty
+            printf '  wildcard). If you have only one name, scripts/setup-server.sh with a\n' >/dev/tty
+            printf '  wildcard certificate is the other way out.\n' >/dev/tty
+            shared_answer=$(ask 'Install with routers on the panel'"'"'s own origin? [y/N]:' 'n')
+            case "$shared_answer" in
+                y|Y|yes|YES|Yes) ALLOW_SHARED_ORIGIN=1 ;;
+                *) die "nothing was installed: routers need their own name.
+       Re-run with one of:
+         --gateway-host gate.example.com   routers on their own name (one DNS record,
+                                         one extra certificate name, no wildcard)
+         --allow-shared-origin            accept the shared origin: a hostile router
+                                         page can then act as the signed-in operator
+       Or use scripts/setup-server.sh on this host with a wildcard certificate." ;;
+            esac
+        else
+            die "refusing to install the shared-origin layout unattended: with no terminal
+       to ask on, this script will not choose it for you. A compromised router page on
+       the panel's own origin can call the panel API as the signed-in operator and read
+       the other routers' LuCI.
+       Re-run with one of:
+         --gateway-host gate.example.com   routers on their own name (one DNS record,
+                                         one extra name on the certificate you already
+                                         have - no wildcard)
+         --allow-shared-origin            accept the shared origin (in a scripted run:
+                                         the documented one-name deployment)
+       Or use scripts/setup-server.sh on this host with a wildcard certificate."
+        fi
+    else
+        warn "routers will share the panel's origin (--allow-shared-origin): a compromised"
+        warn "  router page can then act as the signed-in operator and read the other"
+        warn "  routers' LuCI. --gateway-host NAME on a second DNS name removes this."
+    fi
+    ROUTER_LAYOUT=merged
+else
+    ROUTER_LAYOUT=separate
+    ok "routers get their own name: $GATEWAY_HOST (panel stays on $HOST)"
+fi
 
 # Root is needed for what this script CHANGES - packages, a user, systemd units, nginx.
 # A dry run changes nothing, so it must stay usable without sudo: an operator reading the
@@ -316,6 +428,12 @@ fi
 AUTH_ROUTES=$ROUTES_DIR/$(basename "$ROUTES" .conf).auth.conf
 VHOST_AVAILABLE=/etc/nginx/sites-available/$SERVICE.conf
 VHOST_ENABLED=/etc/nginx/sites-enabled/$SERVICE.conf
+# The gateway vhost is only installed in the separate layout. Its name sorts AFTER
+# $SERVICE.conf in sites-enabled (tunnelgate-gateway-* < tunnelgate.conf), which matters:
+# includes are processed in glob order, so the panel vhost's listen default_server is
+# parsed first and the gateway block cannot accidentally claim the default server.
+GATEWAY_VHOST_AVAILABLE=/etc/nginx/sites-available/$SERVICE-gateway.conf
+GATEWAY_VHOST_ENABLED=/etc/nginx/sites-enabled/$SERVICE-gateway.conf
 AUTHORIZED_KEYS=$DATA_DIR/.ssh/authorized_keys
 PANEL_URL=http://127.0.0.1:$PANEL_PORT
 if [ "$HTTP_PORT" = "80" ]; then
@@ -324,6 +442,17 @@ else
     PUBLIC_AUTHORITY=$HOST:$HTTP_PORT
 fi
 PUBLIC_URL=$PUBLIC_SCHEME://$PUBLIC_AUTHORITY
+if [ "$ROUTER_LAYOUT" = separate ]; then
+    ROUTER_URL_HOST=$GATEWAY_HOST
+else
+    ROUTER_URL_HOST=$HOST
+fi
+if [ "$HTTP_PORT" = "80" ]; then
+    ROUTER_AUTHORITY=$ROUTER_URL_HOST
+else
+    ROUTER_AUTHORITY=$ROUTER_URL_HOST:$HTTP_PORT
+fi
+ROUTER_PUBLIC_URL=$PUBLIC_SCHEME://$ROUTER_AUTHORITY
 if [ "$PUBLIC_SCHEME" = "https" ]; then
     COOKIE_SECURE=true
 else
@@ -336,6 +465,11 @@ SED_DATA=$(sed_repl "$DATA_DIR")
 SED_ROUTES=$(sed_repl "$ROUTES")
 SED_AUTH_ROUTES=$(sed_repl "$AUTH_ROUTES")
 SED_HOST=$(sed_repl "$HOST")
+if [ "$ROUTER_LAYOUT" = separate ]; then
+    SED_ROUTER_HOST=$(sed_repl "$GATEWAY_HOST")
+else
+    SED_ROUTER_HOST=$SED_HOST
+fi
 SED_SERVICE=$(sed_repl "$SERVICE")
 SED_RUN_USER=$(sed_repl "$RUN_USER")
 SED_RUN_GROUP=$(sed_repl "$RUN_GROUP")
@@ -343,7 +477,11 @@ SED_RUN_GROUP=$(sed_repl "$RUN_GROUP")
 say "installing TunnelGate ($SERVICE)"
 printf '     public name   %s\n' "$PUBLIC_URL"
 printf '     this host     http://0.0.0.0:%s  ->  panel %s\n' "$HTTP_PORT" "$PANEL_URL"
-printf '     routers       %s/<slug>/   (path mode, merged layout)\n' "$PUBLIC_URL"
+if [ "$ROUTER_LAYOUT" = separate ]; then
+    printf '     routers       %s/<slug>/   (path mode, own name: separate origin)\n' "$ROUTER_PUBLIC_URL"
+else
+    printf '     routers       %s/<slug>/   (path mode, MERGED layout: the panel\047s origin)\n' "$ROUTER_PUBLIC_URL"
+fi
 printf '     service user  %s%s\n' "$RUN_USER" "$( [ "$RUN_AS" = root ] && printf '   (NOT recommended)' || printf '   (dedicated account)')"
 printf '     ssh account   tunnelgate  (routers log in here; always unprivileged)\n'
 printf '     sources       %s\n' "$INSTALL_DIR"
@@ -422,6 +560,13 @@ esac
 [ -f "$REPO/requirements.txt" ] || die "$REPO/requirements.txt is missing: is this a full checkout?"
 [ -f "$REPO/deploy/sshd/tunnelgate.conf" ] || die "$REPO/deploy/sshd/tunnelgate.conf is missing"
 [ -f "$REPO/deploy/nginx/tunnelgate-behind-proxy.conf" ] || die "$REPO/deploy/nginx/tunnelgate-behind-proxy.conf is missing"
+# Only needed by the separate layout, but checked here with the other sources so the
+# failure names the file before anything is installed rather than halfway through
+# section 9 with the database already seeded.
+if [ "$ROUTER_LAYOUT" = separate ]; then
+    [ -f "$REPO/deploy/nginx/tunnelgate-gateway-behind-proxy.conf" ] ||
+        die "$REPO/deploy/nginx/tunnelgate-gateway-behind-proxy.conf is missing: --gateway-host installs it as the routers' vhost"
+fi
 
 # ---------------------------------------------------------------- 2. packages
 say "installing packages"
@@ -602,14 +747,51 @@ TUNNELGATE_SUBDOMAIN_SUFFIX=$HOST
 TUNNELGATE_COOKIE_SECURE=$COOKIE_SECURE
 
 # --- router addressing ---------------------------------------------------
-# path: every router is <public-url>/<slug>/ - one name, no wildcard DNS, no
-# per-router certificate. That is the point of this install shape.
+# path: every router is <gateway>/<slug>/ - one name for the fleet, no wildcard
+# DNS and no per-router certificate. That is the point of this install shape.
 TUNNELGATE_ROUTE_MODE=path
-# Equal to PANEL_HOST, i.e. the MERGED layout: routes.conf then holds locations
-# only and is included INSIDE the panel server block, which is what
-# deploy/nginx/tunnelgate-behind-proxy.conf does. A path is not an origin
-# boundary (docs/SECURITY.md 6.1): a hostile router page shares this origin.
+# Whether this nginx serves PLAIN HTTP to your proxy (true) or terminates TLS
+# itself (false, the panel default). It describes the hop nginx serves, NOT the
+# scheme a browser uses: the browser gets https from your proxy, which is why
+# TUNNELGATE_PUBLIC_URL above stays https. With this true, a gateway on its own
+# name keeps its server block in the installer's vhost instead of in the file the
+# panel regenerates - a listen port written into routes.conf would be lost on the
+# next router change.
+TUNNELGATE_PROXY_PLAIN_HTTP=true
+ENVEOF
+        # The router addressing block differs by layout, and the difference is the
+        # whole point: it decides which vhost includes routes.conf and whether the
+        # routers share the panel's origin. Written here, after the heredoc, so the
+        # choice is made once in shell rather than twice in prose.
+        if [ "$ROUTER_LAYOUT" = separate ]; then
+            cat >>"$ENV_FILE" <<ENVEOF
+# The routers' OWN name. It is a different origin from PANEL_HOST above, which is
+# what stops a hostile router page from calling the panel API as the operator.
+# routes.conf declares locations only and is included INSIDE this vhost's server
+# block ($GATEWAY_VHOST_AVAILABLE), which is on the SAME plain port as the panel.
+# One DNS record plus one extra name on your certificate - never a wildcard.
+TUNNELGATE_GATEWAY_HOST=$GATEWAY_HOST
+ENVEOF
+        else
+            cat >>"$ENV_FILE" <<ENVEOF
+# Equal to PANEL_HOST, i.e. the MERGED layout (installed with
+# --allow-shared-origin): routes.conf holds locations only and is included INSIDE
+# the panel server block, which is what deploy/nginx/tunnelgate-behind-proxy.conf
+# does. A path is not an origin boundary (docs/SECURITY.md 6.1): a hostile router
+# page shares this origin and can act as the signed-in operator. Set this to a
+# name of its own - plus one DNS record and one certificate name - to remove that.
 TUNNELGATE_GATEWAY_HOST=$HOST
+ENVEOF
+        fi
+
+        # Everything below is layout-independent, so it is one heredoc appended after the
+        # branch above. It MUST stay inside a heredoc: an earlier revision closed the
+        # heredoc before this block, which turned every one of these lines into a shell
+        # assignment instead of a line in the environment file. The script still "worked"
+        # (assignments do not fail), so the only symptom was a panel that started with
+        # none of these settings and fell back to defaults - an authorized_keys path that
+        # sshd never read and a tunnel port range nobody had opened.
+        cat >>"$ENV_FILE" <<ENVEOF
 
 # --- real client addresses ----------------------------------------------
 # The only peer the panel sees is this host's nginx, which is loopback and is
@@ -851,18 +1033,70 @@ if [ "$DRY_RUN" -eq 0 ]; then
 fi
 
 # ---------------------------------------------------------------- 9. nginx
+# Rewrites the panel vhost's one routes include line, reading the template on stdin.
+#
+# In the MERGED layout the line becomes the operator's routes path. In the SEPARATE
+# layout the line becomes a comment, and that removal is the security fix, not a
+# tidy-up: the gateway has a vhost of its own, and an include left in the panel vhost
+# would keep every /<slug>/ reachable on the panel's own origin - the shared origin the
+# second name exists to remove. Commented rather than deleted so the rendered file
+# still says where the routers went.
+#
+# awk rather than sed on purpose. The replacement is three lines and contains "#" and
+# "/", and inside a sed "s###" expression a bare & means "the whole match", so an
+# unescaped operator value silently corrupts the vhost instead of failing. A line that
+# no longer matches exits 3, so a future template edit stops the install here rather
+# than shipping a panel vhost that quietly includes the routers again.
+render_routes_include() {
+    if [ "$ROUTER_LAYOUT" = separate ]; then
+        replacement="    # Routers are on $GATEWAY_HOST, not on this name. Their vhost is
+    # $GATEWAY_VHOST_AVAILABLE, and including this file HERE as
+    # well would put every /<slug>/ back on the panel's own origin -
+    # the origin sharing the second name exists to remove."
+    else
+        replacement="    include $ROUTES;"
+    fi
+    awk -v repl="$replacement" '
+        index($0, "    include /etc/nginx/tunnelgate/routes.conf;") == 1 {
+            count = split(repl, line, "\n")
+            for (i = 1; i <= count; i++) print line[i]
+            replaced = 1
+            next
+        }
+        { print }
+        END { exit replaced ? 0 : 3 }
+    '
+}
+
 say "installing the plain-HTTP vhost on :$HTTP_PORT"
 if [ "$DRY_RUN" -eq 0 ]; then
     # Substitutions: the listen port, the panel upstream, the name the CSP names for
-    # the console WebSocket, and the routes include the panel generates.
-    sed -e "s#listen 80 default_server;#listen $HTTP_PORT default_server;#" \
+    # the console WebSocket, then the routes include line (see above).
+    if ! sed -e "s#listen 80 default_server;#listen $HTTP_PORT default_server;#" \
         -e "s#listen \[::\]:80 default_server;#listen [::]:$HTTP_PORT default_server;#" \
         -e "s#127\.0\.0\.1:8080#127.0.0.1:$PANEL_PORT#g" \
         -e "s#panel\.example\.com#$SED_HOST#g" \
-        -e "s#/etc/nginx/tunnelgate/routes\.conf#$SED_ROUTES#g" \
-        "$REPO/deploy/nginx/tunnelgate-behind-proxy.conf" >"$VHOST_AVAILABLE"
+        "$REPO/deploy/nginx/tunnelgate-behind-proxy.conf" | render_routes_include >"$VHOST_AVAILABLE"
+    then
+        rm -f "$VHOST_AVAILABLE"
+        die "$REPO/deploy/nginx/tunnelgate-behind-proxy.conf no longer has the
+       routes include line this installer rewrites. Refusing to install a panel
+       vhost whose router locations were not resolved."
+    fi
     chmod 0644 "$VHOST_AVAILABLE"
     ln -sf "$VHOST_AVAILABLE" "$VHOST_ENABLED"
+    if [ "$ROUTER_LAYOUT" = separate ]; then
+        # Same port as the panel vhost, on purpose: one listener, and the operator's
+        # proxy routes both names to it. No default_server (the panel vhost owns the
+        # default) and no map (that lives in the panel vhost's http context).
+        sed -e "s#^    listen 80;\$#    listen $HTTP_PORT;#" \
+            -e "s#^    listen \[::\]:80;\$#    listen [::]:$HTTP_PORT;#" \
+            -e "s#server_name gateway\.example\.com;#server_name $SED_ROUTER_HOST;#" \
+            -e "s#/etc/nginx/tunnelgate/routes\.conf#$SED_ROUTES#g" \
+            "$REPO/deploy/nginx/tunnelgate-gateway-behind-proxy.conf" >"$GATEWAY_VHOST_AVAILABLE"
+        chmod 0644 "$GATEWAY_VHOST_AVAILABLE"
+        ln -sf "$GATEWAY_VHOST_AVAILABLE" "$GATEWAY_VHOST_ENABLED"
+    fi
     # nginx refuses to start when an include target is missing, so seed both generated
     # files before the first nginx -t. They belong to the panel's account: the write is
     # temp+rename inside a directory that account owns.
@@ -955,13 +1189,40 @@ else
 fi
 
 # ---------------------------------------------------------------- 12. summary
+# The two layouts need different words here, and the words are the point: the merged
+# one has to say what a compromised router can DO, and the separate one has to say what
+# keeps it that way plus the one thing the operator must do at the proxy. Assembled into
+# variables so the rest of the summary stays one readable heredoc.
+if [ "$ROUTER_LAYOUT" = separate ]; then
+    SUMMARY_ROUTERS="$ROUTER_PUBLIC_URL/<slug>/   (own name: separate origin from the panel)"
+    SUMMARY_SECURITY="  * Routers are published on $GATEWAY_HOST, a different origin from the panel, so a
+    hostile or compromised router page cannot act as you: the session cookie is not
+    sent to that name and its panel API calls are cross-origin 401s. Keep it that way.
+    Do not add routes.conf to the panel vhost (this script removes that include for
+    this reason), and do not aim the gateway name at the panel server block."
+    SUMMARY_EDGE="
+  This host now serves TWO names on one port. Your proxy needs a server block (or an
+  SNI/host rule) for $GATEWAY_HOST as well, forwarding to the same address and port:
+  one certificate with both names as SANs covers it - still no wildcard.
+"
+else
+    SUMMARY_ROUTERS="$ROUTER_PUBLIC_URL/<slug>/   (the panel's OWN origin: merged layout)"
+    SUMMARY_SECURITY="  * Routers share the panel's origin in this layout (path mode, one name), so a
+    hostile or compromised router page can act as a signed-in operator AND read the
+    other routers' LuCI through that same origin. Read docs/SECURITY.md 6.1 before
+    adding routers you do not physically control. The way out is a name of their own:
+    re-run with --gateway-host gate.example.com - one DNS record and one extra name
+    on the certificate you already have (no wildcard) - or use scripts/setup-server.sh
+    on this host with a wildcard certificate."
+    SUMMARY_EDGE=""
+fi
 cat <<SUMMARY
 
 TunnelGate is installed on this host.
 
   through nginx (your proxy forwards here)   http://127.0.0.1:$HTTP_PORT
   public name                                $PUBLIC_URL
-  routers                                    $PUBLIC_URL/<slug>/
+  routers                                    $SUMMARY_ROUTERS
   admin user                                 admin
   admin password                             $ENV_FILE -> TUNNELGATE_ADMIN_PASSWORD (mode 0600)
   environment                                $ENV_FILE
@@ -1009,6 +1270,7 @@ NEXT: point your reverse proxy at http://<this host>:$HTTP_PORT
       $PUBLIC_AUTHORITY {
           reverse_proxy http://<this host>:$HTTP_PORT
       }
+$SUMMARY_EDGE
 
   Two things your edge must not do:
     * must not strip X-Forwarded-For. Without it the panel cannot record a client
@@ -1021,10 +1283,7 @@ NEXT: point your reverse proxy at http://<this host>:$HTTP_PORT
       curl -fsS $PUBLIC_URL/api/v1/health
 
 SECURITY NOTES
-  * Routers share the panel's origin in this layout (path mode, one name), so a
-    hostile or compromised router page can act as a signed-in operator. Read
-    docs/SECURITY.md 6.1 before adding routers you do not physically control.
-    Putting the gateway on its own name removes this; see docs/INSTALL_SERVER.md 6.
+$SUMMARY_SECURITY
   * The audit log records the address your proxy reports. With --proxy-hops 1 that is
     the proxy's own, which is unforgeable but shared by every client.
   * The tunnel and console pools stay CLOSED. Confirm sshd honours the drop-in:

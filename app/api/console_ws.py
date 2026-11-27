@@ -30,6 +30,7 @@ from ..models import PanelSession, Router, User
 from ..security import hash_token
 from ..services import console as console_service
 from ..services import console_ws as bridge_service
+from ..services.access import can_access_router
 
 log = logging.getLogger("tunnelgate.api.console_ws")
 
@@ -58,6 +59,13 @@ async def _resolve_identity(websocket: WebSocket) -> tuple[User, PanelSession] |
 
 
 def _load_router(router_id: str) -> Router | None:
+    """The router row, detached from the session that read it.
+
+    Detached on purpose: the handler below can run for hours. It opens its own short-lived
+    session for the one thing that must be written - the host key pin learned on first use
+    (app/services/console.py:record_host_key_pin) - and nothing holds a database connection for
+    the lifetime of an interactive shell.
+    """
     with session_scope() as db:
         item = db.get(Router, router_id)
         if item is not None:
@@ -140,6 +148,23 @@ async def console_websocket(
             bridge_service.CLOSE_FORBIDDEN,
             "console_forbidden",
             "The interactive console requires the operator or admin role",
+        )
+        return
+
+    # Per-router access, on top of the role. Today only admin and operator can reach this line,
+    # and both are implicitly allowed on every router in app/services/access.py, so this check
+    # can never fire - which is exactly why it belongs here BEFORE the ticket is consumed. If
+    # CONSOLE_ROLES is ever widened (an auditor role that may watch a shell, say), a widened role
+    # would otherwise inherit the console on every router the moment it inherits the role name,
+    # and nobody would notice because the grant table was never consulted on this path.
+    with session_scope() as access_db:
+        allowed = can_access_router(access_db, user, router_id)
+    if not allowed:
+        await _reject(
+            websocket,
+            bridge_service.CLOSE_FORBIDDEN,
+            "forbidden",
+            "You do not have access to this router",
         )
         return
 

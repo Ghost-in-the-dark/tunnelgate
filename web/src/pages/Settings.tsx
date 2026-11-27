@@ -34,7 +34,7 @@ type TabId = (typeof TABS)[number]['id']
 const ROLE_HELP: Record<Role, string> = {
   admin: 'Full control: routers, users, panel settings and audit history.',
   operator: 'May create routers, rotate keys, open consoles. Cannot manage users.',
-  viewer: 'Read-only. Sees routers and audit history, cannot change anything.',
+  viewer: 'Read-only. Sees only the routers granted to them, plus audit history; cannot change anything.',
 }
 
 export function SettingsPage() {
@@ -312,6 +312,21 @@ function normalizeUsers(data: { items: User[]; total?: number } | User[] | undef
   return Array.isArray(data) ? data : data.items
 }
 
+/**
+ * True for the roles that already reach every router by role, so a per-router grant on them
+ * would imply a restriction that does not exist.
+ *
+ * This mirrors app/services/access.py exactly: router_grants rows are what widen a VIEWER's
+ * reach, and admin/operator are allowed on every router implicitly (they create, re-key and
+ * rotate routers, and a rotated key hands them a working credential anyway). The dialog
+ * therefore only opens for a viewer; for the other two roles the Users table states the rule
+ * in muted text instead of offering checkboxes that could not change anything. Kept as one
+ * named helper so the menu, the row note and the dialog cannot drift apart.
+ */
+function reachesEveryRouter(role: Role): boolean {
+  return role === 'admin' || role === 'operator'
+}
+
 function UsersTab({ currentUserId }: { currentUserId: number }) {
   const toast = useToast()
   const queryClient = useQueryClient()
@@ -320,6 +335,7 @@ function UsersTab({ currentUserId }: { currentUserId: number }) {
   const [createOpen, setCreateOpen] = useState(false)
   const [editing, setEditing] = useState<User | null>(null)
   const [removing, setRemoving] = useState<User | null>(null)
+  const [granting, setGranting] = useState<User | null>(null)
 
   const users = useMemo(() => normalizeUsers(usersQuery.data), [usersQuery.data])
 
@@ -356,7 +372,8 @@ function UsersTab({ currentUserId }: { currentUserId: number }) {
         <div>
           <h2 className="text-xs font-medium text-text">Panel users</h2>
           <p className="mt-0.5 text-2xs text-muted">
-            Roles decide what each person can do. Disabling keeps the history but blocks sign-in.
+            Roles decide what each person can do. A viewer only sees the routers granted to them.
+            Disabling keeps the history but blocks sign-in.
           </p>
         </div>
         <Button size="sm" variant="primary" icon="plus" onClick={() => setCreateOpen(true)}>
@@ -422,6 +439,12 @@ function UsersTab({ currentUserId }: { currentUserId: number }) {
                       <Badge tone={u.role === 'admin' ? 'accent' : u.role === 'operator' ? 'success' : 'neutral'} mono>
                         {u.role}
                       </Badge>
+                      {/* The scope sits under the role rather than in the action menu: it is the
+                          answer to "can I restrict this person per router?", and for admin and
+                          operator that answer is no. */}
+                      <div className="mt-0.5 text-3xs text-faint">
+                        {reachesEveryRouter(u.role) ? 'reaches every router' : 'granted routers only'}
+                      </div>
                     </td>
                     <td className="px-3.5 py-2">
                       <span
@@ -450,6 +473,18 @@ function UsersTab({ currentUserId }: { currentUserId: number }) {
                             icon: 'user',
                             onSelect: () => setEditing(u),
                           },
+                          // Only a viewer is narrowed per router. Admin and operator reach every
+                          // router by role (see reachesEveryRouter), so offering them checkboxes
+                          // would imply a restriction the backend does not apply.
+                          ...(reachesEveryRouter(u.role)
+                            ? []
+                            : [
+                                {
+                                  label: 'Routers',
+                                  icon: 'hosts' as const,
+                                  onSelect: () => setGranting(u),
+                                },
+                              ]),
                           {
                             label: u.is_active ? 'Disable sign-in' : 'Enable sign-in',
                             icon: u.is_active ? 'eye-off' : 'eye',
@@ -494,6 +529,7 @@ function UsersTab({ currentUserId }: { currentUserId: number }) {
 
       <CreateUserModal open={createOpen} onClose={() => setCreateOpen(false)} />
       <EditUserModal user={editing} onClose={() => setEditing(null)} />
+      <RouterGrantsModal user={granting} onClose={() => setGranting(null)} />
       <Modal
         open={removing !== null}
         onClose={() => setRemoving(null)}
@@ -723,6 +759,243 @@ function EditUserModal({ user, onClose }: { user: User | null; onClose: () => vo
           hint="Leave empty to keep the current password. At least 10 characters."
         />
       </div>
+    </Modal>
+  )
+}
+
+/* ------------------------------------------------- per-router grants */
+
+/** Longer than this and the checkbox list needs a filter box to stay usable. */
+const GRANT_FILTER_THRESHOLD = 8
+
+/**
+ * The routers one viewer may reach. PUT replaces the whole set, so Save sends every checked id.
+ *
+ * Only viewers appear here. Admin and operator reach every router by role - the backend's
+ * app/services/access.py grants them all routers implicitly, and a router_grants row could not
+ * narrow that - so the action menu hides this dialog for them and the Role cell says "reaches
+ * every router" instead. Showing checkboxes there would suggest a restriction the server would
+ * not apply, which is worse than no control at all.
+ *
+ * The dialog reads two sources: every router in the panel (api.listRouters), which is the pool
+ * to choose from, and the user's current grants (api.listUserRouters), which pre-checks the
+ * boxes. Both load together, and Save stays disabled until the grants arrive - saving an empty
+ * set because the pre-check had not landed yet would silently revoke everything.
+ */
+function RouterGrantsModal({ user, onClose }: { user: User | null; onClose: () => void }) {
+  const toast = useToast()
+  const queryClient = useQueryClient()
+  const userId = user?.id ?? -1
+
+  const routersQuery = useQuery({
+    queryKey: ['routers', 'grant-picker'],
+    queryFn: ({ signal }) => api.listRouters({}, signal),
+    enabled: user !== null,
+  })
+  const grantsQuery = useQuery({
+    queryKey: ['user-routers', userId],
+    queryFn: ({ signal }) => api.listUserRouters(userId, signal),
+    enabled: user !== null,
+  })
+
+  const [checked, setChecked] = useState<Set<string>>(new Set())
+  const [baseline, setBaseline] = useState<string[]>([])
+  const [search, setSearch] = useState('')
+
+  // Re-seeds when a different user is opened (or the server's set changes under us). Keyed on
+  // user + the server's ids so a background refetch of the same set does not throw away edits
+  // in progress - the same reason AgentEndpointCard keeps a seededRef.
+  const seededRef = useRef<string>('')
+  const grants = grantsQuery.data?.items
+  const seedKey = user !== null && grants ? userId + ':' + grants.map((g) => g.id).sort().join(',') : ''
+  useEffect(() => {
+    if (!grants || seededRef.current === seedKey) return
+    seededRef.current = seedKey
+    const ids = grants.map((g) => g.id)
+    setChecked(new Set(ids))
+    setBaseline([...ids].sort())
+  }, [grants, seedKey])
+
+  // A fresh search per user: the filter is about the list in front of you, not a preference.
+  useEffect(() => {
+    setSearch('')
+  }, [userId])
+
+  // Closing without saving drops the edits. The dialog component stays mounted (it renders
+  // nothing while closed) so the queries stay cached, which means without this the next open
+  // would show checkboxes from a session the admin already abandoned.
+  useEffect(() => {
+    if (user === null) seededRef.current = ''
+  }, [user])
+
+  const routers = useMemo(() => routersQuery.data?.items ?? [], [routersQuery.data])
+  const needsFilter = routers.length > GRANT_FILTER_THRESHOLD
+  const needle = search.trim().toLowerCase()
+  const visible = useMemo(() => {
+    if (!needle) return routers
+    return routers.filter(
+      (r) => r.name.toLowerCase().includes(needle) || r.slug.toLowerCase().includes(needle),
+    )
+  }, [routers, needle])
+
+  const currentIds = useMemo(() => Array.from(checked).sort(), [checked])
+  const pristine =
+    currentIds.length === baseline.length && currentIds.every((id, i) => id === baseline[i])
+  const allVisibleChecked = visible.length > 0 && visible.every((r) => checked.has(r.id))
+  const someVisibleChecked = visible.some((r) => checked.has(r.id))
+
+  const toggle = (id: string) => {
+    setChecked((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const toggleVisible = () => {
+    setChecked((prev) => {
+      const next = new Set(prev)
+      if (allVisibleChecked) for (const r of visible) next.delete(r.id)
+      else for (const r of visible) next.add(r.id)
+      return next
+    })
+  }
+
+  const mutation = useMutation({
+    mutationFn: () => api.setUserRouters(userId, currentIds),
+    onSuccess: (res) => {
+      toast.success(
+        'Router access saved. ' + res.total + ' of ' + routers.length + ' routers granted.',
+      )
+      // Only this user's grant set changed: the admin's own router list is unaffected, because
+      // granting a viewer routers never removes one from an admin or operator. The router pool
+      // is left alone so the picker does not flicker back to skeletons behind the closing dialog.
+      void queryClient.invalidateQueries({ queryKey: ['user-routers', userId] })
+      onClose()
+    },
+    onError: (err) => toast.error(friendlyMessage(err)),
+  })
+
+  const loading = routersQuery.isLoading || grantsQuery.isLoading
+  const error = routersQuery.error ?? grantsQuery.error
+  const limitedRole = user ? reachesEveryRouter(user.role) : false
+  const title = 'Routers for ' + (user?.display_name ?? user?.username ?? 'user')
+
+  return (
+    <Modal
+      open={user !== null}
+      onClose={onClose}
+      title={title}
+      description="A viewer only sees the routers granted here. Save replaces the whole set."
+      footer={
+        <>
+          <Button onClick={onClose}>Cancel</Button>
+          <Button
+            variant="primary"
+            loading={mutation.isPending}
+            disabled={pristine || loading || Boolean(error) || limitedRole}
+            onClick={() => mutation.mutate()}
+          >
+            Save access
+          </Button>
+        </>
+      }
+    >
+      {limitedRole ? (
+        <p className="text-2xs leading-relaxed text-muted">
+          This account has a role that reaches every router, so there is nothing to grant. Change
+          the role to viewer first if it should be limited to specific routers.
+        </p>
+      ) : error ? (
+        <ErrorState
+          error={error}
+          onRetry={() => {
+            void routersQuery.refetch()
+            void grantsQuery.refetch()
+          }}
+        />
+      ) : loading ? (
+        <div className="space-y-2" aria-busy="true">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <Skeleton key={i} className="h-9 w-full" />
+          ))}
+        </div>
+      ) : routers.length === 0 ? (
+        <EmptyState
+          icon="hosts"
+          title="No routers exist yet"
+          description="Add a router on the Hosts page first, then come back to grant it to this viewer."
+        />
+      ) : (
+        <div className="space-y-2.5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="text-2xs text-muted" aria-live="polite">
+              {checked.size} of {routers.length} granted
+            </p>
+            {needsFilter ? (
+              <div className="relative min-w-[11rem] flex-1 sm:max-w-[14rem]">
+                <Icon
+                  name="search"
+                  size={13}
+                  className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-faint"
+                />
+                <input
+                  type="search"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  placeholder="Name or slug…"
+                  aria-label="Filter routers by name or slug"
+                  className="h-8 w-full rounded border border-border bg-surface-2 pl-8 pr-2 text-xs text-text placeholder:text-faint focus:border-accent focus:outline-none focus-visible:outline-none"
+                />
+              </div>
+            ) : null}
+          </div>
+
+          <fieldset className="min-w-0">
+            <legend className="sr-only">Routers this viewer may reach</legend>
+            <div className="max-h-64 overflow-y-auto rounded border border-border">
+              <div className="flex items-center gap-2 border-b border-border bg-surface-2/60 px-3 py-1.5">
+                <input
+                  type="checkbox"
+                  aria-label={allVisibleChecked ? 'Deselect all routers shown' : 'Select all routers shown'}
+                  checked={allVisibleChecked}
+                  ref={(el) => {
+                    if (el) el.indeterminate = !allVisibleChecked && someVisibleChecked
+                  }}
+                  onChange={toggleVisible}
+                  className="h-3.5 w-3.5 cursor-pointer rounded-sm border-border-strong bg-surface-2 accent-[rgb(var(--tg-accent))]"
+                />
+                <span className="text-2xs text-muted">
+                  {needle ? 'Select all shown' : 'Select all'}
+                </span>
+              </div>
+              {visible.length === 0 ? (
+                <p className="px-3 py-6 text-center text-2xs text-muted">
+                  No routers match “{search.trim()}”.
+                </p>
+              ) : (
+                <ul className="divide-y divide-border/60">
+                  {visible.map((r) => (
+                    <li key={r.id}>
+                      <label className="flex cursor-pointer items-center gap-2.5 px-3 py-2 text-xs text-text hover:bg-surface-2/60">
+                        <input
+                          type="checkbox"
+                          checked={checked.has(r.id)}
+                          onChange={() => toggle(r.id)}
+                          className="h-3.5 w-3.5 shrink-0 cursor-pointer rounded-sm border-border-strong bg-surface-2 accent-[rgb(var(--tg-accent))]"
+                        />
+                        <span className="min-w-0 flex-1 truncate">{r.name}</span>
+                        <span className="shrink-0 font-mono text-3xs text-faint">{r.slug}</span>
+                      </label>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </fieldset>
+        </div>
+      )}
     </Modal>
   )
 }

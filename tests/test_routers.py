@@ -6,12 +6,28 @@ import re
 
 import pytest
 
-from app.config import RESERVED_SLUGS, SLUG_RE, utcnow
+from app.config import RESERVED_SLUGS, SLUG_RE, get_settings, utcnow
 from app.models import AuditLog, BootstrapToken, Router, RouterRuntime
 
 
 def _stable(c: Router) -> dict:
     return c
+
+
+def _login(client, username: str, password: str = "user-t3st-pass") -> str:
+    """Log in as a non-admin and install the CSRF header the mutating routes require.
+
+    The token is delivered in the csrf cookie rather than the login body (a same-origin router
+    page could otherwise fetch it out of /api/auth/me), so it is read from the response
+    cookies. The body field is kept as a fallback: the point of this helper is to let the
+    tests below state what a viewer may do, not to pin the transport of the token.
+    """
+    r = client.post("/api/auth/login", json={"username": username, "password": password})
+    assert r.status_code == 200, r.text
+    token = r.cookies.get(get_settings().csrf_cookie_name) or r.json().get("csrf_token")
+    assert token, "login returned no CSRF token in the cookie or the body"
+    client.headers[get_settings().csrf_header] = token
+    return token
 
 
 # --------------------------------------------------------------------------- create
@@ -96,24 +112,20 @@ def test_create_router_requires_authentication(client):
 
 def test_viewer_cannot_create_or_delete(client, settings, make_user):
     make_user("viewer1", role="viewer")
-    login = client.post(
-        "/api/auth/login", json={"username": "viewer1", "password": "user-t3st-pass"}
-    )
-    assert login.status_code == 200
-    client.headers[settings.csrf_header] = login.json()["csrf_token"]
+    _login(client, "viewer1")
     r = client.post("/api/v1/routers", json={"name": "Nope"})
     assert r.status_code == 403
     assert r.json()["error"]["code"] == "forbidden"
-    # but a viewer may read the list
-    assert client.get("/api/v1/routers").status_code == 200
+    # but a viewer may read the list - and it is the list of routers they were granted, which
+    # is empty here. The read is allowed; the content is filtered (see tests/test_access.py).
+    list_response = client.get("/api/v1/routers")
+    assert list_response.status_code == 200
+    assert list_response.json()["items"] == []
 
 
 def test_operator_can_create(api, db, settings, make_user, client):
     make_user("operator1", role="operator")
-    login = client.post(
-        "/api/auth/login", json={"username": "operator1", "password": "user-t3st-pass"}
-    )
-    client.headers[settings.csrf_header] = login.json()["csrf_token"]
+    _login(client, "operator1")
     r = client.post("/api/v1/routers", json={"name": "Operator Router"})
     assert r.status_code == 201, r.text
 
@@ -274,10 +286,7 @@ def test_script_reissue_on_an_installed_router_needs_admin(api, client, settings
     row.revoked_at = None
     db.commit()
     make_user("operator2", role="operator")
-    login = client.post(
-        "/api/auth/login", json={"username": "operator2", "password": "user-t3st-pass"}
-    )
-    client.headers[settings.csrf_header] = login.json()["csrf_token"]
+    _login(client, "operator2")
     r = client.get(f"/api/v1/routers/{created['id']}/script?reissue=true")
     assert r.status_code == 403
     assert r.json()["error"]["code"] == "forbidden"

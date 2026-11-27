@@ -11,9 +11,15 @@ nginx calls `GET /__tg/auth?router_id=...&uri=...` for each request to
 
 The router id comes from the vhost, never from the client.
 
+Two questions are answered here, and they are not the same one. A credential answers WHO the
+caller is; app/services/access.py answers WHETHER that caller may reach THIS router. Before the
+second question was asked, every authenticated account - a viewer included - could open every
+router's LuCI through the proxy.
+
 Fail closed is the whole design: anything other than a clean 200 makes nginx deny. A panel crash
 therefore denies access rather than opening it, and an unknown router id is a plain 401 - the
-gate must not become a router-existence oracle for an unauthenticated caller.
+gate must not become a router-existence oracle for an unauthenticated caller. A router that
+exists but was not granted to this caller gets that same plain 401, for the same reason.
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ from fastapi.responses import JSONResponse
 
 from ..deps import DbSession, OptionalSession, SettingsDep, client_ip
 from ..models import Router, User
+from ..services.access import can_access_router
 from ..services.audit import record as audit_record
 from ..services.launch import router_cookie_names, verify_router_cookie
 
@@ -119,6 +126,21 @@ async def auth_request(
         # Deliberately the same answer as "not authenticated": an unauthenticated caller must not
         # learn which router ids exist by comparing status codes.
         log.info("gate: unknown router id %s requested by %s", router_id, user.username)
+        return _deny()
+
+    # Per-router authorization. Authentication above only proved WHO the caller is; without this
+    # check any logged-in account, a viewer included, reached every router's LuCI - which is the
+    # cross-tenant hole this gate exists to close. A viewer who was not granted this router gets
+    # the SAME 401 body as an unauthenticated caller, on purpose: answering 403 here and 401 one
+    # comment earlier would tell a viewer which of the router ids they guessed are real, and the
+    # panel already keeps the two responses byte-identical for that exact reason.
+    if not can_access_router(db, user, item):
+        log.info(
+            "gate: denied router %s for %s (role %s) - no grant",
+            item.slug,
+            user.username,
+            user.role,
+        )
         return _deny()
 
     if _should_audit(user.id, item.id, time.monotonic()):
